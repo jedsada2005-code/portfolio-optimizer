@@ -48,8 +48,9 @@ if run_btn and len(stock_list) >= 2:
             interval="1d",
             auto_adjust=True,
         )
-        data_close = df["Close"].ffill()
-        data_close.dropna(inplace=True)
+        data_close = df["Close"].ffill().bfill()
+        data_close.dropna(how="all", inplace=True)
+        data_close.dropna(axis=1, how="all", inplace=True)
 
     if data_close.empty:
         st.error("No data downloaded. Check symbols and date range.")
