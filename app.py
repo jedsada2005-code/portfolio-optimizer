@@ -35,6 +35,7 @@ with st.sidebar:
     st.caption("3. Custom Weight รวมกันต้องเท่ากับ 1.0 เท่านั้น")
     st.caption("4. ตัวอย่าง: `AMZN, META, NVDA, SPY, LLY`")
     st.caption("5. ค่า Return, Vol, Sharpe ใน Expected กับ Backtest มีค่าใกล้เคียงกันแต่อาจต่างกันเล็กน้อย เนื่องจากคำนวณคนละวิธี")
+    st.caption("6. หุ้นบางตัวอาจโหลดไม่สำเร็จ เพราะเขียนชื่อผิด หรือในปีนั้นยังไม่มีข้อมูล (ตรวจสอบชื่อและปีที่ดึงข้อมูลให้ดี)")
 
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
