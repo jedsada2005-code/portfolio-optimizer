@@ -28,6 +28,13 @@ with st.sidebar:
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
     run_btn = st.button("Calculate", type="primary", use_container_width=True)
 
+    st.divider()
+    st.caption("⚠️ **Beta Version — ข้อควรระวัง**")
+    st.caption("1. รองรับเฉพาะสินทรัพย์ที่มีใน Yahoo Finance เท่านั้น")
+    st.caption("2. หุ้นไทยต้องเติม `.BK` หลังชื่อ เช่น `PTT.BK` หุ้น US ใส่ชื่อได้เลย")
+    st.caption("3. Custom Weight รวมกันต้องเท่ากับ 1.0 เท่านั้น")
+    st.caption("4. ตัวอย่าง: `AMZN, META, NVDA, SPY, LLY`")
+
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
 
