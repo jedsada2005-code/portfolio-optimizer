@@ -56,6 +56,13 @@ if run_btn and len(stock_list) >= 2:
         st.error("No data downloaded. Check symbols and date range.")
         st.stop()
 
+    # แจ้งหุ้นที่โหลดสำเร็จ / ไม่สำเร็จ
+    loaded = list(data_close.columns)
+    missing = [s for s in stock_list if s not in loaded]
+    if missing:
+        st.warning(f"⚠️ ไม่พบข้อมูล: **{', '.join(missing)}** — ตรวจสอบชื่อ symbol อีกครั้ง")
+    st.success(f"✅ โหลดสำเร็จ {len(loaded)} ตัว: **{', '.join(loaded)}**")
+
     # ─── Calculations ───
     with st.spinner("Computing efficient frontier..."):
         weekly = data_close.resample("W-FRI").last()
