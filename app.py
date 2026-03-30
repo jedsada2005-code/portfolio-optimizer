@@ -67,6 +67,13 @@ if run_btn and len(stock_list) >= 2:
         perf = ef.portfolio_performance(risk_free_rate=risk_free_rate)
         opt_ret, opt_vol, opt_sharpe = perf
 
+        # Min Volatility weights
+        ef_mv = EfficientFrontier(ar, covr)
+        mv_weights = ef_mv.min_volatility()
+        mv_cleaned = dict(mv_weights)
+        mv_perf = ef_mv.portfolio_performance(risk_free_rate=risk_free_rate)
+        mv_ret, mv_vol, mv_sharpe = mv_perf
+
         # Efficient frontier curve
         ef2 = EfficientFrontier(ar, covr)
         fig_mpl, ax_mpl = plt.subplots()
@@ -83,6 +90,8 @@ if run_btn and len(stock_list) >= 2:
     st.session_state["covr"] = covr
     st.session_state["cleaned"] = cleaned
     st.session_state["opt_perf"] = (opt_ret, opt_vol, opt_sharpe)
+    st.session_state["mv_cleaned"] = mv_cleaned
+    st.session_state["mv_perf"] = (mv_ret, mv_vol, mv_sharpe)
     st.session_state["random"] = (stds, rets, sharpes)
     st.session_state["ef_curve"] = (ef_x, ef_y)
     st.session_state["stock_list"] = stock_list
@@ -97,6 +106,8 @@ if st.session_state.get("calculated"):
     covr = st.session_state["covr"]
     cleaned = st.session_state["cleaned"]
     opt_ret, opt_vol, opt_sharpe = st.session_state["opt_perf"]
+    mv_cleaned = st.session_state["mv_cleaned"]
+    mv_ret, mv_vol, mv_sharpe = st.session_state["mv_perf"]
     stds, rets, sharpes = st.session_state["random"]
     ef_x, ef_y = st.session_state["ef_curve"]
     stock_list = st.session_state["stock_list"]
@@ -132,6 +143,12 @@ if st.session_state.get("calculated"):
                         line=dict(width=1, color="black")),
             name=f"Max Sharpe (SR={opt_sharpe:.2f})",
         ))
+        fig.add_trace(go.Scatter(
+            x=[mv_vol], y=[mv_ret], mode="markers",
+            marker=dict(size=14, color="limegreen", symbol="diamond",
+                        line=dict(width=1, color="black")),
+            name=f"Min Volatility (SR={mv_sharpe:.2f})",
+        ))
         fig.update_layout(
             title="Efficient Frontier with Random Portfolios",
             xaxis_title="Annual Volatility",
@@ -144,15 +161,28 @@ if st.session_state.get("calculated"):
     # Tab 2: Optimal Weights + Custom Sliders
     # ════════════════════════════════════════
     with tab2:
-        st.subheader("Max Sharpe Optimal Weights")
+        strategy = st.radio(
+            "Optimization Strategy",
+            ["Max Sharpe", "Min Volatility"],
+            horizontal=True,
+        )
+
+        if strategy == "Max Sharpe":
+            sel_weights = cleaned
+            sel_ret, sel_vol, sel_sharpe = opt_ret, opt_vol, opt_sharpe
+        else:
+            sel_weights = mv_cleaned
+            sel_ret, sel_vol, sel_sharpe = mv_ret, mv_vol, mv_sharpe
+
+        st.subheader(f"{strategy} Optimal Weights")
         col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Expected Annual Return", f"{opt_ret:.2%}")
-        col_m2.metric("Annual Volatility", f"{opt_vol:.2%}")
-        col_m3.metric("Sharpe Ratio", f"{opt_sharpe:.2f}")
+        col_m1.metric("Expected Annual Return", f"{sel_ret:.2%}")
+        col_m2.metric("Annual Volatility", f"{sel_vol:.2%}")
+        col_m3.metric("Sharpe Ratio", f"{sel_sharpe:.2f}")
 
         weights_df = pd.DataFrame({
-            "Stock": list(cleaned.keys()),
-            "Weight": [f"{v:.1%}" for v in cleaned.values()],
+            "Stock": list(sel_weights.keys()),
+            "Weight": [f"{v:.1%}" for v in sel_weights.values()],
         })
         st.dataframe(weights_df, use_container_width=True, hide_index=True)
 
@@ -162,12 +192,12 @@ if st.session_state.get("calculated"):
 
         custom_w = {}
         cols = st.columns(min(len(stock_list), 4))
-        for i, sym in enumerate(sorted(cleaned.keys())):
+        for i, sym in enumerate(sorted(sel_weights.keys())):
             with cols[i % len(cols)]:
-                default = cleaned.get(sym, 0.0)
+                default = sel_weights.get(sym, 0.0)
                 custom_w[sym] = st.slider(
                     sym, 0.0, 1.0, float(round(default, 3)),
-                    step=0.01, key=f"w_{sym}",
+                    step=0.01, key=f"w_{sym}_{strategy}",
                 )
 
         total_w = sum(custom_w.values())
