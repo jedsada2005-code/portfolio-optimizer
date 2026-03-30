@@ -34,6 +34,7 @@ with st.sidebar:
     st.caption("2. หุ้นไทยต้องเติม `.BK` หลังชื่อ เช่น `PTT.BK` หุ้น US ใส่ชื่อได้เลย")
     st.caption("3. Custom Weight รวมกันต้องเท่ากับ 1.0 เท่านั้น")
     st.caption("4. ตัวอย่าง: `AMZN, META, NVDA, SPY, LLY`")
+    st.caption("5. ค่า Return, Vol, Sharpe ใน Expected กับ Backtest มีค่าใกล้เคียงกันแต่อาจต่างกันเล็กน้อย เนื่องจากคำนวณคนละวิธี")
 
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
