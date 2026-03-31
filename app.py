@@ -71,7 +71,7 @@ if run_btn and len(stock_list) >= 2:
         covr = weekly.pct_change().cov() * 52
 
         # Random portfolios
-        n_samples = 1_000_000
+        n_samples = 200_000
         w = np.random.dirichlet([0.5] * len(ar), n_samples)
         rets = w.dot(ar)
         stds = np.sqrt((w.T * (covr.values @ w.T)).sum(axis=0))
