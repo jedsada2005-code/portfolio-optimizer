@@ -57,3 +57,32 @@ def test_get_daily_nav_raises_rate_limit_error_after_max_retries(mock_sleep):
 
     assert session.get.call_count == thai_mf.MAX_RETRIES
     assert mock_sleep.call_count == thai_mf.MAX_RETRIES - 1
+
+
+def test_list_funds_aggregates_across_amcs():
+    session = MagicMock()
+
+    def fake_get(url, headers, timeout):
+        if url == "https://api.sec.or.th/FundFactsheet/fund/amc":
+            return MagicMock(
+                status_code=200,
+                json=lambda: [{"unique_id": "amc-1"}, {"unique_id": "amc-2"}],
+            )
+        if url == "https://api.sec.or.th/FundFactsheet/fund/amc/amc-1":
+            return MagicMock(
+                status_code=200,
+                json=lambda: [{"proj_id": "p1", "proj_abbr_name": "FUND-A"}],
+            )
+        if url == "https://api.sec.or.th/FundFactsheet/fund/amc/amc-2":
+            return MagicMock(
+                status_code=200,
+                json=lambda: [{"proj_id": "p2", "proj_abbr_name": "FUND-B"}],
+            )
+        raise AssertionError(f"unexpected url {url}")
+
+    session.get.side_effect = fake_get
+
+    client = _make_client(session)
+    funds = client.list_funds()
+
+    assert {f["proj_id"] for f in funds} == {"p1", "p2"}

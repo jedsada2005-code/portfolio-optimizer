@@ -48,3 +48,29 @@ class SECFundClient:
             raise SECAPIError(
                 f"SEC API error {resp.status_code} fetching NAV for {proj_id} on {nav_date}"
             )
+
+    def list_funds(self):
+        """Return a flat list of fund dicts (proj_id, proj_abbr_name,
+        proj_name_th, proj_name_en, fund_status, ...) across every AMC.
+        """
+        resp = self.session.get(
+            f"{FUND_FACTSHEET_BASE}/fund/amc", headers=self._headers(), timeout=30
+        )
+        resp.raise_for_status()
+        amcs = resp.json()
+
+        funds = []
+        for amc in amcs:
+            unique_id = amc.get("unique_id")
+            if not unique_id:
+                continue
+            detail_resp = self.session.get(
+                f"{FUND_FACTSHEET_BASE}/fund/amc/{unique_id}",
+                headers=self._headers(),
+                timeout=30,
+            )
+            detail_resp.raise_for_status()
+            detail = detail_resp.json()
+            if isinstance(detail, list):
+                funds.extend(detail)
+        return funds
