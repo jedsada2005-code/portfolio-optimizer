@@ -27,20 +27,28 @@ class SECRateLimitError(SECAPIError):
 
 
 class SECFundClient:
-    def __init__(self, subscription_key, session=None):
-        self.subscription_key = subscription_key
+    """SEC Open Data issues a separate subscription key per API product —
+    the Fund Factsheet API (fund lookup) and the Fund Daily Info API (NAV
+    history) are subscribed to and keyed independently, even though both
+    sit under the same api.sec.or.th host.
+    """
+
+    def __init__(self, factsheet_key, daily_info_key, session=None):
+        self.factsheet_key = factsheet_key
+        self.daily_info_key = daily_info_key
         self.session = session or requests.Session()
 
-    def _headers(self):
-        return {"Ocp-Apim-Subscription-Key": self.subscription_key}
+    @staticmethod
+    def _headers(key):
+        return {"Ocp-Apim-Subscription-Key": key}
 
-    def _get(self, url):
+    def _get(self, url, key):
         """GET url, normalizing network-level failures (connection errors,
         timeouts, etc.) into SECAPIError so callers only ever need to catch
         that one exception type for HTTP-calling methods.
         """
         try:
-            return self.session.get(url, headers=self._headers(), timeout=30)
+            return self.session.get(url, headers=self._headers(key), timeout=30)
         except requests.exceptions.RequestException as exc:
             raise SECAPIError(f"Network error calling SEC API at {url}: {exc}") from exc
 
@@ -55,14 +63,14 @@ class SECFundClient:
                 f"SEC API error {resp.status_code} calling {url}: {exc}"
             ) from exc
 
-    def _get_with_retry(self, url):
+    def _get_with_retry(self, url, key):
         """GET url, retrying on HTTP 429 with backoff. Returns (resp, incomplete)
         where incomplete is True if retries were exhausted while still rate
         limited (resp is the last, still-429 response in that case).
         """
         attempts = 0
         while True:
-            resp = self._get(url)
+            resp = self._get(url, key)
             if resp.status_code != 429:
                 return resp, False
             attempts += 1
@@ -73,7 +81,8 @@ class SECFundClient:
     def list_funds(self):
         """Return a flat list of fund dicts (proj_id, proj_abbr_name,
         proj_name_th, proj_name_en, fund_status, ...) by paginating through
-        the SEC fund general-info/profiles endpoint.
+        the SEC fund general-info/profiles endpoint. Uses the Fund
+        Factsheet API subscription key.
         """
         funds = []
         next_cursor = None
@@ -82,7 +91,7 @@ class SECFundClient:
             if next_cursor:
                 params["next_cursor"] = next_cursor
             url = f"{FUND_PROFILES_URL}?{urlencode(params)}"
-            resp = self._get(url)
+            resp = self._get(url, self.factsheet_key)
             self._raise_for_status(resp, url)
             payload = resp.json()
             funds.extend(payload.get("items", []))
@@ -94,9 +103,10 @@ class SECFundClient:
     def get_nav_range(self, proj_id, start_date, end_date):
         """Fetch all daily NAV records for proj_id between start_date and
         end_date (inclusive), paginating via next_cursor until exhausted.
-        Returns (items, incomplete) — the item dicts collected so far, and
-        whether pagination was cut short by sustained rate limiting (in
-        which case items holds whatever was fetched before that point).
+        Uses the Fund Daily Info API subscription key. Returns
+        (items, incomplete) — the item dicts collected so far, and whether
+        pagination was cut short by sustained rate limiting (in which case
+        items holds whatever was fetched before that point).
         """
         items = []
         next_cursor = None
@@ -111,7 +121,7 @@ class SECFundClient:
                 params["next_cursor"] = next_cursor
             url = f"{FUND_NAV_URL}?{urlencode(params)}"
 
-            resp, incomplete = self._get_with_retry(url)
+            resp, incomplete = self._get_with_retry(url, self.daily_info_key)
             if incomplete:
                 return items, True
 

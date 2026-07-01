@@ -9,7 +9,9 @@ import thai_mf
 
 
 def _make_client(session):
-    return thai_mf.SECFundClient("dummy-key", session=session)
+    return thai_mf.SECFundClient(
+        "dummy-factsheet-key", "dummy-daily-info-key", session=session
+    )
 
 
 def _query(url):
@@ -50,6 +52,34 @@ def test_list_funds_paginates_via_next_cursor():
     assert session.get.call_count == 2
     first_url = session.get.call_args_list[0].args[0]
     assert first_url.startswith("https://api.sec.or.th/v2/fund/general-info/profiles?")
+
+
+def test_list_funds_sends_factsheet_key_not_daily_info_key():
+    session = MagicMock()
+    session.get.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {"message": "success", "next_cursor": "", "items": []},
+    )
+    client = _make_client(session)
+
+    client.list_funds()
+
+    sent_headers = session.get.call_args.kwargs["headers"]
+    assert sent_headers == {"Ocp-Apim-Subscription-Key": "dummy-factsheet-key"}
+
+
+def test_get_nav_range_sends_daily_info_key_not_factsheet_key():
+    session = MagicMock()
+    session.get.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {"message": "success", "next_cursor": "", "items": []},
+    )
+    client = _make_client(session)
+
+    client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+
+    sent_headers = session.get.call_args.kwargs["headers"]
+    assert sent_headers == {"Ocp-Apim-Subscription-Key": "dummy-daily-info-key"}
 
 
 def test_list_funds_raises_sec_api_error_on_http_error():

@@ -28,11 +28,17 @@ with st.sidebar:
 
     total_cash = st.number_input("Total Cash (USD)", value=1_000_000, step=100_000)
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
-    sec_api_key = st.text_input(
-        "SEC Open API Key (สำหรับกองทุนไทย)",
+    sec_factsheet_key = st.text_input(
+        "SEC Fund Factsheet API Key (สำหรับกองทุนไทย)",
         value="",
         type="password",
-        help="จำเป็นเฉพาะเมื่อกรอกกองทุนรวมไทยด้วย prefix MF: สมัครฟรีที่ api-portal.sec.or.th",
+        help="จำเป็นเฉพาะเมื่อกรอกกองทุนรวมไทยด้วย prefix MF: สมัครฟรีที่ secopendata.sec.or.th",
+    )
+    sec_daily_info_key = st.text_input(
+        "SEC Fund Daily Info API Key (สำหรับกองทุนไทย)",
+        value="",
+        type="password",
+        help="เป็น API key คนละตัวกับ Fund Factsheet ต้อง subscribe แยกกันที่ secopendata.sec.or.th",
     )
     run_btn = st.button("Calculate", type="primary", use_container_width=True)
 
@@ -44,7 +50,7 @@ with st.sidebar:
     st.caption("4. ตัวอย่าง: `AMZN, META, NVDA, SPY, LLY`")
     st.caption("5. ค่า Return, Vol, Sharpe ใน Expected กับ Backtest มีค่าใกล้เคียงกันแต่อาจต่างกันเล็กน้อย เนื่องจากคำนวณคนละวิธี")
     st.caption("6. หุ้นบางตัวอาจโหลดไม่สำเร็จ เพราะเขียนชื่อผิด หรือในปีนั้นยังไม่มีข้อมูล (ตรวจสอบชื่อและปีที่ดึงข้อมูลให้ดี)")
-    st.caption("7. กองทุนรวมไทยใส่ prefix `MF:` เช่น `MF:K-CHANGE-A(A)` ข้อมูลมาจาก SEC Open API และต้องกรอก API Key ด้านบน (ครั้งแรกที่ดึงข้อมูลกองทุนใหม่จะช้า เพราะ SEC ไม่มี endpoint ดึงทีละช่วงวันที่)")
+    st.caption("7. กองทุนรวมไทยใส่ prefix `MF:` เช่น `MF:K-CHANGE-A(A)` ข้อมูลมาจาก SEC Open Data และต้องกรอก API Key ทั้ง 2 ช่องด้านบน (Fund Factsheet กับ Fund Daily Info เป็นคนละ key กัน ต้อง subscribe แยกกัน)")
 
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
@@ -52,8 +58,11 @@ stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
 if run_btn and len(stock_list) >= 2:
     yf_symbols, mf_symbols = thai_mf.split_symbols(stock_list)
 
-    if mf_symbols and not sec_api_key:
-        st.error("⚠️ พบสัญลักษณ์กองทุนไทย (MF:) แต่ยังไม่ได้กรอก SEC Open API Key ในแถบด้านซ้าย")
+    if mf_symbols and (not sec_factsheet_key or not sec_daily_info_key):
+        st.error(
+            "⚠️ พบสัญลักษณ์กองทุนไทย (MF:) แต่ยังไม่ได้กรอก SEC API Key ให้ครบทั้ง 2 ช่อง "
+            "(Fund Factsheet และ Fund Daily Info) ในแถบด้านซ้าย"
+        )
         st.stop()
 
     with st.spinner("Downloading data..."):
@@ -75,7 +84,7 @@ if run_btn and len(stock_list) >= 2:
     mf_incomplete = []
     if mf_symbols:
         with st.spinner("Downloading Thai mutual fund data..."):
-            client = thai_mf.SECFundClient(sec_api_key)
+            client = thai_mf.SECFundClient(sec_factsheet_key, sec_daily_info_key)
             fund_navs = {}
             for name in mf_symbols:
                 display_symbol = f"MF:{name}"
