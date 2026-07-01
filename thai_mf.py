@@ -1,15 +1,18 @@
 import json
 import time
+from datetime import date
 from pathlib import Path
+from urllib.parse import urlencode
 
 import pandas as pd
 import requests
 
-FUND_FACTSHEET_BASE = "https://api.sec.or.th/FundFactsheet"
-FUND_DAILY_INFO_BASE = "https://api.sec.or.th/FundDailyInfo"
+FUND_PROFILES_URL = "https://api.sec.or.th/v2/fund/general-info/profiles"
+FUND_NAV_URL = "https://api.sec.or.th/v2/fund/daily-info/nav"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
+PAGE_SIZE = 100
 
 CACHE_DIR = Path(".cache/thai_mf")
 FUND_LIST_MAX_AGE_DAYS = 7
@@ -52,51 +55,73 @@ class SECFundClient:
                 f"SEC API error {resp.status_code} calling {url}: {exc}"
             ) from exc
 
-    def get_daily_nav(self, proj_id, nav_date):
-        """Return the NAV per unit for proj_id on nav_date (a date object),
-        or None if no NAV was published that day.
+    def _get_with_retry(self, url):
+        """GET url, retrying on HTTP 429 with backoff. Returns (resp, incomplete)
+        where incomplete is True if retries were exhausted while still rate
+        limited (resp is the last, still-429 response in that case).
         """
-        url = f"{FUND_DAILY_INFO_BASE}/{proj_id}/dailynav/{nav_date.isoformat()}"
         attempts = 0
         while True:
             resp = self._get(url)
-            if resp.status_code == 200:
-                return resp.json().get("last_val")
-            if resp.status_code == 204:
-                return None
-            if resp.status_code == 429:
-                attempts += 1
-                if attempts >= MAX_RETRIES:
-                    raise SECRateLimitError(
-                        f"Rate limited fetching NAV for {proj_id} on {nav_date}"
-                    )
-                time.sleep(RETRY_BACKOFF_SECONDS * attempts)
-                continue
-            raise SECAPIError(
-                f"SEC API error {resp.status_code} fetching NAV for {proj_id} on {nav_date}"
-            )
+            if resp.status_code != 429:
+                return resp, False
+            attempts += 1
+            if attempts >= MAX_RETRIES:
+                return resp, True
+            time.sleep(RETRY_BACKOFF_SECONDS * attempts)
 
     def list_funds(self):
         """Return a flat list of fund dicts (proj_id, proj_abbr_name,
-        proj_name_th, proj_name_en, fund_status, ...) across every AMC.
+        proj_name_th, proj_name_en, fund_status, ...) by paginating through
+        the SEC fund general-info/profiles endpoint.
         """
-        amc_list_url = f"{FUND_FACTSHEET_BASE}/fund/amc"
-        resp = self._get(amc_list_url)
-        self._raise_for_status(resp, amc_list_url)
-        amcs = resp.json()
-
         funds = []
-        for amc in amcs:
-            unique_id = amc.get("unique_id")
-            if not unique_id:
-                continue
-            detail_url = f"{FUND_FACTSHEET_BASE}/fund/amc/{unique_id}"
-            detail_resp = self._get(detail_url)
-            self._raise_for_status(detail_resp, detail_url)
-            detail = detail_resp.json()
-            if isinstance(detail, list):
-                funds.extend(detail)
+        next_cursor = None
+        while True:
+            params = {"page_size": PAGE_SIZE}
+            if next_cursor:
+                params["next_cursor"] = next_cursor
+            url = f"{FUND_PROFILES_URL}?{urlencode(params)}"
+            resp = self._get(url)
+            self._raise_for_status(resp, url)
+            payload = resp.json()
+            funds.extend(payload.get("items", []))
+            next_cursor = payload.get("next_cursor")
+            if not next_cursor:
+                break
         return funds
+
+    def get_nav_range(self, proj_id, start_date, end_date):
+        """Fetch all daily NAV records for proj_id between start_date and
+        end_date (inclusive), paginating via next_cursor until exhausted.
+        Returns (items, incomplete) — the item dicts collected so far, and
+        whether pagination was cut short by sustained rate limiting (in
+        which case items holds whatever was fetched before that point).
+        """
+        items = []
+        next_cursor = None
+        while True:
+            params = {
+                "proj_id": proj_id,
+                "start_nav_date": start_date.isoformat(),
+                "end_nav_date": end_date.isoformat(),
+                "page_size": PAGE_SIZE,
+            }
+            if next_cursor:
+                params["next_cursor"] = next_cursor
+            url = f"{FUND_NAV_URL}?{urlencode(params)}"
+
+            resp, incomplete = self._get_with_retry(url)
+            if incomplete:
+                return items, True
+
+            self._raise_for_status(resp, url)
+            payload = resp.json()
+            items.extend(payload.get("items", []))
+            next_cursor = payload.get("next_cursor")
+            if not next_cursor:
+                break
+        return items, False
 
 
 def _ensure_cache_dir():
@@ -151,6 +176,10 @@ def _nav_cache_path(proj_id):
     return CACHE_DIR / f"nav_{proj_id}.csv"
 
 
+def _nav_meta_path(proj_id):
+    return CACHE_DIR / f"nav_{proj_id}.meta.json"
+
+
 def _load_nav_cache(proj_id):
     path = _nav_cache_path(proj_id)
     if not path.exists():
@@ -164,33 +193,56 @@ def _save_nav_cache(proj_id, series):
     series.rename("nav").rename_axis("date").to_csv(_nav_cache_path(proj_id))
 
 
+def _load_nav_meta(proj_id):
+    """Return (fetched_start, fetched_end) as date objects for the date
+    range already fully fetched for proj_id, or None if never fetched.
+    """
+    path = _nav_meta_path(proj_id)
+    if not path.exists():
+        return None
+    with open(path) as f:
+        data = json.load(f)
+    return date.fromisoformat(data["start_date"]), date.fromisoformat(data["end_date"])
+
+
+def _save_nav_meta(proj_id, start_date, end_date):
+    _ensure_cache_dir()
+    with open(_nav_meta_path(proj_id), "w") as f:
+        json.dump({"start_date": start_date.isoformat(), "end_date": end_date.isoformat()}, f)
+
+
 def get_nav_history(client, proj_id, start_date, end_date):
     """Fetch NAV history for proj_id over [start_date, end_date] inclusive,
-    reading/writing the on-disk cache so already-fetched dates aren't
-    re-requested. Returns (series, incomplete) where series is indexed by
-    date and incomplete is True if fetching stopped early due to sustained
-    rate limiting (SEC has no bulk date-range endpoint, so this is one
-    HTTP call per missing date).
+    reading/writing the on-disk cache so a range that's already been fully
+    fetched isn't re-requested. Returns (series, incomplete) where series
+    is indexed by date and incomplete is True if fetching was interrupted
+    by sustained rate limiting (whatever was fetched is still cached and
+    returned; incomplete signals the caller that some dates in range may
+    be missing).
     """
+    fetched_range = _load_nav_meta(proj_id)
+    if fetched_range and fetched_range[0] <= start_date and fetched_range[1] >= end_date:
+        cached = _load_nav_cache(proj_id)
+        result = cached.loc[
+            (cached.index >= pd.Timestamp(start_date)) & (cached.index <= pd.Timestamp(end_date))
+        ]
+        return result.sort_index(), False
+
+    items, incomplete = client.get_nav_range(proj_id, start_date, end_date)
+
     cached = _load_nav_cache(proj_id)
-    all_dates = pd.date_range(start_date, end_date, freq="D")
-    known_dates = set(cached.index)
-    missing_dates = [d for d in all_dates if d not in known_dates]
-
-    incomplete = False
-    updates = {}
-    for ts in missing_dates:
-        try:
-            val = client.get_daily_nav(proj_id, ts.date())
-        except SECRateLimitError:
-            incomplete = True
-            break
-        if val is not None:
-            updates[ts] = val
-
+    updates = {
+        pd.Timestamp(item["nav_date"]): item["last_val"]
+        for item in items
+        if item.get("last_val") is not None
+    }
     if updates:
-        cached = pd.concat([cached, pd.Series(updates)]).sort_index()
+        cached = pd.concat([cached, pd.Series(updates)])
+        cached = cached[~cached.index.duplicated(keep="last")].sort_index()
         _save_nav_cache(proj_id, cached)
+
+    if not incomplete:
+        _save_nav_meta(proj_id, start_date, end_date)
 
     result = cached.loc[
         (cached.index >= pd.Timestamp(start_date)) & (cached.index <= pd.Timestamp(end_date))

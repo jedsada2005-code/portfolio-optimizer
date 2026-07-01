@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 import datetime as dt
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import requests
@@ -11,120 +12,51 @@ def _make_client(session):
     return thai_mf.SECFundClient("dummy-key", session=session)
 
 
-def test_get_daily_nav_returns_last_val_on_200():
-    session = MagicMock()
-    session.get.return_value = MagicMock(status_code=200, json=lambda: {"last_val": 12.3456})
-    client = _make_client(session)
-
-    result = client.get_daily_nav("proj-123", dt.date(2024, 1, 5))
-
-    assert result == 12.3456
-    called_url = session.get.call_args.args[0]
-    assert called_url == "https://api.sec.or.th/FundDailyInfo/proj-123/dailynav/2024-01-05"
-    assert session.get.call_args.kwargs["headers"] == {"Ocp-Apim-Subscription-Key": "dummy-key"}
+def _query(url):
+    return parse_qs(urlparse(url).query)
 
 
-def test_get_daily_nav_returns_none_on_204():
-    session = MagicMock()
-    session.get.return_value = MagicMock(status_code=204)
-    client = _make_client(session)
-
-    result = client.get_daily_nav("proj-123", dt.date(2024, 1, 6))
-
-    assert result is None
-
-
-def test_get_daily_nav_raises_generic_error_on_persistent_failure():
-    session = MagicMock()
-    session.get.return_value = MagicMock(status_code=500)
-    client = _make_client(session)
-
-    try:
-        client.get_daily_nav("proj-123", dt.date(2024, 1, 6))
-        assert False, "expected SECAPIError"
-    except thai_mf.SECAPIError:
-        pass
-
-
-@patch("thai_mf.time.sleep", return_value=None)
-def test_get_daily_nav_raises_rate_limit_error_after_max_retries(mock_sleep):
-    session = MagicMock()
-    session.get.return_value = MagicMock(status_code=429)
-    client = _make_client(session)
-
-    try:
-        client.get_daily_nav("proj-123", dt.date(2024, 1, 6))
-        assert False, "expected SECRateLimitError"
-    except thai_mf.SECRateLimitError:
-        pass
-
-    assert session.get.call_count == thai_mf.MAX_RETRIES
-    assert mock_sleep.call_count == thai_mf.MAX_RETRIES - 1
-
-
-def test_list_funds_aggregates_across_amcs():
+def test_list_funds_paginates_via_next_cursor():
     session = MagicMock()
 
     def fake_get(url, headers, timeout):
-        if url == "https://api.sec.or.th/FundFactsheet/fund/amc":
+        q = _query(url)
+        if "next_cursor" not in q:
             return MagicMock(
                 status_code=200,
-                json=lambda: [{"unique_id": "amc-1"}, {"unique_id": "amc-2"}],
+                json=lambda: {
+                    "message": "success",
+                    "next_cursor": "page-2",
+                    "items": [{"proj_id": "p1", "proj_abbr_name": "FUND-A"}],
+                },
             )
-        if url == "https://api.sec.or.th/FundFactsheet/fund/amc/amc-1":
+        if q["next_cursor"] == ["page-2"]:
             return MagicMock(
                 status_code=200,
-                json=lambda: [{"proj_id": "p1", "proj_abbr_name": "FUND-A"}],
-            )
-        if url == "https://api.sec.or.th/FundFactsheet/fund/amc/amc-2":
-            return MagicMock(
-                status_code=200,
-                json=lambda: [{"proj_id": "p2", "proj_abbr_name": "FUND-B"}],
+                json=lambda: {
+                    "message": "success",
+                    "next_cursor": "",
+                    "items": [{"proj_id": "p2", "proj_abbr_name": "FUND-B"}],
+                },
             )
         raise AssertionError(f"unexpected url {url}")
 
     session.get.side_effect = fake_get
-
     client = _make_client(session)
+
     funds = client.list_funds()
 
     assert {f["proj_id"] for f in funds} == {"p1", "p2"}
+    assert session.get.call_count == 2
+    first_url = session.get.call_args_list[0].args[0]
+    assert first_url.startswith("https://api.sec.or.th/v2/fund/general-info/profiles?")
 
 
-def test_list_funds_raises_sec_api_error_on_amc_list_http_error():
+def test_list_funds_raises_sec_api_error_on_http_error():
     session = MagicMock()
     error_resp = MagicMock(status_code=401)
-    error_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
-        "401 Client Error"
-    )
+    error_resp.raise_for_status.side_effect = requests.exceptions.HTTPError("401 Client Error")
     session.get.return_value = error_resp
-    client = _make_client(session)
-
-    try:
-        client.list_funds()
-        assert False, "expected SECAPIError"
-    except thai_mf.SECAPIError:
-        pass
-
-
-def test_list_funds_raises_sec_api_error_on_amc_detail_http_error():
-    session = MagicMock()
-
-    def fake_get(url, headers, timeout):
-        if url == "https://api.sec.or.th/FundFactsheet/fund/amc":
-            return MagicMock(
-                status_code=200,
-                json=lambda: [{"unique_id": "amc-1"}],
-            )
-        if url == "https://api.sec.or.th/FundFactsheet/fund/amc/amc-1":
-            error_resp = MagicMock(status_code=500)
-            error_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
-                "500 Server Error"
-            )
-            return error_resp
-        raise AssertionError(f"unexpected url {url}")
-
-    session.get.side_effect = fake_get
     client = _make_client(session)
 
     try:
@@ -146,16 +78,85 @@ def test_list_funds_raises_sec_api_error_on_connection_error():
         pass
 
 
-def test_get_daily_nav_raises_sec_api_error_on_connection_error():
+def test_get_nav_range_paginates_and_returns_items():
+    session = MagicMock()
+
+    def fake_get(url, headers, timeout):
+        q = _query(url)
+        assert q["proj_id"] == ["p1"]
+        assert q["start_nav_date"] == ["2024-01-01"]
+        assert q["end_nav_date"] == ["2024-01-03"]
+        if "next_cursor" not in q:
+            return MagicMock(
+                status_code=200,
+                json=lambda: {
+                    "message": "success",
+                    "next_cursor": "page-2",
+                    "items": [
+                        {"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0}
+                    ],
+                },
+            )
+        if q["next_cursor"] == ["page-2"]:
+            return MagicMock(
+                status_code=200,
+                json=lambda: {
+                    "message": "success",
+                    "next_cursor": "",
+                    "items": [
+                        {"proj_id": "p1", "nav_date": "2024-01-02", "last_val": 10.5}
+                    ],
+                },
+            )
+        raise AssertionError(f"unexpected url {url}")
+
+    session.get.side_effect = fake_get
+    client = _make_client(session)
+
+    items, incomplete = client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+
+    assert incomplete is False
+    assert [item["nav_date"] for item in items] == ["2024-01-01", "2024-01-02"]
+
+
+def test_get_nav_range_raises_sec_api_error_on_http_error():
+    session = MagicMock()
+    error_resp = MagicMock(status_code=500)
+    error_resp.raise_for_status.side_effect = requests.exceptions.HTTPError("500 Server Error")
+    session.get.return_value = error_resp
+    client = _make_client(session)
+
+    try:
+        client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+        assert False, "expected SECAPIError"
+    except thai_mf.SECAPIError:
+        pass
+
+
+def test_get_nav_range_raises_sec_api_error_on_connection_error():
     session = MagicMock()
     session.get.side_effect = requests.exceptions.Timeout("timed out")
     client = _make_client(session)
 
     try:
-        client.get_daily_nav("proj-123", dt.date(2024, 1, 6))
+        client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
         assert False, "expected SECAPIError"
     except thai_mf.SECAPIError:
         pass
+
+
+@patch("thai_mf.time.sleep", return_value=None)
+def test_get_nav_range_returns_incomplete_on_sustained_rate_limit(mock_sleep):
+    session = MagicMock()
+    session.get.return_value = MagicMock(status_code=429)
+    client = _make_client(session)
+
+    items, incomplete = client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+
+    assert incomplete is True
+    assert items == []
+    assert session.get.call_count == thai_mf.MAX_RETRIES
+    assert mock_sleep.call_count == thai_mf.MAX_RETRIES - 1
 
 
 def test_resolve_fund_id_matches_abbr_name_case_insensitively(tmp_path, monkeypatch):
@@ -202,12 +203,14 @@ def test_get_nav_history_fetches_and_caches(tmp_path, monkeypatch):
     monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
     session = MagicMock()
     client = _make_client(session)
-    client.get_daily_nav = MagicMock(
-        side_effect=lambda proj_id, d: {
-            dt.date(2024, 1, 1): 10.0,
-            dt.date(2024, 1, 2): 10.5,
-            dt.date(2024, 1, 3): None,  # e.g. weekend, no NAV published
-        }[d]
+    client.get_nav_range = MagicMock(
+        return_value=(
+            [
+                {"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0},
+                {"proj_id": "p1", "nav_date": "2024-01-02", "last_val": 10.5},
+            ],
+            False,
+        )
     )
 
     series, incomplete = thai_mf.get_nav_history(
@@ -216,34 +219,52 @@ def test_get_nav_history_fetches_and_caches(tmp_path, monkeypatch):
 
     assert incomplete is False
     assert list(series.values) == [10.0, 10.5]
-    assert client.get_daily_nav.call_count == 3
+    client.get_nav_range.assert_called_once_with(
+        "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
+    )
     assert (tmp_path / "nav_p1.csv").exists()
+    assert (tmp_path / "nav_p1.meta.json").exists()
 
 
-def test_get_nav_history_reuses_cache_for_already_fetched_dates(tmp_path, monkeypatch):
+def test_get_nav_history_reuses_cache_for_already_fetched_range(tmp_path, monkeypatch):
     monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
     session = MagicMock()
     client = _make_client(session)
-    client.get_daily_nav = MagicMock(return_value=10.0)
+    client.get_nav_range = MagicMock(
+        return_value=([{"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0}], False)
+    )
 
     thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
-    assert client.get_daily_nav.call_count == 1
+    assert client.get_nav_range.call_count == 1
 
     thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
-    assert client.get_daily_nav.call_count == 1  # no new calls, served from cache
+    assert client.get_nav_range.call_count == 1  # no new call, served from cache
 
 
-def test_get_nav_history_stops_early_and_flags_incomplete_on_rate_limit(tmp_path, monkeypatch):
+def test_get_nav_history_refetches_when_requested_range_extends_beyond_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
     session = MagicMock()
     client = _make_client(session)
+    client.get_nav_range = MagicMock(
+        return_value=([{"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0}], False)
+    )
 
-    def fake_get_daily_nav(proj_id, d):
-        if d == dt.date(2024, 1, 1):
-            return 10.0
-        raise thai_mf.SECRateLimitError("rate limited")
+    thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
+    assert client.get_nav_range.call_count == 1
 
-    client.get_daily_nav = MagicMock(side_effect=fake_get_daily_nav)
+    thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 5))
+    assert client.get_nav_range.call_count == 2  # wider range not covered by cache
+
+
+def test_get_nav_history_flags_incomplete_and_keeps_partial_results_on_rate_limit(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
+    session = MagicMock()
+    client = _make_client(session)
+    client.get_nav_range = MagicMock(
+        return_value=([{"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0}], True)
+    )
 
     series, incomplete = thai_mf.get_nav_history(
         client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
@@ -251,6 +272,8 @@ def test_get_nav_history_stops_early_and_flags_incomplete_on_rate_limit(tmp_path
 
     assert incomplete is True
     assert list(series.values) == [10.0]
+    # an incomplete fetch must not mark the range as fully cached
+    assert not (tmp_path / "nav_p1.meta.json").exists()
 
 
 def test_split_symbols_separates_mf_prefixed_entries():
