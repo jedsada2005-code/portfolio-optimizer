@@ -8,6 +8,8 @@ from pypfopt import EfficientFrontier, CLA, plotting
 import matplotlib.pyplot as plt
 import io
 
+import thai_mf
+
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 st.title("Portfolio Optimizer & Backtesting")
 
@@ -26,6 +28,12 @@ with st.sidebar:
 
     total_cash = st.number_input("Total Cash (USD)", value=1_000_000, step=100_000)
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
+    sec_api_key = st.text_input(
+        "SEC Open API Key (สำหรับกองทุนไทย)",
+        value="",
+        type="password",
+        help="จำเป็นเฉพาะเมื่อกรอกกองทุนรวมไทยด้วย prefix MF: สมัครฟรีที่ api-portal.sec.or.th",
+    )
     run_btn = st.button("Calculate", type="primary", use_container_width=True)
 
     st.divider()
@@ -36,22 +44,59 @@ with st.sidebar:
     st.caption("4. ตัวอย่าง: `AMZN, META, NVDA, SPY, LLY`")
     st.caption("5. ค่า Return, Vol, Sharpe ใน Expected กับ Backtest มีค่าใกล้เคียงกันแต่อาจต่างกันเล็กน้อย เนื่องจากคำนวณคนละวิธี")
     st.caption("6. หุ้นบางตัวอาจโหลดไม่สำเร็จ เพราะเขียนชื่อผิด หรือในปีนั้นยังไม่มีข้อมูล (ตรวจสอบชื่อและปีที่ดึงข้อมูลให้ดี)")
+    st.caption("7. กองทุนรวมไทยใส่ prefix `MF:` เช่น `MF:K-CHANGE-A(A)` ข้อมูลมาจาก SEC Open API และต้องกรอก API Key ด้านบน (ครั้งแรกที่ดึงข้อมูลกองทุนใหม่จะช้า เพราะ SEC ไม่มี endpoint ดึงทีละช่วงวันที่)")
 
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
 
 if run_btn and len(stock_list) >= 2:
+    yf_symbols, mf_symbols = thai_mf.split_symbols(stock_list)
+
+    if mf_symbols and not sec_api_key:
+        st.error("⚠️ พบสัญลักษณ์กองทุนไทย (MF:) แต่ยังไม่ได้กรอก SEC Open API Key ในแถบด้านซ้าย")
+        st.stop()
+
     with st.spinner("Downloading data..."):
-        df = yf.download(
-            tickers=stock_list,
-            start=str(start_date),
-            end=str(end_date),
-            interval="1d",
-            auto_adjust=True,
-        )
-        data_close = df["Close"].ffill().bfill()
-        data_close.dropna(how="all", inplace=True)
-        data_close.dropna(axis=1, how="all", inplace=True)
+        if yf_symbols:
+            df = yf.download(
+                tickers=yf_symbols,
+                start=str(start_date),
+                end=str(end_date),
+                interval="1d",
+                auto_adjust=True,
+            )
+            data_close = df["Close"].ffill().bfill()
+            data_close.dropna(how="all", inplace=True)
+            data_close.dropna(axis=1, how="all", inplace=True)
+        else:
+            data_close = pd.DataFrame()
+
+    mf_missing = []
+    mf_incomplete = []
+    if mf_symbols:
+        with st.spinner("Downloading Thai mutual fund data..."):
+            client = thai_mf.SECFundClient(sec_api_key)
+            fund_navs = {}
+            for name in mf_symbols:
+                display_symbol = f"MF:{name}"
+                try:
+                    proj_id = thai_mf.resolve_fund_id(name, client)
+                    if proj_id is None:
+                        mf_missing.append(display_symbol)
+                        continue
+                    nav_series, incomplete = thai_mf.get_nav_history(
+                        client, proj_id, start_date, end_date
+                    )
+                except thai_mf.SECAPIError:
+                    mf_missing.append(display_symbol)
+                    continue
+                if nav_series.empty:
+                    mf_missing.append(display_symbol)
+                    continue
+                if incomplete:
+                    mf_incomplete.append(display_symbol)
+                fund_navs[display_symbol] = nav_series
+            data_close = thai_mf.merge_fund_navs(data_close, fund_navs)
 
     if data_close.empty:
         st.error("No data downloaded. Check symbols and date range.")
@@ -59,9 +104,14 @@ if run_btn and len(stock_list) >= 2:
 
     # แจ้งหุ้นที่โหลดสำเร็จ / ไม่สำเร็จ
     loaded = list(data_close.columns)
-    missing = [s for s in stock_list if s not in loaded]
+    missing = [s for s in yf_symbols if s not in loaded] + mf_missing
     if missing:
         st.warning(f"⚠️ ไม่พบข้อมูล: **{', '.join(missing)}** — ตรวจสอบชื่อ symbol อีกครั้ง")
+    if mf_incomplete:
+        st.warning(
+            f"⚠️ ข้อมูล NAV อาจไม่ครบทุกวันสำหรับ: **{', '.join(mf_incomplete)}** "
+            "(SEC API rate limit ระหว่างดึงข้อมูล ลองกด Calculate ซ้ำเพื่อดึงวันที่เหลือจาก cache)"
+        )
     st.success(f"✅ โหลดสำเร็จ {len(loaded)} ตัว: **{', '.join(loaded)}**")
 
     # ─── Calculations ───
