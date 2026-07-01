@@ -1,4 +1,5 @@
 import json
+import sys
 import time
 from datetime import date
 from pathlib import Path
@@ -63,6 +64,31 @@ class SECFundClient:
                 f"SEC API error {resp.status_code} calling {url}: {exc}"
             ) from exc
 
+    def _parse_json_object(self, resp, url):
+        """Parse resp as JSON and require the top-level value to be an
+        object (dict) with an "items" list, matching every paginated SEC
+        endpoint's documented shape. Raises SECAPIError (instead of a raw
+        AttributeError/TypeError further down the call chain) if the API
+        ever returns something else — e.g. a bare string or list — and
+        logs the raw payload to stderr so it shows up in deployment logs
+        for diagnosis.
+        """
+        try:
+            payload = resp.json()
+        except ValueError as exc:
+            print(
+                f"[thai_mf] Non-JSON response from {url}: {resp.text!r}",
+                file=sys.stderr,
+            )
+            raise SECAPIError(f"Non-JSON response from {url}: {exc}") from exc
+        if not isinstance(payload, dict):
+            print(
+                f"[thai_mf] Unexpected response shape from {url}: {payload!r}",
+                file=sys.stderr,
+            )
+            raise SECAPIError(f"Unexpected response shape from {url}: {payload!r}")
+        return payload
+
     def _get_with_retry(self, url, key):
         """GET url, retrying on HTTP 429 with backoff. Returns (resp, incomplete)
         where incomplete is True if retries were exhausted while still rate
@@ -93,7 +119,7 @@ class SECFundClient:
             url = f"{FUND_PROFILES_URL}?{urlencode(params)}"
             resp = self._get(url, self.factsheet_key)
             self._raise_for_status(resp, url)
-            payload = resp.json()
+            payload = self._parse_json_object(resp, url)
             funds.extend(payload.get("items", []))
             next_cursor = payload.get("next_cursor")
             if not next_cursor:
@@ -126,7 +152,7 @@ class SECFundClient:
                 return items, True
 
             self._raise_for_status(resp, url)
-            payload = resp.json()
+            payload = self._parse_json_object(resp, url)
             items.extend(payload.get("items", []))
             next_cursor = payload.get("next_cursor")
             if not next_cursor:

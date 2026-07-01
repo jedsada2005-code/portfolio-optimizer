@@ -108,6 +108,22 @@ def test_list_funds_raises_sec_api_error_on_connection_error():
         pass
 
 
+def test_list_funds_raises_sec_api_error_when_response_body_is_not_an_object():
+    # Reproduces a live-API failure mode: a 200 response whose JSON body
+    # decodes to a plain string instead of the documented {"items": [...]}
+    # object, which used to crash with a raw AttributeError deep in the
+    # payload.get(...) call.
+    session = MagicMock()
+    session.get.return_value = MagicMock(status_code=200, json=lambda: "unexpected string body")
+    client = _make_client(session)
+
+    try:
+        client.list_funds()
+        assert False, "expected SECAPIError"
+    except thai_mf.SECAPIError:
+        pass
+
+
 def test_get_nav_range_paginates_and_returns_items():
     session = MagicMock()
 
@@ -166,6 +182,18 @@ def test_get_nav_range_raises_sec_api_error_on_http_error():
 def test_get_nav_range_raises_sec_api_error_on_connection_error():
     session = MagicMock()
     session.get.side_effect = requests.exceptions.Timeout("timed out")
+    client = _make_client(session)
+
+    try:
+        client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+        assert False, "expected SECAPIError"
+    except thai_mf.SECAPIError:
+        pass
+
+
+def test_get_nav_range_raises_sec_api_error_when_response_body_is_not_an_object():
+    session = MagicMock()
+    session.get.return_value = MagicMock(status_code=200, json=lambda: "unexpected string body")
     client = _make_client(session)
 
     try:
