@@ -1,4 +1,6 @@
+import json
 import time
+from pathlib import Path
 
 import requests
 
@@ -7,6 +9,9 @@ FUND_DAILY_INFO_BASE = "https://api.sec.or.th/FundDailyInfo"
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_SECONDS = 2
+
+CACHE_DIR = Path(".cache/thai_mf")
+FUND_LIST_MAX_AGE_DAYS = 7
 
 
 class SECAPIError(Exception):
@@ -74,3 +79,51 @@ class SECFundClient:
             if isinstance(detail, list):
                 funds.extend(detail)
         return funds
+
+
+def _ensure_cache_dir():
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _fund_list_cache_path():
+    return CACHE_DIR / "fund_list.json"
+
+
+def _load_fund_list_cache():
+    path = _fund_list_cache_path()
+    if not path.exists():
+        return None
+    age_seconds = time.time() - path.stat().st_mtime
+    if age_seconds > FUND_LIST_MAX_AGE_DAYS * 86400:
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def _save_fund_list_cache(funds):
+    _ensure_cache_dir()
+    with open(_fund_list_cache_path(), "w") as f:
+        json.dump(funds, f)
+
+
+def resolve_fund_id(name, client):
+    """Resolve a fund short name (as typed after the MF: prefix) to its
+    SEC proj_id. Matches case-insensitively against proj_abbr_name,
+    proj_name_th, and proj_name_en. Returns None if no fund matches.
+    """
+    funds = _load_fund_list_cache()
+    if funds is None:
+        funds = client.list_funds()
+        _save_fund_list_cache(funds)
+
+    target = name.strip().upper()
+    for fund in funds:
+        candidates = (
+            fund.get("proj_abbr_name"),
+            fund.get("proj_name_th"),
+            fund.get("proj_name_en"),
+        )
+        for candidate in candidates:
+            if candidate and candidate.strip().upper() == target:
+                return fund.get("proj_id")
+    return None

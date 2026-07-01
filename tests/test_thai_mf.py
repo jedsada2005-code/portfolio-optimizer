@@ -86,3 +86,43 @@ def test_list_funds_aggregates_across_amcs():
     funds = client.list_funds()
 
     assert {f["proj_id"] for f in funds} == {"p1", "p2"}
+
+
+def test_resolve_fund_id_matches_abbr_name_case_insensitively(tmp_path, monkeypatch):
+    monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
+    session = MagicMock()
+    client = _make_client(session)
+    client.list_funds = MagicMock(
+        return_value=[
+            {"proj_id": "p1", "proj_abbr_name": "K-CHANGE-A(A)"},
+            {"proj_id": "p2", "proj_abbr_name": "SCBGOLD"},
+        ]
+    )
+
+    result = thai_mf.resolve_fund_id("k-change-a(a)", client)
+
+    assert result == "p1"
+    client.list_funds.assert_called_once()
+
+
+def test_resolve_fund_id_returns_none_when_unmatched(tmp_path, monkeypatch):
+    monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
+    session = MagicMock()
+    client = _make_client(session)
+    client.list_funds = MagicMock(return_value=[{"proj_id": "p1", "proj_abbr_name": "SCBGOLD"}])
+
+    result = thai_mf.resolve_fund_id("NOT-A-REAL-FUND", client)
+
+    assert result is None
+
+
+def test_resolve_fund_id_uses_cache_on_second_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
+    session = MagicMock()
+    client = _make_client(session)
+    client.list_funds = MagicMock(return_value=[{"proj_id": "p1", "proj_abbr_name": "SCBGOLD"}])
+
+    thai_mf.resolve_fund_id("SCBGOLD", client)
+    thai_mf.resolve_fund_id("SCBGOLD", client)
+
+    client.list_funds.assert_called_once()
