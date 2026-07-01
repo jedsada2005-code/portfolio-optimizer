@@ -179,3 +179,33 @@ def get_nav_history(client, proj_id, start_date, end_date):
         (cached.index >= pd.Timestamp(start_date)) & (cached.index <= pd.Timestamp(end_date))
     ]
     return result.sort_index(), incomplete
+
+
+MF_PREFIX = "MF:"
+
+
+def split_symbols(stock_list):
+    """Split a parsed symbol list into (yf_symbols, mf_symbols). mf_symbols
+    have the MF: prefix stripped so callers can pass them straight to
+    resolve_fund_id.
+    """
+    yf_symbols = []
+    mf_symbols = []
+    for symbol in stock_list:
+        if symbol.startswith(MF_PREFIX):
+            mf_symbols.append(symbol[len(MF_PREFIX):].strip())
+        else:
+            yf_symbols.append(symbol)
+    return yf_symbols, mf_symbols
+
+
+def merge_fund_navs(data_close, fund_navs):
+    """Outer-join Thai fund NAV series (dict of display_symbol -> pd.Series)
+    onto the yfinance data_close DataFrame, forward/backward filling to
+    match the existing stock-data fill behavior. No-op if fund_navs is empty.
+    """
+    if not fund_navs:
+        return data_close
+    mf_df = pd.DataFrame(fund_navs)
+    merged = data_close.join(mf_df, how="outer") if not data_close.empty else mf_df
+    return merged.sort_index().ffill().bfill()

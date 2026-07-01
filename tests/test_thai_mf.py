@@ -183,3 +183,46 @@ def test_get_nav_history_stops_early_and_flags_incomplete_on_rate_limit(tmp_path
 
     assert incomplete is True
     assert list(series.values) == [10.0]
+
+
+def test_split_symbols_separates_mf_prefixed_entries():
+    yf_symbols, mf_symbols = thai_mf.split_symbols(["AMZN", "MF:K-CHANGE-A(A)", "SPY", "MF:SCBGOLD"])
+
+    assert yf_symbols == ["AMZN", "SPY"]
+    assert mf_symbols == ["K-CHANGE-A(A)", "SCBGOLD"]
+
+
+def test_split_symbols_with_no_mf_entries():
+    yf_symbols, mf_symbols = thai_mf.split_symbols(["AMZN", "SPY"])
+
+    assert yf_symbols == ["AMZN", "SPY"]
+    assert mf_symbols == []
+
+
+def test_merge_fund_navs_outer_joins_and_fills():
+    data_close = pd.DataFrame(
+        {"AMZN": [100.0, 101.0, 102.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+    )
+    fund_navs = {
+        "MF:SCBGOLD": pd.Series(
+            [50.0, 51.0],
+            index=pd.to_datetime(["2024-01-01", "2024-01-03"]),
+        )
+    }
+
+    merged = thai_mf.merge_fund_navs(data_close, fund_navs)
+
+    assert list(merged.columns) == ["AMZN", "MF:SCBGOLD"]
+    assert merged.loc["2024-01-02", "MF:SCBGOLD"] == 50.0  # forward-filled
+    assert merged.loc["2024-01-03", "MF:SCBGOLD"] == 51.0
+
+
+def test_merge_fund_navs_returns_data_close_unchanged_when_no_funds():
+    data_close = pd.DataFrame(
+        {"AMZN": [100.0]}, index=pd.to_datetime(["2024-01-01"])
+    )
+
+    merged = thai_mf.merge_fund_navs(data_close, {})
+
+    pd.testing.assert_frame_equal(merged, data_close)
