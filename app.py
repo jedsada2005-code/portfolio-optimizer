@@ -22,9 +22,19 @@ with st.sidebar:
     )
     col1, col2 = st.columns(2)
     with col1:
-        start_date = st.date_input("Start Date", value=pd.Timestamp("2010-01-01"))
+        start_date = st.date_input(
+            "Start Date",
+            value=pd.Timestamp("2010-01-01"),
+            min_value=pd.Timestamp("1990-01-01"),
+            max_value=pd.Timestamp.today(),
+        )
     with col2:
-        end_date = st.date_input("End Date", value=pd.Timestamp("2022-01-01"))
+        end_date = st.date_input(
+            "End Date",
+            value=pd.Timestamp("2022-01-01"),
+            min_value=pd.Timestamp("1990-01-01"),
+            max_value=pd.Timestamp.today(),
+        )
 
     total_cash = st.number_input("Total Cash (USD)", value=1_000_000, step=100_000)
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
