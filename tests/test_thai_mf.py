@@ -2,6 +2,7 @@ from unittest.mock import MagicMock, patch
 import datetime as dt
 
 import pandas as pd
+import requests
 
 import thai_mf
 
@@ -88,6 +89,73 @@ def test_list_funds_aggregates_across_amcs():
     funds = client.list_funds()
 
     assert {f["proj_id"] for f in funds} == {"p1", "p2"}
+
+
+def test_list_funds_raises_sec_api_error_on_amc_list_http_error():
+    session = MagicMock()
+    error_resp = MagicMock(status_code=401)
+    error_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+        "401 Client Error"
+    )
+    session.get.return_value = error_resp
+    client = _make_client(session)
+
+    try:
+        client.list_funds()
+        assert False, "expected SECAPIError"
+    except thai_mf.SECAPIError:
+        pass
+
+
+def test_list_funds_raises_sec_api_error_on_amc_detail_http_error():
+    session = MagicMock()
+
+    def fake_get(url, headers, timeout):
+        if url == "https://api.sec.or.th/FundFactsheet/fund/amc":
+            return MagicMock(
+                status_code=200,
+                json=lambda: [{"unique_id": "amc-1"}],
+            )
+        if url == "https://api.sec.or.th/FundFactsheet/fund/amc/amc-1":
+            error_resp = MagicMock(status_code=500)
+            error_resp.raise_for_status.side_effect = requests.exceptions.HTTPError(
+                "500 Server Error"
+            )
+            return error_resp
+        raise AssertionError(f"unexpected url {url}")
+
+    session.get.side_effect = fake_get
+    client = _make_client(session)
+
+    try:
+        client.list_funds()
+        assert False, "expected SECAPIError"
+    except thai_mf.SECAPIError:
+        pass
+
+
+def test_list_funds_raises_sec_api_error_on_connection_error():
+    session = MagicMock()
+    session.get.side_effect = requests.exceptions.ConnectionError("connection refused")
+    client = _make_client(session)
+
+    try:
+        client.list_funds()
+        assert False, "expected SECAPIError"
+    except thai_mf.SECAPIError:
+        pass
+
+
+def test_get_daily_nav_raises_sec_api_error_on_connection_error():
+    session = MagicMock()
+    session.get.side_effect = requests.exceptions.Timeout("timed out")
+    client = _make_client(session)
+
+    try:
+        client.get_daily_nav("proj-123", dt.date(2024, 1, 6))
+        assert False, "expected SECAPIError"
+    except thai_mf.SECAPIError:
+        pass
 
 
 def test_resolve_fund_id_matches_abbr_name_case_insensitively(tmp_path, monkeypatch):

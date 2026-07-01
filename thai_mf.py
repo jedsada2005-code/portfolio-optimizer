@@ -31,6 +31,27 @@ class SECFundClient:
     def _headers(self):
         return {"Ocp-Apim-Subscription-Key": self.subscription_key}
 
+    def _get(self, url):
+        """GET url, normalizing network-level failures (connection errors,
+        timeouts, etc.) into SECAPIError so callers only ever need to catch
+        that one exception type for HTTP-calling methods.
+        """
+        try:
+            return self.session.get(url, headers=self._headers(), timeout=30)
+        except requests.exceptions.RequestException as exc:
+            raise SECAPIError(f"Network error calling SEC API at {url}: {exc}") from exc
+
+    def _raise_for_status(self, resp, url):
+        """Like resp.raise_for_status(), but re-raises as SECAPIError so
+        callers only ever need to catch that one exception type.
+        """
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as exc:
+            raise SECAPIError(
+                f"SEC API error {resp.status_code} calling {url}: {exc}"
+            ) from exc
+
     def get_daily_nav(self, proj_id, nav_date):
         """Return the NAV per unit for proj_id on nav_date (a date object),
         or None if no NAV was published that day.
@@ -38,7 +59,7 @@ class SECFundClient:
         url = f"{FUND_DAILY_INFO_BASE}/{proj_id}/dailynav/{nav_date.isoformat()}"
         attempts = 0
         while True:
-            resp = self.session.get(url, headers=self._headers(), timeout=30)
+            resp = self._get(url)
             if resp.status_code == 200:
                 return resp.json().get("last_val")
             if resp.status_code == 204:
@@ -59,10 +80,9 @@ class SECFundClient:
         """Return a flat list of fund dicts (proj_id, proj_abbr_name,
         proj_name_th, proj_name_en, fund_status, ...) across every AMC.
         """
-        resp = self.session.get(
-            f"{FUND_FACTSHEET_BASE}/fund/amc", headers=self._headers(), timeout=30
-        )
-        resp.raise_for_status()
+        amc_list_url = f"{FUND_FACTSHEET_BASE}/fund/amc"
+        resp = self._get(amc_list_url)
+        self._raise_for_status(resp, amc_list_url)
         amcs = resp.json()
 
         funds = []
@@ -70,12 +90,9 @@ class SECFundClient:
             unique_id = amc.get("unique_id")
             if not unique_id:
                 continue
-            detail_resp = self.session.get(
-                f"{FUND_FACTSHEET_BASE}/fund/amc/{unique_id}",
-                headers=self._headers(),
-                timeout=30,
-            )
-            detail_resp.raise_for_status()
+            detail_url = f"{FUND_FACTSHEET_BASE}/fund/amc/{unique_id}"
+            detail_resp = self._get(detail_url)
+            self._raise_for_status(detail_resp, detail_url)
             detail = detail_resp.json()
             if isinstance(detail, list):
                 funds.extend(detail)
