@@ -2,6 +2,7 @@ import json
 import time
 from pathlib import Path
 
+import pandas as pd
 import requests
 
 FUND_FACTSHEET_BASE = "https://api.sec.or.th/FundFactsheet"
@@ -127,3 +128,54 @@ def resolve_fund_id(name, client):
             if candidate and candidate.strip().upper() == target:
                 return fund.get("proj_id")
     return None
+
+
+def _nav_cache_path(proj_id):
+    return CACHE_DIR / f"nav_{proj_id}.csv"
+
+
+def _load_nav_cache(proj_id):
+    path = _nav_cache_path(proj_id)
+    if not path.exists():
+        return pd.Series(dtype=float, name="nav")
+    df = pd.read_csv(path, parse_dates=["date"], index_col="date")
+    return df["nav"]
+
+
+def _save_nav_cache(proj_id, series):
+    _ensure_cache_dir()
+    series.rename("nav").rename_axis("date").to_csv(_nav_cache_path(proj_id))
+
+
+def get_nav_history(client, proj_id, start_date, end_date):
+    """Fetch NAV history for proj_id over [start_date, end_date] inclusive,
+    reading/writing the on-disk cache so already-fetched dates aren't
+    re-requested. Returns (series, incomplete) where series is indexed by
+    date and incomplete is True if fetching stopped early due to sustained
+    rate limiting (SEC has no bulk date-range endpoint, so this is one
+    HTTP call per missing date).
+    """
+    cached = _load_nav_cache(proj_id)
+    all_dates = pd.date_range(start_date, end_date, freq="D")
+    known_dates = set(cached.index)
+    missing_dates = [d for d in all_dates if d not in known_dates]
+
+    incomplete = False
+    updates = {}
+    for ts in missing_dates:
+        try:
+            val = client.get_daily_nav(proj_id, ts.date())
+        except SECRateLimitError:
+            incomplete = True
+            break
+        if val is not None:
+            updates[ts] = val
+
+    if updates:
+        cached = pd.concat([cached, pd.Series(updates)]).sort_index()
+        _save_nav_cache(proj_id, cached)
+
+    result = cached.loc[
+        (cached.index >= pd.Timestamp(start_date)) & (cached.index <= pd.Timestamp(end_date))
+    ]
+    return result.sort_index(), incomplete

@@ -1,6 +1,8 @@
 from unittest.mock import MagicMock, patch
 import datetime as dt
 
+import pandas as pd
+
 import thai_mf
 
 
@@ -126,3 +128,58 @@ def test_resolve_fund_id_uses_cache_on_second_call(tmp_path, monkeypatch):
     thai_mf.resolve_fund_id("SCBGOLD", client)
 
     client.list_funds.assert_called_once()
+
+
+def test_get_nav_history_fetches_and_caches(tmp_path, monkeypatch):
+    monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
+    session = MagicMock()
+    client = _make_client(session)
+    client.get_daily_nav = MagicMock(
+        side_effect=lambda proj_id, d: {
+            dt.date(2024, 1, 1): 10.0,
+            dt.date(2024, 1, 2): 10.5,
+            dt.date(2024, 1, 3): None,  # e.g. weekend, no NAV published
+        }[d]
+    )
+
+    series, incomplete = thai_mf.get_nav_history(
+        client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
+    )
+
+    assert incomplete is False
+    assert list(series.values) == [10.0, 10.5]
+    assert client.get_daily_nav.call_count == 3
+    assert (tmp_path / "nav_p1.csv").exists()
+
+
+def test_get_nav_history_reuses_cache_for_already_fetched_dates(tmp_path, monkeypatch):
+    monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
+    session = MagicMock()
+    client = _make_client(session)
+    client.get_daily_nav = MagicMock(return_value=10.0)
+
+    thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
+    assert client.get_daily_nav.call_count == 1
+
+    thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
+    assert client.get_daily_nav.call_count == 1  # no new calls, served from cache
+
+
+def test_get_nav_history_stops_early_and_flags_incomplete_on_rate_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
+    session = MagicMock()
+    client = _make_client(session)
+
+    def fake_get_daily_nav(proj_id, d):
+        if d == dt.date(2024, 1, 1):
+            return 10.0
+        raise thai_mf.SECRateLimitError("rate limited")
+
+    client.get_daily_nav = MagicMock(side_effect=fake_get_daily_nav)
+
+    series, incomplete = thai_mf.get_nav_history(
+        client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
+    )
+
+    assert incomplete is True
+    assert list(series.values) == [10.0]
