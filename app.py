@@ -93,6 +93,7 @@ if run_btn and len(stock_list) >= 2:
 
     mf_missing = []
     mf_incomplete = []
+    mf_resolved_classes = {}
     if mf_symbols:
         with st.spinner("Downloading Thai mutual fund data..."):
             client = thai_mf.SECFundClient(sec_factsheet_key, sec_daily_info_key)
@@ -100,12 +101,12 @@ if run_btn and len(stock_list) >= 2:
             for name in mf_symbols:
                 display_symbol = f"MF:{name}"
                 try:
-                    proj_id = thai_mf.resolve_fund_id(name, client)
+                    proj_id, preferred_class = thai_mf.resolve_fund_id(name, client)
                     if proj_id is None:
                         mf_missing.append(display_symbol)
                         continue
-                    nav_series, incomplete = thai_mf.get_nav_history(
-                        client, proj_id, start_date, end_date
+                    nav_series, incomplete, chosen_class = thai_mf.get_nav_history(
+                        client, proj_id, preferred_class, start_date, end_date
                     )
                 except thai_mf.SECAPIError:
                     mf_missing.append(display_symbol)
@@ -115,6 +116,7 @@ if run_btn and len(stock_list) >= 2:
                     continue
                 if incomplete:
                     mf_incomplete.append(display_symbol)
+                mf_resolved_classes[display_symbol] = chosen_class
                 fund_navs[display_symbol] = nav_series
             data_close = thai_mf.merge_fund_navs(data_close, fund_navs)
 
@@ -133,6 +135,18 @@ if run_btn and len(stock_list) >= 2:
             "(SEC API rate limit ระหว่างดึงข้อมูล ลองกด Calculate ซ้ำเพื่อดึงวันที่เหลือจาก cache)"
         )
     st.success(f"✅ โหลดสำเร็จ {len(loaded)} ตัว: **{', '.join(loaded)}**")
+
+    resolved_notes = [
+        f"{sym} → {cls}"
+        for sym, cls in mf_resolved_classes.items()
+        if sym in loaded and cls != "main" and cls.upper() != sym[3:].upper()
+    ]
+    if resolved_notes:
+        st.caption(
+            "ℹ️ กองทุนไทยที่มีหลายชนิดหน่วยลงทุน (share class) เลือกใช้ชนิดนี้: "
+            + ", ".join(resolved_notes)
+            + " — ถ้าต้องการชนิดอื่น ให้พิมพ์ชื่อชนิดหน่วยลงทุนแบบเต็ม เช่น `MF:K-GOLD-A(D)`"
+        )
 
     # ─── Calculations ───
     with st.spinner("Computing efficient frontier..."):

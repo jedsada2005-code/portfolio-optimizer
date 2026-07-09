@@ -76,7 +76,7 @@ def test_get_nav_range_sends_daily_info_key_not_factsheet_key():
     )
     client = _make_client(session)
 
-    client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+    client.get_nav_range("p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
 
     sent_headers = session.get.call_args.kwargs["headers"]
     assert sent_headers == {"Ocp-Apim-Subscription-Key": "dummy-daily-info-key"}
@@ -130,6 +130,9 @@ def test_get_nav_range_paginates_and_returns_items():
     def fake_get(url, headers, timeout):
         q = _query(url)
         assert q["proj_id"] == ["p1"]
+        # the endpoint's own class filter is intentionally NOT sent (it
+        # returns empty for some funds); selection happens client-side
+        assert "fund_class_name" not in q
         assert q["start_nav_date"] == ["2024-01-01"]
         assert q["end_nav_date"] == ["2024-01-03"]
         if "next_cursor" not in q:
@@ -139,7 +142,8 @@ def test_get_nav_range_paginates_and_returns_items():
                     "message": "success",
                     "next_cursor": "page-2",
                     "items": [
-                        {"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0}
+                        {"proj_id": "p1", "fund_class_name": "A(A)",
+                         "nav_date": "2024-01-01", "last_val": 10.0}
                     ],
                 },
             )
@@ -150,7 +154,8 @@ def test_get_nav_range_paginates_and_returns_items():
                     "message": "success",
                     "next_cursor": "",
                     "items": [
-                        {"proj_id": "p1", "nav_date": "2024-01-02", "last_val": 10.5}
+                        {"proj_id": "p1", "fund_class_name": "A(A)",
+                         "nav_date": "2024-01-02", "last_val": 10.5}
                     ],
                 },
             )
@@ -159,10 +164,126 @@ def test_get_nav_range_paginates_and_returns_items():
     session.get.side_effect = fake_get
     client = _make_client(session)
 
-    items, incomplete = client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+    items, incomplete = client.get_nav_range("p1", "A(A)", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
 
     assert incomplete is False
     assert [item["nav_date"] for item in items] == ["2024-01-01", "2024-01-02"]
+
+
+def test_get_nav_range_filters_out_other_share_classes():
+    # Regression: a single proj_id spans multiple share classes whose NAVs
+    # differ hugely (e.g. K-GOLD-A(A) ~13.8 vs K-GOLD-C(A) ~63.5). The
+    # endpoint may return rows for several classes; only the requested
+    # class must survive, otherwise the NAV series jumps between classes
+    # and manufactures enormous fake day-over-day returns.
+    session = MagicMock()
+    session.get.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "message": "success",
+            "next_cursor": "",
+            "items": [
+                {"proj_id": "p1", "fund_class_name": "K-GOLD-A(A)",
+                 "nav_date": "2024-04-29", "last_val": 13.80},
+                {"proj_id": "p1", "fund_class_name": "K-GOLD-C(A)",
+                 "nav_date": "2024-04-29", "last_val": 63.51},
+                {"proj_id": "p1", "fund_class_name": "K-GOLD-A(D)",
+                 "nav_date": "2024-04-29", "last_val": 11.68},
+            ],
+        },
+    )
+    client = _make_client(session)
+
+    items, incomplete = client.get_nav_range(
+        "p1", "K-GOLD-A(A)", dt.date(2024, 4, 29), dt.date(2024, 4, 29)
+    )
+
+    assert incomplete is False
+    assert len(items) == 1
+    assert items[0]["fund_class_name"] == "K-GOLD-A(A)"
+    assert items[0]["last_val"] == 13.80
+
+
+def test_get_nav_range_falls_back_to_main_when_preferred_class_absent():
+    # The NAV feed labels some funds' class differently from the profiles
+    # feed (e.g. K-CASH is "K-CASH-A" in profiles but "main" in NAV). When
+    # the preferred class isn't present, fall back to "main" rather than
+    # returning nothing.
+    session = MagicMock()
+    session.get.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "message": "success",
+            "next_cursor": "",
+            "items": [
+                {"proj_id": "p1", "fund_class_name": "main",
+                 "nav_date": "2024-01-01", "last_val": 13.60},
+            ],
+        },
+    )
+    client = _make_client(session)
+
+    items, incomplete = client.get_nav_range(
+        "p1", "K-CASH-A", dt.date(2024, 1, 1), dt.date(2024, 1, 1)
+    )
+
+    assert [i["fund_class_name"] for i in items] == ["main"]
+
+
+def test_get_nav_range_falls_back_to_largest_class_when_no_match_and_no_main():
+    session = MagicMock()
+    session.get.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "message": "success",
+            "next_cursor": "",
+            "items": [
+                {"proj_id": "p1", "fund_class_name": "X-B", "nav_date": "2024-01-01", "last_val": 5.0},
+                {"proj_id": "p1", "fund_class_name": "X-A", "nav_date": "2024-01-01", "last_val": 9.0},
+                {"proj_id": "p1", "fund_class_name": "X-A", "nav_date": "2024-01-02", "last_val": 9.1},
+            ],
+        },
+    )
+    client = _make_client(session)
+
+    items, incomplete = client.get_nav_range(
+        "p1", "SOMETHING-ELSE", dt.date(2024, 1, 1), dt.date(2024, 1, 2)
+    )
+
+    # X-A has the most rows -> selected; never a mix of X-A and X-B
+    assert {i["fund_class_name"] for i in items} == {"X-A"}
+    assert len(items) == 2
+
+
+def test_get_nav_range_prefers_accumulation_over_dividend_class():
+    # A dividend class ("-D"/"(D)") often has MORE history, but its NAV
+    # drops on payouts and understates total return, so an accumulation
+    # class must win even with fewer rows.
+    session = MagicMock()
+    session.get.return_value = MagicMock(
+        status_code=200,
+        json=lambda: {
+            "message": "success",
+            "next_cursor": "",
+            "items": [
+                {"proj_id": "p1", "fund_class_name": "K-GOLD-A(D)",
+                 "nav_date": "2024-01-01", "last_val": 11.5},
+                {"proj_id": "p1", "fund_class_name": "K-GOLD-A(D)",
+                 "nav_date": "2024-01-02", "last_val": 11.6},
+                {"proj_id": "p1", "fund_class_name": "K-GOLD-A(D)",
+                 "nav_date": "2024-01-03", "last_val": 11.7},
+                {"proj_id": "p1", "fund_class_name": "K-GOLD-A(A)",
+                 "nav_date": "2024-01-03", "last_val": 13.8},
+            ],
+        },
+    )
+    client = _make_client(session)
+
+    items, incomplete = client.get_nav_range(
+        "p1", None, dt.date(2024, 1, 1), dt.date(2024, 1, 3)
+    )
+
+    assert {i["fund_class_name"] for i in items} == {"K-GOLD-A(A)"}
 
 
 def test_get_nav_range_raises_sec_api_error_on_http_error():
@@ -173,7 +294,7 @@ def test_get_nav_range_raises_sec_api_error_on_http_error():
     client = _make_client(session)
 
     try:
-        client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+        client.get_nav_range("p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
         assert False, "expected SECAPIError"
     except thai_mf.SECAPIError:
         pass
@@ -185,7 +306,7 @@ def test_get_nav_range_raises_sec_api_error_on_connection_error():
     client = _make_client(session)
 
     try:
-        client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+        client.get_nav_range("p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
         assert False, "expected SECAPIError"
     except thai_mf.SECAPIError:
         pass
@@ -197,7 +318,7 @@ def test_get_nav_range_raises_sec_api_error_when_response_body_is_not_an_object(
     client = _make_client(session)
 
     try:
-        client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+        client.get_nav_range("p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
         assert False, "expected SECAPIError"
     except thai_mf.SECAPIError:
         pass
@@ -209,7 +330,7 @@ def test_get_nav_range_returns_incomplete_on_sustained_rate_limit(mock_sleep):
     session.get.return_value = MagicMock(status_code=429)
     client = _make_client(session)
 
-    items, incomplete = client.get_nav_range("p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
+    items, incomplete = client.get_nav_range("p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 3))
 
     assert incomplete is True
     assert items == []
@@ -217,39 +338,67 @@ def test_get_nav_range_returns_incomplete_on_sustained_rate_limit(mock_sleep):
     assert mock_sleep.call_count == thai_mf.MAX_RETRIES - 1
 
 
-def test_resolve_fund_id_matches_abbr_name_case_insensitively(tmp_path, monkeypatch):
+def test_resolve_fund_id_fund_level_match_defers_class_choice(tmp_path, monkeypatch):
+    # Typing the fund-level abbreviation is ambiguous across share classes,
+    # so resolve returns preferred_class=None and lets the NAV layer pick
+    # the primary class (the profiles class label is unreliable here).
     monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
     session = MagicMock()
     client = _make_client(session)
     client.list_funds = MagicMock(
         return_value=[
-            {"proj_id": "p1", "proj_abbr_name": "K-CHANGE-A(A)"},
-            {"proj_id": "p2", "proj_abbr_name": "SCBGOLD"},
+            {"proj_id": "p1", "proj_abbr_name": "K-GOLD", "fund_class_name": "K-GOLD-A(A)"},
+            {"proj_id": "p1", "proj_abbr_name": "K-GOLD", "fund_class_name": "K-GOLD-A(D)"},
+            {"proj_id": "p2", "proj_abbr_name": "SCBGOLD", "fund_class_name": "main"},
         ]
     )
 
-    result = thai_mf.resolve_fund_id("k-change-a(a)", client)
+    proj_id, preferred_class = thai_mf.resolve_fund_id("k-gold", client)
 
-    assert result == "p1"
+    assert proj_id == "p1"
+    assert preferred_class is None
     client.list_funds.assert_called_once()
 
 
-def test_resolve_fund_id_returns_none_when_unmatched(tmp_path, monkeypatch):
+def test_resolve_fund_id_exact_class_match_pins_that_class(tmp_path, monkeypatch):
     monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
     session = MagicMock()
     client = _make_client(session)
-    client.list_funds = MagicMock(return_value=[{"proj_id": "p1", "proj_abbr_name": "SCBGOLD"}])
+    client.list_funds = MagicMock(
+        return_value=[
+            {"proj_id": "p1", "proj_abbr_name": "K-GOLD", "fund_class_name": "K-GOLD-A(A)"},
+            {"proj_id": "p1", "proj_abbr_name": "K-GOLD", "fund_class_name": "K-GOLD-A(D)"},
+            {"proj_id": "p1", "proj_abbr_name": "K-GOLD", "fund_class_name": "K-GOLD-C(A)"},
+        ]
+    )
 
-    result = thai_mf.resolve_fund_id("NOT-A-REAL-FUND", client)
+    proj_id, preferred_class = thai_mf.resolve_fund_id("k-gold-a(d)", client)
 
-    assert result is None
+    assert proj_id == "p1"
+    assert preferred_class == "K-GOLD-A(D)"
+
+
+def test_resolve_fund_id_returns_none_tuple_when_unmatched(tmp_path, monkeypatch):
+    monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
+    session = MagicMock()
+    client = _make_client(session)
+    client.list_funds = MagicMock(
+        return_value=[{"proj_id": "p1", "proj_abbr_name": "SCBGOLD", "fund_class_name": "main"}]
+    )
+
+    proj_id, fund_class_name = thai_mf.resolve_fund_id("NOT-A-REAL-FUND", client)
+
+    assert proj_id is None
+    assert fund_class_name is None
 
 
 def test_resolve_fund_id_uses_cache_on_second_call(tmp_path, monkeypatch):
     monkeypatch.setattr(thai_mf, "CACHE_DIR", tmp_path)
     session = MagicMock()
     client = _make_client(session)
-    client.list_funds = MagicMock(return_value=[{"proj_id": "p1", "proj_abbr_name": "SCBGOLD"}])
+    client.list_funds = MagicMock(
+        return_value=[{"proj_id": "p1", "proj_abbr_name": "SCBGOLD", "fund_class_name": "main"}]
+    )
 
     thai_mf.resolve_fund_id("SCBGOLD", client)
     thai_mf.resolve_fund_id("SCBGOLD", client)
@@ -264,24 +413,27 @@ def test_get_nav_history_fetches_and_caches(tmp_path, monkeypatch):
     client.get_nav_range = MagicMock(
         return_value=(
             [
-                {"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0},
-                {"proj_id": "p1", "nav_date": "2024-01-02", "last_val": 10.5},
+                {"proj_id": "p1", "fund_class_name": "main",
+                 "nav_date": "2024-01-01", "last_val": 10.0},
+                {"proj_id": "p1", "fund_class_name": "main",
+                 "nav_date": "2024-01-02", "last_val": 10.5},
             ],
             False,
         )
     )
 
-    series, incomplete = thai_mf.get_nav_history(
-        client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
+    series, incomplete, chosen_class = thai_mf.get_nav_history(
+        client, "p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
     )
 
     assert incomplete is False
+    assert chosen_class == "main"
     assert list(series.values) == [10.0, 10.5]
     client.get_nav_range.assert_called_once_with(
-        "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
+        "p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
     )
-    assert (tmp_path / "nav_p1.csv").exists()
-    assert (tmp_path / "nav_p1.meta.json").exists()
+    assert (tmp_path / "nav_p1__main.csv").exists()
+    assert (tmp_path / "nav_p1__main.meta.json").exists()
 
 
 def test_get_nav_history_reuses_cache_for_already_fetched_range(tmp_path, monkeypatch):
@@ -289,13 +441,13 @@ def test_get_nav_history_reuses_cache_for_already_fetched_range(tmp_path, monkey
     session = MagicMock()
     client = _make_client(session)
     client.get_nav_range = MagicMock(
-        return_value=([{"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0}], False)
+        return_value=([{"proj_id": "p1", "fund_class_name": "main", "nav_date": "2024-01-01", "last_val": 10.0}], False)
     )
 
-    thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
+    thai_mf.get_nav_history(client, "p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
     assert client.get_nav_range.call_count == 1
 
-    thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
+    thai_mf.get_nav_history(client, "p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
     assert client.get_nav_range.call_count == 1  # no new call, served from cache
 
 
@@ -304,13 +456,13 @@ def test_get_nav_history_refetches_when_requested_range_extends_beyond_cache(tmp
     session = MagicMock()
     client = _make_client(session)
     client.get_nav_range = MagicMock(
-        return_value=([{"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0}], False)
+        return_value=([{"proj_id": "p1", "fund_class_name": "main", "nav_date": "2024-01-01", "last_val": 10.0}], False)
     )
 
-    thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
+    thai_mf.get_nav_history(client, "p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 1))
     assert client.get_nav_range.call_count == 1
 
-    thai_mf.get_nav_history(client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 5))
+    thai_mf.get_nav_history(client, "p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 5))
     assert client.get_nav_range.call_count == 2  # wider range not covered by cache
 
 
@@ -321,17 +473,17 @@ def test_get_nav_history_flags_incomplete_and_keeps_partial_results_on_rate_limi
     session = MagicMock()
     client = _make_client(session)
     client.get_nav_range = MagicMock(
-        return_value=([{"proj_id": "p1", "nav_date": "2024-01-01", "last_val": 10.0}], True)
+        return_value=([{"proj_id": "p1", "fund_class_name": "main", "nav_date": "2024-01-01", "last_val": 10.0}], True)
     )
 
-    series, incomplete = thai_mf.get_nav_history(
-        client, "p1", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
+    series, incomplete, chosen_class = thai_mf.get_nav_history(
+        client, "p1", "main", dt.date(2024, 1, 1), dt.date(2024, 1, 3)
     )
 
     assert incomplete is True
     assert list(series.values) == [10.0]
     # an incomplete fetch must not mark the range as fully cached
-    assert not (tmp_path / "nav_p1.meta.json").exists()
+    assert not (tmp_path / "nav_p1__main.meta.json").exists()
 
 
 def test_split_symbols_separates_mf_prefixed_entries():

@@ -126,15 +126,67 @@ class SECFundClient:
                 break
         return funds
 
-    def get_nav_range(self, proj_id, start_date, end_date):
-        """Fetch all daily NAV records for proj_id between start_date and
-        end_date (inclusive), paginating via next_cursor until exhausted.
-        Uses the Fund Daily Info API subscription key. Returns
-        (items, incomplete) — the item dicts collected so far, and whether
-        pagination was cut short by sustained rate limiting (in which case
-        items holds whatever was fetched before that point).
+    @staticmethod
+    def _select_class_items(items, preferred_class):
+        """From NAV rows that may span several share classes of one
+        proj_id, return only the rows of a single class.
+
+        A single proj_id can cover several share classes (accumulation,
+        dividend, currency-hedged, ...) whose NAVs differ by a large
+        factor; blending them into one series manufactures enormous
+        phantom day-over-day returns that corrupt any backtest, so exactly
+        one class must be kept.
+
+        preferred_class is only a hint (it may be None when the user typed
+        a fund-level name, and even when set it may not appear in the NAV
+        feed because the NAV and profiles feeds use different labels —
+        e.g. K-CASH is "K-CASH-A" in profiles but "main" in NAV).
+        Selection order:
+          1. preferred_class, if set and present in the NAV rows;
+          2. otherwise "main", if present;
+          3. otherwise, among the fund's classes, prefer an accumulation
+             class over a dividend-paying one (a dividend class's NAV
+             drops on each payout and understates total return, which
+             would undercount a backtest), then the class with the most
+             rows (longest history), ties broken alphabetically.
+        Whatever the path, exactly one class is returned — never a mix.
         """
-        items = []
+        by_class = {}
+        for item in items:
+            by_class.setdefault(item.get("fund_class_name"), []).append(item)
+        if not by_class:
+            return []
+        if preferred_class is not None and preferred_class in by_class:
+            chosen = preferred_class
+        elif "main" in by_class:
+            chosen = "main"
+        else:
+            def rank(cls):
+                label = (cls or "").strip().upper()
+                is_dividend = label.endswith("(D)") or label.endswith("-D")
+                return (is_dividend, -len(by_class[cls]), str(cls))
+
+            chosen = sorted(by_class, key=rank)[0]
+        return by_class[chosen]
+
+    def get_nav_range(self, proj_id, fund_class_name, start_date, end_date):
+        """Fetch daily NAV records for a single share class of proj_id
+        between start_date and end_date inclusive, paginating via
+        next_cursor until exhausted. Uses the Fund Daily Info API key.
+
+        All classes are fetched (the endpoint's own fund_class_name filter
+        is NOT used — it returns an empty body for funds whose NAV class
+        labels differ from the profiles labels, e.g. K-CASH), then exactly
+        one class is selected via _select_class_items so a mix of classes
+        can never leak into one price series.
+
+        Returns (items, incomplete) — the single-class item dicts, and
+        whether pagination was cut short by sustained rate limiting (in
+        which case items holds whatever class-selected rows were fetched
+        before that point).
+        """
+        raw_items = []
+        incomplete = False
         next_cursor = None
         while True:
             params = {
@@ -147,17 +199,18 @@ class SECFundClient:
                 params["next_cursor"] = next_cursor
             url = f"{FUND_NAV_URL}?{urlencode(params)}"
 
-            resp, incomplete = self._get_with_retry(url, self.daily_info_key)
-            if incomplete:
-                return items, True
+            resp, hit_rate_limit = self._get_with_retry(url, self.daily_info_key)
+            if hit_rate_limit:
+                incomplete = True
+                break
 
             self._raise_for_status(resp, url)
             payload = self._parse_json_object(resp, url)
-            items.extend(payload.get("items", []))
+            raw_items.extend(payload.get("items", []))
             next_cursor = payload.get("next_cursor")
             if not next_cursor:
                 break
-        return items, False
+        return self._select_class_items(raw_items, fund_class_name), incomplete
 
 
 def _ensure_cache_dir():
@@ -186,9 +239,21 @@ def _save_fund_list_cache(funds):
 
 
 def resolve_fund_id(name, client):
-    """Resolve a fund short name (as typed after the MF: prefix) to its
-    SEC proj_id. Matches case-insensitively against proj_abbr_name,
-    proj_name_th, and proj_name_en. Returns None if no fund matches.
+    """Resolve a fund name (as typed after the MF: prefix) to a
+    (proj_id, preferred_class) pair. Returns (None, None) if no fund
+    matches.
+
+    Matching is case-insensitive and tries, in order:
+      1. An exact share-class name (fund_class_name) — lets the user pin
+         an exact class, e.g. "K-GOLD-A(D)". preferred_class is that class.
+      2. The fund-level abbreviation / Thai / English name
+         (proj_abbr_name / proj_name_th / proj_name_en). This is
+         ambiguous across the fund's share classes, so preferred_class is
+         returned as None, meaning "let the NAV layer pick the primary
+         class" (see SECFundClient._select_class_items) — the profiles
+         feed's own class labels are unreliable for this (they can be
+         typo'd, and differ from the NAV feed's labels), whereas the
+         class with the most NAV history is a robust primary-class proxy.
     """
     funds = _load_fund_list_cache()
     if funds is None:
@@ -196,77 +261,112 @@ def resolve_fund_id(name, client):
         _save_fund_list_cache(funds)
 
     target = name.strip().upper()
+
+    # 1. Exact share-class match -> pin that class.
     for fund in funds:
-        candidates = (
-            fund.get("proj_abbr_name"),
-            fund.get("proj_name_th"),
-            fund.get("proj_name_en"),
-        )
-        for candidate in candidates:
-            if candidate and candidate.strip().upper() == target:
-                return fund.get("proj_id")
-    return None
+        cls = fund.get("fund_class_name")
+        if cls and cls.strip().upper() == target:
+            return fund.get("proj_id"), cls
+
+    # 2. Fund-level name match -> defer class choice to the NAV layer.
+    for fund in funds:
+        if any(
+            (fund.get(field) or "").strip().upper() == target
+            for field in ("proj_abbr_name", "proj_name_th", "proj_name_en")
+        ):
+            return fund.get("proj_id"), None
+
+    return None, None
 
 
-def _nav_cache_path(proj_id):
-    return CACHE_DIR / f"nav_{proj_id}.csv"
+def _cache_key(proj_id, fund_class_name):
+    """Build a filesystem-safe cache key for one share class of a fund.
+    NAV is cached per (proj_id, fund_class_name) because different classes
+    of the same proj_id have different NAV series. fund_class_name is None
+    when the class is auto-selected from the NAV data (fund-level match).
+    """
+    label = fund_class_name if fund_class_name is not None else "auto"
+    slug = "".join(c if c.isalnum() or c in "-_" else "_" for c in label)
+    return f"{proj_id}__{slug}"
 
 
-def _nav_meta_path(proj_id):
-    return CACHE_DIR / f"nav_{proj_id}.meta.json"
+def _nav_cache_path(proj_id, fund_class_name):
+    return CACHE_DIR / f"nav_{_cache_key(proj_id, fund_class_name)}.csv"
 
 
-def _load_nav_cache(proj_id):
-    path = _nav_cache_path(proj_id)
+def _nav_meta_path(proj_id, fund_class_name):
+    return CACHE_DIR / f"nav_{_cache_key(proj_id, fund_class_name)}.meta.json"
+
+
+def _load_nav_cache(proj_id, fund_class_name):
+    path = _nav_cache_path(proj_id, fund_class_name)
     if not path.exists():
         return pd.Series(dtype=float, name="nav")
     df = pd.read_csv(path, parse_dates=["date"], index_col="date")
     return df["nav"]
 
 
-def _save_nav_cache(proj_id, series):
+def _save_nav_cache(proj_id, fund_class_name, series):
     _ensure_cache_dir()
-    series.rename("nav").rename_axis("date").to_csv(_nav_cache_path(proj_id))
+    series.rename("nav").rename_axis("date").to_csv(_nav_cache_path(proj_id, fund_class_name))
 
 
-def _load_nav_meta(proj_id):
-    """Return (fetched_start, fetched_end) as date objects for the date
-    range already fully fetched for proj_id, or None if never fetched.
+def _load_nav_meta(proj_id, fund_class_name):
+    """Return (fetched_start, fetched_end, chosen_class) for the date
+    range already fully fetched for this class key, or None if never
+    fetched. chosen_class is the actual NAV class stored (which may differ
+    from the requested fund_class_name).
     """
-    path = _nav_meta_path(proj_id)
+    path = _nav_meta_path(proj_id, fund_class_name)
     if not path.exists():
         return None
     with open(path) as f:
         data = json.load(f)
-    return date.fromisoformat(data["start_date"]), date.fromisoformat(data["end_date"])
+    return (
+        date.fromisoformat(data["start_date"]),
+        date.fromisoformat(data["end_date"]),
+        data.get("chosen_class"),
+    )
 
 
-def _save_nav_meta(proj_id, start_date, end_date):
+def _save_nav_meta(proj_id, fund_class_name, start_date, end_date, chosen_class):
     _ensure_cache_dir()
-    with open(_nav_meta_path(proj_id), "w") as f:
-        json.dump({"start_date": start_date.isoformat(), "end_date": end_date.isoformat()}, f)
+    with open(_nav_meta_path(proj_id, fund_class_name), "w") as f:
+        json.dump(
+            {
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "chosen_class": chosen_class,
+            },
+            f,
+        )
 
 
-def get_nav_history(client, proj_id, start_date, end_date):
-    """Fetch NAV history for proj_id over [start_date, end_date] inclusive,
-    reading/writing the on-disk cache so a range that's already been fully
-    fetched isn't re-requested. Returns (series, incomplete) where series
-    is indexed by date and incomplete is True if fetching was interrupted
-    by sustained rate limiting (whatever was fetched is still cached and
-    returned; incomplete signals the caller that some dates in range may
-    be missing).
+def get_nav_history(client, proj_id, fund_class_name, start_date, end_date):
+    """Fetch NAV history for one share class of proj_id over
+    [start_date, end_date] inclusive, reading/writing the on-disk cache so
+    a range that's already been fully fetched isn't re-requested.
+
+    fund_class_name is the preferred class (may be None for a fund-level
+    match, in which case the primary class is auto-selected from the NAV
+    data). Returns (series, incomplete, chosen_class):
+      - series indexed by date (a single class, never a mix);
+      - incomplete True if fetching was interrupted by sustained rate
+        limiting (whatever was fetched is still cached and returned);
+      - chosen_class the actual NAV class label used.
     """
-    fetched_range = _load_nav_meta(proj_id)
-    if fetched_range and fetched_range[0] <= start_date and fetched_range[1] >= end_date:
-        cached = _load_nav_cache(proj_id)
+    fetched = _load_nav_meta(proj_id, fund_class_name)
+    if fetched and fetched[0] <= start_date and fetched[1] >= end_date:
+        cached = _load_nav_cache(proj_id, fund_class_name)
         result = cached.loc[
             (cached.index >= pd.Timestamp(start_date)) & (cached.index <= pd.Timestamp(end_date))
         ]
-        return result.sort_index(), False
+        return result.sort_index(), False, fetched[2]
 
-    items, incomplete = client.get_nav_range(proj_id, start_date, end_date)
+    items, incomplete = client.get_nav_range(proj_id, fund_class_name, start_date, end_date)
+    chosen_class = items[0].get("fund_class_name") if items else fund_class_name
 
-    cached = _load_nav_cache(proj_id)
+    cached = _load_nav_cache(proj_id, fund_class_name)
     updates = {
         pd.Timestamp(item["nav_date"]): item["last_val"]
         for item in items
@@ -275,15 +375,15 @@ def get_nav_history(client, proj_id, start_date, end_date):
     if updates:
         cached = pd.concat([cached, pd.Series(updates)])
         cached = cached[~cached.index.duplicated(keep="last")].sort_index()
-        _save_nav_cache(proj_id, cached)
+        _save_nav_cache(proj_id, fund_class_name, cached)
 
     if not incomplete:
-        _save_nav_meta(proj_id, start_date, end_date)
+        _save_nav_meta(proj_id, fund_class_name, start_date, end_date, chosen_class)
 
     result = cached.loc[
         (cached.index >= pd.Timestamp(start_date)) & (cached.index <= pd.Timestamp(end_date))
     ]
-    return result.sort_index(), incomplete
+    return result.sort_index(), incomplete, chosen_class
 
 
 MF_PREFIX = "MF:"
