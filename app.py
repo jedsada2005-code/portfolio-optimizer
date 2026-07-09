@@ -5,6 +5,7 @@ import numpy as np
 import plotly.graph_objs as go
 import plotly.express as px
 from pypfopt import EfficientFrontier, CLA, plotting
+from pypfopt.exceptions import OptimizationError
 import matplotlib.pyplot as plt
 import io
 
@@ -84,7 +85,7 @@ if run_btn and len(stock_list) >= 2:
                 interval="1d",
                 auto_adjust=True,
             )
-            data_close = df["Close"].ffill().bfill()
+            data_close = df["Close"].ffill()
             data_close.dropna(how="all", inplace=True)
             data_close.dropna(axis=1, how="all", inplace=True)
         else:
@@ -137,6 +138,30 @@ if run_btn and len(stock_list) >= 2:
     with st.spinner("Computing efficient frontier..."):
         weekly = data_close.resample("W-FRI").last()
         ar = weekly.pct_change(52).mean()
+
+        # An asset with less than a year of real history in the selected
+        # date range has no valid 52-week trailing return, so ar is NaN
+        # for it. Passing NaN into the optimizer breaks the solver, so
+        # exclude those assets here (rather than silently backfilling a
+        # fake flat price for them) and tell the user why.
+        insufficient_history = list(ar[ar.isna()].index)
+        if insufficient_history:
+            st.warning(
+                f"⚠️ ข้อมูลไม่พอสำหรับคำนวณ (ต้องมีข้อมูลอย่างน้อย 1 ปีในช่วงวันที่ที่เลือก): "
+                f"**{', '.join(insufficient_history)}** — ไม่รวมในการคำนวณพอร์ต "
+                "(ลองขยาย End Date ให้ไกลขึ้น หรือปรับ Start Date ให้อยู่หลังวันที่กองทุนจดทะเบียน)"
+            )
+            data_close = data_close.drop(columns=insufficient_history)
+            weekly = weekly.drop(columns=insufficient_history)
+            ar = ar.drop(index=insufficient_history)
+
+        if len(ar) < 2:
+            st.error(
+                "เหลือสินทรัพย์ที่มีข้อมูลเพียงพอน้อยกว่า 2 ตัว ไม่สามารถคำนวณพอร์ตได้ "
+                "ลองขยายช่วงวันที่ หรือลดกองทุนที่เพิ่งจดทะเบียนออก"
+            )
+            st.stop()
+
         covr = weekly.pct_change().cov() * 52
 
         # Random portfolios
@@ -148,7 +173,15 @@ if run_btn and len(stock_list) >= 2:
 
         # Max Sharpe weights
         ef = EfficientFrontier(ar, covr)
-        raw_weights = ef.max_sharpe(risk_free_rate=risk_free_rate)
+        try:
+            raw_weights = ef.max_sharpe(risk_free_rate=risk_free_rate)
+        except (ValueError, OptimizationError):
+            st.error(
+                "⚠️ หาพอร์ต Max Sharpe ไม่ได้ — สินทรัพย์ที่เลือกมีผลตอบแทนคาดหวังใกล้เคียงหรือต่ำกว่า "
+                f"Risk-Free Rate ที่ตั้งไว้ ({risk_free_rate:.2%}) เกินไป "
+                "ลองลด Risk-Free Rate ลง หรือเพิ่มสินทรัพย์ที่ผลตอบแทนสูงกว่าเข้าไปในพอร์ต"
+            )
+            st.stop()
         cleaned = dict(raw_weights)
         perf = ef.portfolio_performance(risk_free_rate=risk_free_rate)
         opt_ret, opt_vol, opt_sharpe = perf

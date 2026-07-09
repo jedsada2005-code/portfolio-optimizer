@@ -367,6 +367,30 @@ def test_merge_fund_navs_outer_joins_and_fills():
     assert merged.loc["2024-01-03", "MF:SCBGOLD"] == 51.0
 
 
+def test_merge_fund_navs_does_not_backfill_before_funds_first_nav_date():
+    # A fund that started trading well after the rest of the portfolio's
+    # history (e.g. a newly registered Thai fund) must stay NaN for dates
+    # before its own first NAV, not get a fake flat price backfilled in —
+    # that would collapse its variance to ~0 for that whole span and can
+    # make the portfolio optimizer's covariance matrix singular.
+    data_close = pd.DataFrame(
+        {"AMZN": [100.0, 101.0, 102.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+    )
+    fund_navs = {
+        "MF:NEWFUND": pd.Series(
+            [50.0],
+            index=pd.to_datetime(["2024-01-03"]),
+        )
+    }
+
+    merged = thai_mf.merge_fund_navs(data_close, fund_navs)
+
+    assert pd.isna(merged.loc["2024-01-01", "MF:NEWFUND"])
+    assert pd.isna(merged.loc["2024-01-02", "MF:NEWFUND"])
+    assert merged.loc["2024-01-03", "MF:NEWFUND"] == 50.0
+
+
 def test_merge_fund_navs_returns_data_close_unchanged_when_no_funds():
     data_close = pd.DataFrame(
         {"AMZN": [100.0]}, index=pd.to_datetime(["2024-01-01"])

@@ -306,11 +306,20 @@ def split_symbols(stock_list):
 
 def merge_fund_navs(data_close, fund_navs):
     """Outer-join Thai fund NAV series (dict of display_symbol -> pd.Series)
-    onto the yfinance data_close DataFrame, forward/backward filling to
-    match the existing stock-data fill behavior. No-op if fund_navs is empty.
+    onto the yfinance data_close DataFrame, forward-filling gaps (e.g.
+    non-trading days) within each asset's own history. No-op if fund_navs
+    is empty.
+
+    Deliberately does NOT back-fill: a fund's dates before its own first
+    published NAV are left as NaN rather than papered over with its
+    earliest known price. Back-filling a flat price across a fund's entire
+    pre-inception period makes its computed variance/covariance collapse
+    toward zero, which can produce a near-singular covariance matrix and
+    break the portfolio optimizer for any fund significantly younger than
+    the other assets in the selected date range.
     """
     if not fund_navs:
         return data_close
     mf_df = pd.DataFrame(fund_navs)
     merged = data_close.join(mf_df, how="outer") if not data_close.empty else mf_df
-    return merged.sort_index().ffill().bfill()
+    return merged.sort_index().ffill()
