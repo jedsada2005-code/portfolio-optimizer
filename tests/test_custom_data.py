@@ -1,0 +1,95 @@
+import io
+
+import pandas as pd
+
+import custom_data
+
+
+def test_parse_wide_csv_with_multiple_assets():
+    csv = io.StringIO(
+        "Date,AAPL,SPY\n"
+        "2024-01-01,100,400\n"
+        "2024-01-02,101,402\n"
+    )
+
+    prices = custom_data.parse_price_csv(csv, "ignored.csv")
+
+    assert list(prices.columns) == ["AAPL", "SPY"]
+    assert prices.loc[pd.Timestamp("2024-01-02"), "AAPL"] == 101
+    assert prices.loc[pd.Timestamp("2024-01-02"), "SPY"] == 402
+
+
+def test_parse_long_csv_with_symbol_and_close_columns():
+    csv = io.StringIO(
+        "Date,Symbol,Close\n"
+        "2024-01-01,AAPL,100\n"
+        "2024-01-01,SPY,400\n"
+        "2024-01-02,AAPL,101\n"
+    )
+
+    prices = custom_data.parse_price_csv(csv, "ignored.csv")
+
+    assert list(prices.columns) == ["AAPL", "SPY"]
+    assert prices.loc[pd.Timestamp("2024-01-01"), "SPY"] == 400
+    assert prices.loc[pd.Timestamp("2024-01-02"), "AAPL"] == 101
+
+
+def test_parse_single_asset_csv_uses_file_name_when_column_is_close():
+    csv = io.StringIO(
+        "Date,Close\n"
+        "2024-01-01,10.5\n"
+        "2024-01-02,10.8\n"
+    )
+
+    prices = custom_data.parse_price_csv(csv, "my custom asset.csv")
+
+    assert list(prices.columns) == ["MY_CUSTOM_ASSET"]
+    assert prices.loc[pd.Timestamp("2024-01-02"), "MY_CUSTOM_ASSET"] == 10.8
+
+
+def test_parse_csv_rejects_missing_date_column():
+    csv = io.StringIO(
+        "Asset,Close\n"
+        "AAPL,100\n"
+        "SPY,400\n"
+    )
+
+    try:
+        custom_data.parse_price_csv(csv, "bad.csv")
+        assert False, "expected CSVPriceDataError"
+    except custom_data.CSVPriceDataError:
+        pass
+
+
+def test_merge_uploaded_prices_outer_joins_and_forward_fills():
+    market = pd.DataFrame(
+        {"AAPL": [100.0, 101.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-03"]),
+    )
+    uploaded = pd.DataFrame(
+        {"PRIVATE_FUND": [50.0, 51.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02"]),
+    )
+
+    merged = custom_data.merge_uploaded_prices(market, uploaded)
+
+    assert list(merged.columns) == ["AAPL", "PRIVATE_FUND"]
+    assert merged.loc[pd.Timestamp("2024-01-02"), "AAPL"] == 100.0
+    assert merged.loc[pd.Timestamp("2024-01-03"), "PRIVATE_FUND"] == 51.0
+
+
+def test_merge_uploaded_prices_rejects_duplicate_market_symbol():
+    market = pd.DataFrame(
+        {"AAPL": [100.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+    uploaded = pd.DataFrame(
+        {"AAPL": [99.0]},
+        index=pd.to_datetime(["2024-01-01"]),
+    )
+
+    try:
+        custom_data.merge_uploaded_prices(market, uploaded)
+        assert False, "expected CSVPriceDataError"
+    except custom_data.CSVPriceDataError as exc:
+        assert "AAPL" in str(exc)

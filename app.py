@@ -9,6 +9,7 @@ from pypfopt.exceptions import OptimizationError
 import matplotlib.pyplot as plt
 import io
 
+import custom_data
 import thai_mf
 
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
@@ -39,6 +40,15 @@ with st.sidebar:
 
     total_cash = st.number_input("Total Cash (USD)", value=1_000_000, step=100_000)
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
+    uploaded_csv_files = st.file_uploader(
+        "Upload CSV Price Data",
+        type=["csv"],
+        accept_multiple_files=True,
+        help=(
+            "รองรับ Date,AAPL,SPY... หรือ Date,Symbol,Close หรือ Date,Close "
+            "(กรณี Date,Close จะใช้ชื่อไฟล์เป็นชื่อสินทรัพย์)"
+        ),
+    )
     sec_factsheet_key = st.text_input(
         "SEC Fund Factsheet API Key (สำหรับกองทุนไทย)",
         value="",
@@ -62,11 +72,44 @@ with st.sidebar:
     st.caption("5. ค่า Return, Vol, Sharpe ใน Expected กับ Backtest มีค่าใกล้เคียงกันแต่อาจต่างกันเล็กน้อย เนื่องจากคำนวณคนละวิธี")
     st.caption("6. หุ้นบางตัวอาจโหลดไม่สำเร็จ เพราะเขียนชื่อผิด หรือในปีนั้นยังไม่มีข้อมูล (ตรวจสอบชื่อและปีที่ดึงข้อมูลให้ดี)")
     st.caption("7. กองทุนรวมไทยใส่ prefix `MF:` เช่น `MF:K-CHANGE-A(A)` ข้อมูลมาจาก SEC Open Data และต้องกรอก API Key ทั้ง 2 ช่องด้านบน (Fund Factsheet กับ Fund Daily Info เป็นคนละ key กัน ต้อง subscribe แยกกัน)")
+    st.caption("8. CSV ต้องเป็นราคาหรือ NAV ไม่ใช่ daily return และต้องมีคอลัมน์วันที่ เช่น `Date`")
 
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
 
-if run_btn and len(stock_list) >= 2:
+if run_btn:
+    uploaded_frames = []
+    csv_errors = []
+    for uploaded_file in uploaded_csv_files:
+        try:
+            uploaded_file.seek(0)
+            uploaded_frames.append(
+                custom_data.parse_price_csv(uploaded_file, uploaded_file.name)
+            )
+        except custom_data.CSVPriceDataError as exc:
+            csv_errors.append(f"{uploaded_file.name}: {exc}")
+
+    if csv_errors:
+        st.error("อ่าน CSV ไม่สำเร็จ:\n\n" + "\n".join(f"- {err}" for err in csv_errors))
+        st.stop()
+
+    if uploaded_frames:
+        uploaded_prices = pd.concat(uploaded_frames, axis=1)
+        if not uploaded_prices.columns.is_unique:
+            duplicates = sorted(set(uploaded_prices.columns[uploaded_prices.columns.duplicated()]))
+            st.error(
+                "CSV มีชื่อสินทรัพย์ซ้ำกัน: "
+                + ", ".join(duplicates)
+                + " — กรุณาเปลี่ยนชื่อคอลัมน์หรือชื่อไฟล์ให้ไม่ซ้ำ"
+            )
+            st.stop()
+    else:
+        uploaded_prices = pd.DataFrame()
+
+    if len(stock_list) + len(uploaded_prices.columns) < 2:
+        st.error("ต้องมีสินทรัพย์อย่างน้อย 2 ตัวจาก Yahoo/กองทุนไทย/CSV เพื่อคำนวณพอร์ต")
+        st.stop()
+
     yf_symbols, mf_symbols = thai_mf.split_symbols(stock_list)
 
     if mf_symbols and (not sec_factsheet_key or not sec_daily_info_key):
@@ -85,7 +128,12 @@ if run_btn and len(stock_list) >= 2:
                 interval="1d",
                 auto_adjust=True,
             )
-            data_close = df["Close"].ffill()
+            if df.empty:
+                data_close = pd.DataFrame()
+            elif isinstance(df.columns, pd.MultiIndex):
+                data_close = df["Close"].ffill()
+            else:
+                data_close = df[["Close"]].rename(columns={"Close": yf_symbols[0]}).ffill()
             data_close.dropna(how="all", inplace=True)
             data_close.dropna(axis=1, how="all", inplace=True)
         else:
@@ -120,6 +168,13 @@ if run_btn and len(stock_list) >= 2:
                 fund_navs[display_symbol] = nav_series
             data_close = thai_mf.merge_fund_navs(data_close, fund_navs)
 
+    if not uploaded_prices.empty:
+        try:
+            data_close = custom_data.merge_uploaded_prices(data_close, uploaded_prices)
+        except custom_data.CSVPriceDataError as exc:
+            st.error(str(exc))
+            st.stop()
+
     if data_close.empty:
         st.error("No data downloaded. Check symbols and date range.")
         st.stop()
@@ -129,6 +184,12 @@ if run_btn and len(stock_list) >= 2:
     missing = [s for s in yf_symbols if s not in loaded] + mf_missing
     if missing:
         st.warning(f"⚠️ ไม่พบข้อมูล: **{', '.join(missing)}** — ตรวจสอบชื่อ symbol อีกครั้ง")
+    csv_loaded = [col for col in uploaded_prices.columns if col in loaded]
+    if csv_loaded:
+        st.info(
+            f"📄 รวมข้อมูลจาก CSV {len(csv_loaded)} ตัว: **{', '.join(csv_loaded)}** "
+            "โดย forward-fill เฉพาะหลังวันแรกที่มีราคา"
+        )
     if mf_incomplete:
         st.warning(
             f"⚠️ ข้อมูล NAV อาจไม่ครบทุกวันสำหรับ: **{', '.join(mf_incomplete)}** "
@@ -227,7 +288,7 @@ if run_btn and len(stock_list) >= 2:
     st.session_state["mv_perf"] = (mv_ret, mv_vol, mv_sharpe)
     st.session_state["random"] = (stds, rets, sharpes)
     st.session_state["ef_curve"] = (ef_x, ef_y)
-    st.session_state["stock_list"] = stock_list
+    st.session_state["stock_list"] = list(data_close.columns)
     st.session_state["total_cash"] = total_cash
     st.session_state["risk_free_rate"] = risk_free_rate
     st.session_state["calculated"] = True
