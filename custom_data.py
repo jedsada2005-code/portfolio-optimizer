@@ -16,18 +16,21 @@ PRICE_COLUMNS = {
 }
 
 
-class CSVPriceDataError(ValueError):
-    """Raised when an uploaded CSV cannot be converted to asset prices."""
+class PriceDataError(ValueError):
+    """Raised when an uploaded price file cannot be converted to asset prices."""
+
+
+CSVPriceDataError = PriceDataError
 
 
 def _normalized_columns(df):
     return {str(col).strip().lower(): col for col in df.columns}
 
 
-def _fallback_asset_name(filename):
-    stem = Path(filename or "CSV_ASSET").stem.strip()
+def _fallback_asset_name(label):
+    stem = Path(label or "UPLOADED_ASSET").stem.strip()
     cleaned = "".join(c if c.isalnum() or c in "-_." else "_" for c in stem)
-    return cleaned.upper() or "CSV_ASSET"
+    return cleaned.upper() or "UPLOADED_ASSET"
 
 
 def _find_date_column(df):
@@ -44,7 +47,7 @@ def _find_date_column(df):
             parsed = pd.to_datetime(df[col], errors="coerce")
         if parsed.notna().mean() >= 0.8:
             return col
-    raise CSVPriceDataError("CSV must include a date column.")
+    raise PriceDataError("Uploaded file must include a date column.")
 
 
 def _to_price_frame(df, date_col):
@@ -52,7 +55,7 @@ def _to_price_frame(df, date_col):
     out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
     out = out.dropna(subset=[date_col])
     if out.empty:
-        raise CSVPriceDataError("CSV has no valid dates.")
+        raise PriceDataError("Uploaded file has no valid dates.")
     return out
 
 
@@ -60,21 +63,9 @@ def _numeric_series(values):
     return pd.to_numeric(values, errors="coerce")
 
 
-def parse_price_csv(file_obj, filename=None):
-    """Parse one uploaded CSV into a daily price DataFrame.
-
-    Supported shapes:
-      - wide: Date, AAPL, SPY, ...
-      - long: Date, Symbol, Close
-      - single asset: Date, Close (asset name comes from the file name)
-    """
-    try:
-        raw = pd.read_csv(file_obj)
-    except Exception as exc:
-        raise CSVPriceDataError(f"Could not read CSV: {exc}") from exc
-
+def _parse_price_frame(raw, fallback_asset_label):
     if raw.empty:
-        raise CSVPriceDataError("CSV is empty.")
+        raise PriceDataError("Uploaded file is empty.")
 
     raw.columns = [str(col).strip() for col in raw.columns]
     date_col = _find_date_column(raw)
@@ -91,7 +82,7 @@ def parse_price_csv(file_obj, filename=None):
         long_df[price_col] = _numeric_series(long_df[price_col])
         long_df = long_df.dropna(subset=[price_col])
         if long_df.empty:
-            raise CSVPriceDataError("CSV has no valid price values.")
+            raise PriceDataError("Uploaded file has no valid price values.")
         prices = long_df.pivot_table(
             index=date_col,
             columns=symbol_col,
@@ -104,10 +95,10 @@ def parse_price_csv(file_obj, filename=None):
         numeric.index = df[date_col]
         numeric = numeric.dropna(axis=1, how="all")
         if numeric.empty:
-            raise CSVPriceDataError("CSV has no numeric price columns.")
+            raise PriceDataError("Uploaded file has no numeric price columns.")
 
         if len(numeric.columns) == 1 and str(numeric.columns[0]).strip().lower() in PRICE_COLUMNS:
-            numeric = numeric.rename(columns={numeric.columns[0]: _fallback_asset_name(filename)})
+            numeric = numeric.rename(columns={numeric.columns[0]: _fallback_asset_name(fallback_asset_label)})
         prices = numeric
 
     prices.index = pd.to_datetime(prices.index)
@@ -118,12 +109,72 @@ def parse_price_csv(file_obj, filename=None):
     prices = prices.loc[:, prices.columns != ""]
 
     if prices.empty:
-        raise CSVPriceDataError("CSV produced no usable price data.")
+        raise PriceDataError("Uploaded file produced no usable price data.")
     if not prices.columns.is_unique:
         duplicates = sorted(set(prices.columns[prices.columns.duplicated()]))
-        raise CSVPriceDataError(f"Duplicate asset columns in CSV: {', '.join(duplicates)}")
+        raise PriceDataError(f"Duplicate asset columns in uploaded file: {', '.join(duplicates)}")
 
     return prices
+
+
+def parse_price_csv(file_obj, filename=None):
+    """Parse one uploaded CSV into a daily price DataFrame.
+
+    Supported shapes:
+      - wide: Date, AAPL, SPY, ...
+      - long: Date, Symbol, Close
+      - single asset: Date, Close (asset name comes from the file name)
+    """
+    try:
+        raw = pd.read_csv(file_obj)
+    except Exception as exc:
+        raise PriceDataError(f"Could not read CSV: {exc}") from exc
+
+    return _parse_price_frame(raw, filename)
+
+
+def parse_price_xlsx(file_obj, filename=None):
+    """Parse an uploaded XLSX workbook into a daily price DataFrame.
+
+    Every worksheet is read. Wide and long sheets keep their own asset
+    names; single-asset sheets such as Date,Close use the sheet name when
+    there are multiple sheets, otherwise the workbook file name.
+    """
+    try:
+        sheets = pd.read_excel(file_obj, sheet_name=None)
+    except Exception as exc:
+        raise PriceDataError(f"Could not read XLSX: {exc}") from exc
+
+    if not sheets:
+        raise PriceDataError("XLSX workbook has no sheets.")
+
+    frames = []
+    errors = []
+    use_sheet_name = len(sheets) > 1
+    for sheet_name, raw in sheets.items():
+        fallback = sheet_name if use_sheet_name else filename
+        try:
+            frames.append(_parse_price_frame(raw, fallback))
+        except PriceDataError as exc:
+            errors.append(f"{sheet_name}: {exc}")
+
+    if errors and not frames:
+        raise PriceDataError("Could not read any XLSX sheet:\n" + "\n".join(errors))
+
+    prices = pd.concat(frames, axis=1)
+    if not prices.columns.is_unique:
+        duplicates = sorted(set(prices.columns[prices.columns.duplicated()]))
+        raise PriceDataError(f"Duplicate asset columns in XLSX: {', '.join(duplicates)}")
+    return prices.sort_index()
+
+
+def parse_price_file(file_obj, filename=None):
+    suffix = Path(filename or "").suffix.lower()
+    if suffix == ".csv":
+        return parse_price_csv(file_obj, filename)
+    if suffix == ".xlsx":
+        return parse_price_xlsx(file_obj, filename)
+    raise PriceDataError("Unsupported file type. Please upload .csv or .xlsx.")
 
 
 def merge_uploaded_prices(data_close, uploaded_prices):
@@ -134,7 +185,7 @@ def merge_uploaded_prices(data_close, uploaded_prices):
     overlap = set(data_close.columns).intersection(uploaded_prices.columns)
     if overlap:
         raise CSVPriceDataError(
-            "Uploaded CSV duplicates existing symbols: " + ", ".join(sorted(overlap))
+            "Uploaded file duplicates existing symbols: " + ", ".join(sorted(overlap))
         )
 
     merged = (

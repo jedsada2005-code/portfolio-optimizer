@@ -40,13 +40,13 @@ with st.sidebar:
 
     total_cash = st.number_input("Total Cash (USD)", value=1_000_000, step=100_000)
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
-    uploaded_csv_files = st.file_uploader(
-        "Upload CSV Price Data",
-        type=["csv"],
+    uploaded_price_files = st.file_uploader(
+        "Upload CSV/XLSX Price Data",
+        type=["csv", "xlsx"],
         accept_multiple_files=True,
         help=(
             "รองรับ Date,AAPL,SPY... หรือ Date,Symbol,Close หรือ Date,Close "
-            "(กรณี Date,Close จะใช้ชื่อไฟล์เป็นชื่อสินทรัพย์)"
+            "(กรณี Date,Close จะใช้ชื่อไฟล์หรือชื่อ sheet เป็นชื่อสินทรัพย์)"
         ),
     )
     sec_factsheet_key = st.text_input(
@@ -72,25 +72,25 @@ with st.sidebar:
     st.caption("5. ค่า Return, Vol, Sharpe ใน Expected กับ Backtest มีค่าใกล้เคียงกันแต่อาจต่างกันเล็กน้อย เนื่องจากคำนวณคนละวิธี")
     st.caption("6. หุ้นบางตัวอาจโหลดไม่สำเร็จ เพราะเขียนชื่อผิด หรือในปีนั้นยังไม่มีข้อมูล (ตรวจสอบชื่อและปีที่ดึงข้อมูลให้ดี)")
     st.caption("7. กองทุนรวมไทยใส่ prefix `MF:` เช่น `MF:K-CHANGE-A(A)` ข้อมูลมาจาก SEC Open Data และต้องกรอก API Key ทั้ง 2 ช่องด้านบน (Fund Factsheet กับ Fund Daily Info เป็นคนละ key กัน ต้อง subscribe แยกกัน)")
-    st.caption("8. CSV ต้องเป็นราคาหรือ NAV ไม่ใช่ daily return และต้องมีคอลัมน์วันที่ เช่น `Date`")
+    st.caption("8. CSV/XLSX ต้องเป็นราคาหรือ NAV ไม่ใช่ daily return และต้องมีคอลัมน์วันที่ เช่น `Date`")
 
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
 
 if run_btn:
     uploaded_frames = []
-    csv_errors = []
-    for uploaded_file in uploaded_csv_files:
+    file_errors = []
+    for uploaded_file in uploaded_price_files:
         try:
             uploaded_file.seek(0)
             uploaded_frames.append(
-                custom_data.parse_price_csv(uploaded_file, uploaded_file.name)
+                custom_data.parse_price_file(uploaded_file, uploaded_file.name)
             )
-        except custom_data.CSVPriceDataError as exc:
-            csv_errors.append(f"{uploaded_file.name}: {exc}")
+        except custom_data.PriceDataError as exc:
+            file_errors.append(f"{uploaded_file.name}: {exc}")
 
-    if csv_errors:
-        st.error("อ่าน CSV ไม่สำเร็จ:\n\n" + "\n".join(f"- {err}" for err in csv_errors))
+    if file_errors:
+        st.error("อ่านไฟล์ราคาไม่สำเร็จ:\n\n" + "\n".join(f"- {err}" for err in file_errors))
         st.stop()
 
     if uploaded_frames:
@@ -98,7 +98,7 @@ if run_btn:
         if not uploaded_prices.columns.is_unique:
             duplicates = sorted(set(uploaded_prices.columns[uploaded_prices.columns.duplicated()]))
             st.error(
-                "CSV มีชื่อสินทรัพย์ซ้ำกัน: "
+                "ไฟล์ที่อัปโหลดมีชื่อสินทรัพย์ซ้ำกัน: "
                 + ", ".join(duplicates)
                 + " — กรุณาเปลี่ยนชื่อคอลัมน์หรือชื่อไฟล์ให้ไม่ซ้ำ"
             )
@@ -187,7 +187,7 @@ if run_btn:
     csv_loaded = [col for col in uploaded_prices.columns if col in loaded]
     if csv_loaded:
         st.info(
-            f"📄 รวมข้อมูลจาก CSV {len(csv_loaded)} ตัว: **{', '.join(csv_loaded)}** "
+            f"📄 รวมข้อมูลจากไฟล์อัปโหลด {len(csv_loaded)} ตัว: **{', '.join(csv_loaded)}** "
             "โดย forward-fill เฉพาะหลังวันแรกที่มีราคา"
         )
     if mf_incomplete:

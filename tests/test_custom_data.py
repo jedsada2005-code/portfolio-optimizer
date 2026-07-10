@@ -47,6 +47,41 @@ def test_parse_single_asset_csv_uses_file_name_when_column_is_close():
     assert prices.loc[pd.Timestamp("2024-01-02"), "MY_CUSTOM_ASSET"] == 10.8
 
 
+def test_parse_single_sheet_xlsx_with_wide_prices():
+    file_obj = io.BytesIO()
+    with pd.ExcelWriter(file_obj, engine="openpyxl") as writer:
+        pd.DataFrame(
+            {
+                "Date": ["2024-01-01", "2024-01-02"],
+                "AAPL": [100, 101],
+                "SPY": [400, 402],
+            }
+        ).to_excel(writer, index=False)
+    file_obj.seek(0)
+
+    prices = custom_data.parse_price_file(file_obj, "prices.xlsx")
+
+    assert list(prices.columns) == ["AAPL", "SPY"]
+    assert prices.loc[pd.Timestamp("2024-01-02"), "AAPL"] == 101
+
+
+def test_parse_multi_sheet_xlsx_uses_sheet_names_for_single_asset_sheets():
+    file_obj = io.BytesIO()
+    with pd.ExcelWriter(file_obj, engine="openpyxl") as writer:
+        pd.DataFrame(
+            {"Date": ["2024-01-01", "2024-01-02"], "Close": [10.5, 10.8]}
+        ).to_excel(writer, sheet_name="Private Fund", index=False)
+        pd.DataFrame(
+            {"Date": ["2024-01-01", "2024-01-02"], "NAV": [20.0, 20.2]}
+        ).to_excel(writer, sheet_name="Bond Sleeve", index=False)
+    file_obj.seek(0)
+
+    prices = custom_data.parse_price_file(file_obj, "portfolio.xlsx")
+
+    assert list(prices.columns) == ["PRIVATE_FUND", "BOND_SLEEVE"]
+    assert prices.loc[pd.Timestamp("2024-01-02"), "BOND_SLEEVE"] == 20.2
+
+
 def test_parse_csv_rejects_missing_date_column():
     csv = io.StringIO(
         "Asset,Close\n"
