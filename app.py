@@ -970,19 +970,164 @@ if st.session_state.get("calculated"):
                 "ผลลัพธ์จึงสวยเกินจริงเสมอ เปลี่ยนเป็นโหมด Train/Test Split เพื่อดูผลจริง"
             )
 
-        # ── Performance Stats ──
-        st.subheader("Performance Summary")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Annual Return", f"{ann_ret:.2%}")
-        m2.metric("Annual Volatility", f"{ann_vol:.2%}")
-        m3.metric("Sharpe Ratio", f"{sharpe:.2f}")
-        m4.metric("Max Drawdown", f"{max_dd:.2%}")
+        # ── Benchmark ──
+        # Computed before the summary so the headline metrics can carry
+        # a delta against it.
+        bench_daily = pd.Series(dtype=float)
+        bench_stats = None
+        beta = alpha = 0.0
+        if not benchmark.empty:
+            bench_window = benchmark.reindex(
+                benchmark.index.union(port_daily.index)
+            ).ffill().reindex(port_daily.index)
+            bench_daily = bench_window.pct_change().fillna(0.0)
+            bench_stats = metrics.backtest_stats(bench_daily, risk_free_rate)
+            beta, alpha = metrics.beta_alpha(
+                port_daily, bench_daily, risk_free_rate, periods_per_year
+            )
 
-        m5, m6, m7, m8 = st.columns(4)
-        m5.metric("Cumulative Return", f"{total_ret:.2%}")
-        m6.metric("Calmar Ratio", f"{calmar:.2f}")
-        m7.metric("Sortino Ratio", f"{sortino:.2f}")
-        m8.metric("Total Years", f"{n_years:.1f}")
+        def build_workbook():
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+                pd.DataFrame({
+                    "Asset": list(weights_in_force),
+                    "Weight": list(weights_in_force.values()),
+                    "Source": [
+                        f"{weight_source} (งวดล่าสุด)" if walk_result is not None
+                        else weight_source
+                    ] * len(weights_in_force),
+                }).to_excel(writer, sheet_name="Weights", index=False)
+                pd.DataFrame(
+                    {"Metric": list(stats), "Value": list(stats.values())}
+                ).to_excel(writer, sheet_name="Stats", index=False)
+                pd.DataFrame({
+                    "Date": port_daily.index, "Daily Return": port_daily.values,
+                    "Cumulative": cumulative.values, "Drawdown": drawdown.values,
+                }).to_excel(writer, sheet_name="Backtest", index=False)
+                data_close.to_excel(writer, sheet_name="Prices")
+                if walk_result is not None:
+                    pd.DataFrame(
+                        [w for _, w in walk_result.weight_history],
+                        index=[d.date() for d, _ in walk_result.weight_history],
+                    ).to_excel(writer, sheet_name="Walk-Forward Weights")
+            return buffer.getvalue()
+
+        # ── Performance Stats ──
+        # Four headline figures answer the question people actually ask:
+        # what did it make, how badly did it hurt, was that worth the
+        # risk, and did it beat just buying the benchmark. Everything
+        # else is diagnostic and folds away.
+        st.subheader("สรุปผลงาน")
+        st.download_button(
+            "📥 ดาวน์โหลดผลลัพธ์เป็น Excel",
+            data=build_workbook(),
+            file_name="portfolio_backtest.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric(
+            "ผลตอบแทนต่อปี", f"{ann_ret:.2%}",
+            delta=(f"{ann_ret - bench_stats['annual_return']:+.2%} vs {benchmark_symbol}"
+                   if bench_stats else None),
+            help="ผลตอบแทนทบต้นเฉลี่ยต่อปี (CAGR) คำนวณจากช่วงเวลาปฏิทินจริง",
+        )
+        m2.metric(
+            "ขาดทุนสูงสุด", f"{max_dd:.2%}",
+            delta=(f"{max_dd - bench_stats['max_drawdown']:+.2%} vs {benchmark_symbol}"
+                   if bench_stats else None),
+            delta_color="normal",
+            help="Max Drawdown — ระยะที่พอร์ตตกจากจุดสูงสุดลงมาต่ำสุด ยิ่งใกล้ 0 ยิ่งดี",
+        )
+        m3.metric(
+            "Sharpe Ratio", f"{sharpe:.2f}",
+            delta=(f"{sharpe - bench_stats['sharpe']:+.2f} vs {benchmark_symbol}"
+                   if bench_stats else None),
+            help=(
+                "ผลตอบแทนส่วนเกินต่อ 1 หน่วยความผันผวน ยิ่งสูงยิ่งดี "
+                "ต่ำกว่า 0.5 ถือว่าน้อย, 1.0 ขึ้นไปถือว่าดี"
+            ),
+        )
+        if bench_stats:
+            m4.metric(
+                f"ชนะ {benchmark_symbol}", f"{ann_ret - bench_stats['annual_return']:+.2%}",
+                help=f"ส่วนต่างผลตอบแทนต่อปีเทียบกับการถือ {benchmark_symbol} เฉยๆ",
+            )
+        else:
+            m4.metric(
+                "ความผันผวนต่อปี", f"{ann_vol:.2%}",
+                help="ส่วนเบี่ยงเบนมาตรฐานของผลตอบแทน ปรับเป็นรายปี",
+            )
+
+        with st.expander("สถิติเพิ่มเติม"):
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric(
+                "ความผันผวนต่อปี", f"{ann_vol:.2%}",
+                help="ส่วนเบี่ยงเบนมาตรฐานของผลตอบแทน ปรับเป็นรายปี",
+            )
+            e2.metric(
+                "ผลตอบแทนสะสม", f"{total_ret:.2%}",
+                help="ผลตอบแทนรวมตลอดช่วงที่ทดสอบ ไม่ได้เฉลี่ยต่อปี",
+            )
+            e3.metric(
+                "Calmar Ratio", f"{calmar:.2f}",
+                help="ผลตอบแทนต่อปี หารด้วยขาดทุนสูงสุด — วัดว่าคุ้มกับการขาดทุนที่ต้องทนไหม",
+            )
+            e4.metric(
+                "Sortino Ratio", f"{sortino:.2f}",
+                help=(
+                    "คล้าย Sharpe แต่นับเฉพาะความผันผวนขาลง "
+                    "จึงไม่ลงโทษพอร์ตที่ผันผวนขึ้นแรง"
+                ),
+            )
+            e5, e6, e7, e8 = st.columns(4)
+            e5.metric(
+                "ระยะเวลาที่ทดสอบ", f"{n_years:.1f} ปี",
+                help="นับจากปฏิทินจริง ไม่ใช่จำนวนวันทำการหารด้วย 252",
+            )
+            if bench_stats:
+                e6.metric(
+                    "Beta", f"{beta:.2f}",
+                    help=(
+                        f"ความอ่อนไหวต่อ {benchmark_symbol} — 1.0 คือเคลื่อนไหวตามกัน "
+                        "มากกว่า 1 คือแกว่งแรงกว่า"
+                    ),
+                )
+                e7.metric(
+                    "Alpha (ต่อปี)", f"{alpha:.2%}",
+                    help="ผลตอบแทนส่วนเกินหลังปรับความเสี่ยงตาม beta แล้ว — บวกคือเก่งกว่าตลาด",
+                )
+                e8.metric(
+                    f"Sharpe ของ {benchmark_symbol}", f"{bench_stats['sharpe']:.2f}",
+                    help="ไว้เทียบกับ Sharpe ของพอร์ต",
+                )
+
+        if bench_stats is not None:
+            st.subheader(f"เทียบกับ Benchmark: {benchmark_symbol}")
+            versus = pd.DataFrame({
+                "": ["Annual Return", "Annual Volatility", "Sharpe Ratio", "Max Drawdown"],
+                "Portfolio": [
+                    f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}", f"{max_dd:.2%}",
+                ],
+                benchmark_symbol: [
+                    f"{bench_stats['annual_return']:.2%}",
+                    f"{bench_stats['annual_volatility']:.2%}",
+                    f"{bench_stats['sharpe']:.2f}",
+                    f"{bench_stats['max_drawdown']:.2%}",
+                ],
+            })
+            st.dataframe(versus, use_container_width=True, hide_index=True)
+
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Beta", f"{beta:.2f}", help="ความอ่อนไหวต่อ benchmark — 1.0 คือเคลื่อนไหวตามกัน")
+            b2.metric("Alpha (ต่อปี)", f"{alpha:.2%}", help="ผลตอบแทนส่วนเกินหลังปรับความเสี่ยงตาม beta")
+            b3.metric("ชนะ Benchmark", f"{ann_ret - bench_stats['annual_return']:+.2%}")
+
+            if ann_ret <= bench_stats["annual_return"]:
+                st.info(
+                    f"ℹ️ พอร์ตนี้ให้ผลตอบแทนไม่ชนะการถือ **{benchmark_symbol}** เฉยๆ "
+                    "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
+                )
 
         # ── Walk-forward weight history ──
         if walk_result is not None:
@@ -1031,44 +1176,6 @@ if st.session_state.get("calculated"):
                         f"(−{decay:.2f}) — น้ำหนักชุดนี้ fit กับอดีตมากกว่าที่จะใช้ได้จริง"
                     )
 
-        # ── Benchmark ──
-        bench_daily = pd.Series(dtype=float)
-        if not benchmark.empty:
-            bench_window = benchmark.reindex(
-                benchmark.index.union(port_daily.index)
-            ).ffill().reindex(port_daily.index)
-            bench_daily = bench_window.pct_change().fillna(0.0)
-            bench_stats = metrics.backtest_stats(bench_daily, risk_free_rate)
-            beta, alpha = metrics.beta_alpha(
-                port_daily, bench_daily, risk_free_rate, periods_per_year
-            )
-
-            st.subheader(f"เทียบกับ Benchmark: {benchmark_symbol}")
-            versus = pd.DataFrame({
-                "": ["Annual Return", "Annual Volatility", "Sharpe Ratio", "Max Drawdown"],
-                "Portfolio": [
-                    f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}", f"{max_dd:.2%}",
-                ],
-                benchmark_symbol: [
-                    f"{bench_stats['annual_return']:.2%}",
-                    f"{bench_stats['annual_volatility']:.2%}",
-                    f"{bench_stats['sharpe']:.2f}",
-                    f"{bench_stats['max_drawdown']:.2%}",
-                ],
-            })
-            st.dataframe(versus, use_container_width=True, hide_index=True)
-
-            b1, b2, b3 = st.columns(3)
-            b1.metric("Beta", f"{beta:.2f}", help="ความอ่อนไหวต่อ benchmark — 1.0 คือเคลื่อนไหวตามกัน")
-            b2.metric("Alpha (ต่อปี)", f"{alpha:.2%}", help="ผลตอบแทนส่วนเกินหลังปรับความเสี่ยงตาม beta")
-            b3.metric("ชนะ Benchmark", f"{ann_ret - bench_stats['annual_return']:+.2%}")
-
-            if ann_ret <= bench_stats["annual_return"]:
-                st.info(
-                    f"ℹ️ พอร์ตนี้ให้ผลตอบแทนไม่ชนะการถือ **{benchmark_symbol}** เฉยๆ "
-                    "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
-                )
-
         # Hand the NAV tab the exact series behind these numbers.
         st.session_state["nav_view"] = {
             "returns": port_daily,
@@ -1105,7 +1212,7 @@ if st.session_state.get("calculated"):
             st.caption(f"สัดส่วนเมื่อจบช่วง (ปล่อยให้ drift): {drift}")
 
         # ── Cumulative Returns Chart ──
-        st.subheader("Cumulative Returns")
+        st.subheader("การเติบโตของพอร์ต")
         fig_cum = go.Figure()
         fig_cum.add_trace(go.Scatter(
             x=cumulative.index, y=cumulative.values,
@@ -1125,7 +1232,7 @@ if st.session_state.get("calculated"):
         st.plotly_chart(fig_cum, use_container_width=True)
 
         # ── Drawdown Chart ──
-        st.subheader("Drawdown")
+        st.subheader("การขาดทุนจากจุดสูงสุด")
         fig_dd = go.Figure()
         fig_dd.add_trace(go.Scatter(
             x=drawdown.index, y=drawdown.values,
@@ -1140,7 +1247,6 @@ if st.session_state.get("calculated"):
         st.plotly_chart(fig_dd, use_container_width=True)
 
         # ── Monthly Returns Heatmap ──
-        st.subheader("Monthly Returns")
         monthly = port_daily.resample("ME").apply(lambda x: (1 + x).prod() - 1)
         monthly_pivot = pd.DataFrame({
             "Year": monthly.index.year,
@@ -1158,43 +1264,10 @@ if st.session_state.get("calculated"):
             text_auto=".1%",
         )
         fig_hm.update_layout(height=max(300, len(monthly_pivot) * 30))
-        st.plotly_chart(fig_hm, use_container_width=True)
-
-        # ── Export ──
-        st.subheader("ดาวน์โหลดผลลัพธ์")
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            pd.DataFrame({
-                "Asset": list(weights_in_force),
-                "Weight": list(weights_in_force.values()),
-                "Source": [
-                    f"{weight_source} (งวดล่าสุด)" if walk_result is not None
-                    else weight_source
-                ] * len(weights_in_force),
-            }).to_excel(writer, sheet_name="Weights", index=False)
-            pd.DataFrame(
-                {"Metric": list(stats), "Value": list(stats.values())}
-            ).to_excel(writer, sheet_name="Stats", index=False)
-            pd.DataFrame({
-                "Date": port_daily.index, "Daily Return": port_daily.values,
-                "Cumulative": cumulative.values, "Drawdown": drawdown.values,
-            }).to_excel(writer, sheet_name="Backtest", index=False)
-            data_close.to_excel(writer, sheet_name="Prices")
-            if walk_result is not None:
-                pd.DataFrame(
-                    [w for _, w in walk_result.weight_history],
-                    index=[d.date() for d, _ in walk_result.weight_history],
-                ).to_excel(writer, sheet_name="Walk-Forward Weights")
-        st.download_button(
-            "📥 ดาวน์โหลดเป็น Excel",
-            data=buffer.getvalue(),
-            file_name="portfolio_backtest.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
+        with st.expander("ผลตอบแทนรายเดือน"):
+            st.plotly_chart(fig_hm, use_container_width=True)
 
         # ── Worst Drawdown Periods ──
-        st.subheader("Worst Drawdown Periods")
         dd_series = drawdown.copy()
         periods = []
         for _ in range(5):
@@ -1226,7 +1299,12 @@ if st.session_state.get("calculated"):
                 dd_series.loc[peak_idx:recovery_idx] = 0
 
         if periods:
-            st.dataframe(pd.DataFrame(periods), use_container_width=True, hide_index=True)
+            with st.expander("ช่วงที่ขาดทุนหนักที่สุด"):
+                st.dataframe(pd.DataFrame(periods), use_container_width=True, hide_index=True)
+                st.caption(
+                    "Peak คือจุดสูงสุดก่อนตก · Valley คือจุดต่ำสุด · "
+                    "Recovery คือวันที่กลับมาเท่าจุดสูงสุดเดิม"
+                )
 
     # ════════════════════════════════════════
     # Tab 4: NAV Breakdown
