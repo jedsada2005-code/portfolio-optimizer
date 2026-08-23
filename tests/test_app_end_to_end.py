@@ -37,7 +37,9 @@ def app():
 
 
 def _calculate(at):
-    at.button[0].click().run()
+    # Not at.button[0]: AppTest lists main-block elements before sidebar
+    # ones, so the welcome screen's preset buttons come first.
+    _widget(at.button, "Calculate").click().run()
     assert not at.exception, at.exception
     return at
 
@@ -251,3 +253,46 @@ class TestNavTabAgreesWithBacktest:
         at = _calculate(app)
         view = at.session_state["nav_view"]
         assert view["weights"][metrics.CASH_SYMBOL] == pytest.approx(0.25)
+
+
+class TestWelcomeScreen:
+    """Before the first run the page used to hold one sentence.
+
+    Someone opening the app had no idea what to type into the symbol
+    box, which matters because the whole point is handing it to people
+    who have not seen it before.
+    """
+
+    @pytest.fixture
+    def fresh(self):
+        at = AppTest.from_file("app.py", default_timeout=300)
+        at.run()
+        assert not at.exception, at.exception
+        return at
+
+    def test_explains_itself_before_any_run(self, fresh):
+        text = " ".join(m.value for m in fresh.markdown)
+        assert "ทดสอบ" in text
+        assert any("จะได้อะไรกลับมา" in m.value for m in fresh.markdown)
+
+    def test_offers_a_starting_point_for_every_preset(self, fresh):
+        labels = [b.label for b in fresh.button]
+        for name in ["หุ้นเทคโนโลยีสหรัฐ", "กระจายความเสี่ยงหลายสินทรัพย์", "หุ้นไทย", "พอร์ตความเสี่ยงต่ำ"]:
+            assert name in labels
+
+    def test_a_preset_fills_the_symbol_box(self, fresh):
+        _widget(fresh.button, "หุ้นไทย").click().run()
+        assert not fresh.exception, fresh.exception
+        assert fresh.session_state["symbols_input"] == "PTT.BK, ADVANC.BK, CPALL.BK, KBANK.BK, AOT.BK"
+
+    def test_a_preset_actually_runs(self, fresh):
+        _widget(fresh.button, "พอร์ตความเสี่ยงต่ำ").click().run()
+        _calculate(fresh)
+        assert not fresh.exception, fresh.exception
+        assert not fresh.error
+        assert fresh.session_state["calculated"] is True
+
+    def test_the_share_link_appears_only_after_a_run(self, fresh, app):
+        assert not any("แชร์พอร์ตนี้" in (e.label or "") for e in fresh.expander)
+        at = _calculate(app)
+        assert any("แชร์พอร์ตนี้" in (e.label or "") for e in at.expander)

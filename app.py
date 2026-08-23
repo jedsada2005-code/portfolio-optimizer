@@ -23,6 +23,28 @@ PLOT_SAMPLE = 6_000
 MODES = ["Train / Test Split", "Walk-Forward", "In-sample (ทั้งช่วง)"]
 OBJECTIVES = ["Max Sharpe", "Min Volatility"]
 CUSTOM_SOURCE = "Custom (จากแท็บน้ำหนักพอร์ต)"
+DEFAULT_SYMBOLS = "AMZN, META, LLY, SPY, NVDA, GOOGL"
+
+# Starting points for people who have no idea what to type into an
+# empty symbol box.
+PRESETS = {
+    "หุ้นเทคโนโลยีสหรัฐ": (
+        "AMZN, META, LLY, SPY, NVDA, GOOGL",
+        "หุ้นใหญ่ที่คนรู้จัก ผลตอบแทนสูงแต่ผันผวนแรงและเคลื่อนไหวไปทางเดียวกัน",
+    ),
+    "กระจายความเสี่ยงหลายสินทรัพย์": (
+        "SPY, QQQ, GLD, TLT, EEM, XLE",
+        "หุ้น ทองคำ พันธบัตร ตลาดเกิดใหม่ พลังงาน — ค่าสหสัมพันธ์ต่ำกว่ามาก",
+    ),
+    "หุ้นไทย": (
+        "PTT.BK, ADVANC.BK, CPALL.BK, KBANK.BK, AOT.BK",
+        "หุ้นใหญ่ใน SET ลองตั้งสกุลเงินฐานเป็น THB และ benchmark เป็น ^SET.BK",
+    ),
+    "พอร์ตความเสี่ยงต่ำ": (
+        "AGG, TLT, GLD, SPY",
+        "เน้นพันธบัตรและทองคำ ลองเพิ่มสัดส่วนเงินสดในการตั้งค่าขั้นสูง",
+    ),
+}
 
 
 def qp_text(key, default):
@@ -43,6 +65,15 @@ def qp_date(key, default):
         return pd.Timestamp(st.query_params[key])
     except (KeyError, TypeError, ValueError):
         return default
+
+
+def current_url():
+    """Full page URL including the saved settings, for copying."""
+    try:
+        return st.context.url
+    except Exception:
+        query = "&".join(f"{k}={v}" for k, v in st.query_params.items())
+        return f"?{query}"
 
 
 def qp_choice(key, options, default_index=0):
@@ -95,9 +126,13 @@ with st.sidebar:
     # default below is usable as-is, so grouping the rest behind
     # expanders costs nothing and stops Calculate from sitting at the
     # bottom of nineteen controls.
+    if "pending_symbols" in st.session_state:
+        st.session_state["symbols_input"] = st.session_state.pop("pending_symbols")
+    elif "symbols_input" not in st.session_state:
+        st.session_state["symbols_input"] = qp_text("symbols", DEFAULT_SYMBOLS)
     symbols_input = st.text_input(
         "สินทรัพย์ในพอร์ต (คั่นด้วยจุลภาค)",
-        value=qp_text("symbols", "AMZN, META, LLY, SPY, NVDA, GOOGL"),
+        key="symbols_input",
         help="หุ้น/ETF เช่น `SPY` · หุ้นไทยเติม `.BK` เช่น `PTT.BK` · กองทุนไทยเติม `MF:` เช่น `MF:K-GOLD-A(A)`",
     )
     col1, col2 = st.columns(2)
@@ -675,6 +710,10 @@ if st.session_state.get("calculated"):
     if benchmark_symbol:
         status.append(f"📊 เทียบ {benchmark_symbol}")
     st.caption(" · ".join(status))
+
+    with st.expander("🔗 บันทึกหรือแชร์พอร์ตนี้"):
+        st.caption("ลิงก์นี้เก็บการตั้งค่าทั้งหมดไว้ เปิดแล้วได้ค่าเดิม ส่งต่อให้คนอื่นได้")
+        st.code(current_url(), language=None)
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "📈 เส้นขอบประสิทธิภาพ",
@@ -1370,4 +1409,40 @@ if st.session_state.get("calculated"):
         st.metric("Total P&L", f"{nav_total.iloc[-1] - total_cash:,.0f} {base_currency}")
 
 else:
-    st.info("Enter stock symbols and click **Calculate** to begin.")
+    st.subheader("เครื่องมือจัดพอร์ตและทดสอบย้อนหลัง")
+    st.markdown(
+        "หาสัดส่วนการลงทุนที่ให้ผลตอบแทนดีที่สุดต่อความเสี่ยงที่รับได้ "
+        "แล้ว**ทดสอบกับข้อมูลจริงในอดีตที่ระบบไม่เคยเห็น** "
+        "รองรับหุ้นและ ETF ทั่วโลก กองทุนรวมไทยจาก SEC และไฟล์ราคาที่คุณมีเอง"
+    )
+
+    st.markdown("#### เริ่มจากตัวอย่าง")
+    st.caption("กดเลือกหนึ่งชุด แล้วกด **Calculate** ในแถบด้านซ้าย")
+    preset_columns = st.columns(len(PRESETS))
+    for column, (name, (symbols, description)) in zip(preset_columns, PRESETS.items()):
+        with column:
+            if st.button(name, use_container_width=True):
+                st.session_state["pending_symbols"] = symbols
+                st.rerun()
+            st.caption(description)
+            st.code(symbols, language=None)
+
+    st.divider()
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### จะได้อะไรกลับมา")
+        st.markdown(
+            "- **น้ำหนักที่เหมาะสม** ของแต่ละสินทรัพย์ ทั้งแบบ Max Sharpe และ Min Volatility\n"
+            "- **ผลทดสอบย้อนหลัง** พร้อมผลตอบแทน ความผันผวน และช่วงขาดทุนหนักที่สุด\n"
+            "- **เทียบกับ benchmark** ว่าชนะการถือ index เฉยๆ หรือไม่\n"
+            "- **กราฟมูลค่าพอร์ต** และดาวน์โหลดผลทั้งหมดเป็น Excel"
+        )
+    with right:
+        st.markdown("#### สิ่งที่ควรรู้ก่อนเชื่อตัวเลข")
+        st.markdown(
+            "- ค่าเริ่มต้นใช้โหมด **Train/Test** คือหาน้ำหนักจากช่วงแรก "
+            "แล้ววัดผลบนช่วงหลังที่ไม่เคยเห็น ตัวเลขจึงไม่สวยเท่าโหมด In-sample "
+            "แต่เป็นตัวเลขที่เชื่อได้จริง\n"
+            "- ผลตอบแทนในอดีตไม่รับประกันอนาคต\n"
+            "- ทุกสินทรัพย์ถูกแปลงเป็นสกุลเงินฐานก่อนคำนวณ ผลของค่าเงินจึงถูกนับรวมแล้ว"
+        )
