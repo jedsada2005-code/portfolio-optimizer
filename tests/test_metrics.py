@@ -301,3 +301,89 @@ class TestBetaAlpha:
         b = pd.Series(rng.normal(0.0004, 0.01, 300), index=idx)
         beta, _ = metrics.beta_alpha(b.iloc[100:], b, 0.02, 252)
         assert beta == pytest.approx(1.0)
+
+
+class TestRebalanceDates:
+    def test_daily_rebalances_every_day_after_the_first(self):
+        idx = pd.bdate_range("2020-01-01", periods=10)
+        assert metrics.rebalance_dates(idx, "D") == list(idx[1:])
+
+    def test_buy_and_hold_never_rebalances(self):
+        idx = pd.bdate_range("2020-01-01", periods=10)
+        assert metrics.rebalance_dates(idx, None) == []
+
+    def test_monthly_fires_once_per_month_boundary(self):
+        idx = pd.bdate_range("2020-01-01", "2020-12-31")
+        assert len(metrics.rebalance_dates(idx, "M")) == 11
+
+    def test_quarterly_and_yearly(self):
+        idx = pd.bdate_range("2020-01-01", "2023-12-31")
+        assert len(metrics.rebalance_dates(idx, "Q")) == 15
+        assert len(metrics.rebalance_dates(idx, "Y")) == 3
+
+
+class TestSimulatePortfolio:
+    def _prices(self):
+        idx = pd.bdate_range("2020-01-01", periods=260)
+        rng = np.random.default_rng(11)
+        return pd.DataFrame(
+            {"A": 100 * np.cumprod(1 + rng.normal(0.001, 0.02, 260)),
+             "B": 100 * np.cumprod(1 + rng.normal(0.0004, 0.01, 260))},
+            index=idx,
+        )
+
+    def test_daily_rebalancing_matches_constant_weight_returns(self):
+        # The old dot-product backtest was an implicit daily rebalance;
+        # the simulator must reproduce it exactly at zero cost.
+        prices = self._prices()
+        w = {"A": 0.6, "B": 0.4}
+        sim = metrics.simulate_portfolio(prices, w, "D", 0.0)
+        reference = metrics.portfolio_daily_returns(prices, w).portfolio
+        pd.testing.assert_series_equal(sim.returns, reference, check_names=False)
+
+    def test_buy_and_hold_lets_weights_drift(self):
+        prices = self._prices()
+        sim = metrics.simulate_portfolio(prices, {"A": 0.5, "B": 0.5}, None, 0.0)
+        assert sim.turnover.sum() == 0.0
+        assert sim.final_weights["A"] != pytest.approx(0.5, abs=0.01)
+
+    def test_buy_and_hold_equals_the_weighted_sum_of_each_holding(self):
+        prices = self._prices()
+        w = {"A": 0.3, "B": 0.7}
+        sim = metrics.simulate_portfolio(prices, w, None, 0.0)
+        growth = (prices.iloc[-1] / prices.iloc[0])
+        expected = w["A"] * growth["A"] + w["B"] * growth["B"]
+        assert (1 + sim.returns).prod() == pytest.approx(expected)
+
+    def test_trading_costs_reduce_the_result(self):
+        prices = self._prices()
+        w = {"A": 0.5, "B": 0.5}
+        free = (1 + metrics.simulate_portfolio(prices, w, "M", 0.0).returns).prod()
+        charged = (1 + metrics.simulate_portfolio(prices, w, "M", 50.0).returns).prod()
+        assert charged < free
+
+    def test_more_frequent_rebalancing_trades_more(self):
+        prices = self._prices()
+        w = {"A": 0.5, "B": 0.5}
+        yearly = metrics.simulate_portfolio(prices, w, "Y", 0.0).turnover.sum()
+        monthly = metrics.simulate_portfolio(prices, w, "M", 0.0).turnover.sum()
+        daily = metrics.simulate_portfolio(prices, w, "D", 0.0).turnover.sum()
+        assert yearly < monthly < daily
+
+    def test_costs_do_nothing_when_nothing_is_traded(self):
+        prices = self._prices()
+        w = {"A": 0.5, "B": 0.5}
+        free = (1 + metrics.simulate_portfolio(prices, w, None, 0.0).returns).prod()
+        charged = (1 + metrics.simulate_portfolio(prices, w, None, 100.0).returns).prod()
+        assert charged == pytest.approx(free)
+
+    def test_starts_only_once_every_holding_exists(self):
+        prices = self._prices()
+        prices.loc[prices.index[:100], "B"] = np.nan
+        sim = metrics.simulate_portfolio(prices, {"A": 0.5, "B": 0.5}, "M", 0.0)
+        assert sim.start == prices.index[100]
+
+    def test_no_held_assets_gives_an_empty_result(self):
+        sim = metrics.simulate_portfolio(self._prices(), {"A": 0.0, "B": 0.0}, "M", 0.0)
+        assert sim.returns.empty
+        assert sim.held == []

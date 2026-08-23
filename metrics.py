@@ -235,3 +235,86 @@ def beta_alpha(portfolio_returns, benchmark_returns, risk_free_rate, periods_per
     bench_annual = cagr(float((1 + bench).prod() - 1), years_elapsed(joined.index))
     alpha = port_annual - (risk_free_rate + beta * (bench_annual - risk_free_rate))
     return beta, float(alpha)
+
+
+REBALANCE_FREQUENCIES = {
+    "รายวัน": "D",
+    "รายเดือน": "M",
+    "รายไตรมาส": "Q",
+    "รายปี": "Y",
+    "ซื้อแล้วถือ (ไม่ปรับ)": None,
+}
+
+
+Simulation = namedtuple(
+    "Simulation", "returns assets turnover final_weights held start rebalances"
+)
+
+
+def rebalance_dates(index, freq):
+    """Dates on which the portfolio is traded back to its target weights."""
+    if freq is None or len(index) < 2:
+        return []
+    if freq == "D":
+        return list(index[1:])
+    periods = index.to_period(freq)
+    changed = np.asarray(periods[1:]) != np.asarray(periods[:-1])
+    return list(index[1:][changed])
+
+
+def simulate_portfolio(prices, weights, freq="Q", cost_bps=0.0):
+    """Hold actual units and trade back to target on a schedule.
+
+    Taking the dot product of returns and fixed weights silently assumes
+    the portfolio is rebalanced every single trading day for free, which
+    both overstates the rebalancing bonus and ignores the cost of
+    getting it. Costs are charged on rebalancing turnover only, not on
+    the opening purchase, so the figure isolates what the rebalancing
+    schedule itself costs.
+    """
+    empty = pd.Series(dtype=float)
+    held = [c for c in prices.columns if float(weights.get(c, 0.0) or 0.0) > 0]
+    if not held:
+        return Simulation(empty, pd.DataFrame(), empty, {}, [], None, [])
+
+    sub = prices[held]
+    start = common_start(sub)
+    if start is None:
+        return Simulation(empty, pd.DataFrame(), empty, {}, held, None, [])
+
+    sub = sub.loc[start:].ffill()
+    target = np.array([float(weights[c]) for c in held], dtype=float)
+    total_weight = target.sum()
+    if total_weight > 0:
+        target = target / total_weight
+
+    schedule = set(rebalance_dates(sub.index, freq))
+    price_matrix = sub.values
+    units = target / price_matrix[0]
+    values = np.empty(len(sub))
+    turnovers = np.zeros(len(sub))
+    values[0] = 1.0
+
+    for i in range(1, len(sub)):
+        row = price_matrix[i]
+        position = units * row
+        total = position.sum()
+        if sub.index[i] in schedule and total > 0:
+            traded = np.abs(target * total - position).sum()
+            turnovers[i] = traded / total
+            total -= traded * cost_bps / 10_000.0
+            units = (target * total) / row
+        values[i] = total
+
+    value_series = pd.Series(values, index=sub.index)
+    final_position = units * price_matrix[-1]
+    final_total = final_position.sum()
+    return Simulation(
+        returns=value_series.pct_change().fillna(0.0),
+        assets=sub.pct_change().fillna(0.0),
+        turnover=pd.Series(turnovers, index=sub.index),
+        final_weights=dict(zip(held, final_position / final_total)) if final_total else {},
+        held=held,
+        start=start,
+        rebalances=sorted(schedule),
+    )

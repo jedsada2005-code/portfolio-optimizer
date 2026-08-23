@@ -80,6 +80,26 @@ with st.sidebar:
             help="ที่เหลือใช้เป็นช่วง Test สำหรับวัดผลจริงแบบ out-of-sample",
         )
 
+    rebalance_label = st.selectbox(
+        "ความถี่การ Rebalance",
+        list(metrics.REBALANCE_FREQUENCIES),
+        index=2,
+        help=(
+            "การคำนวณแบบเดิมสมมติว่าปรับพอร์ตกลับสัดส่วนเดิมทุกวันทำการโดยไม่มีค่าใช้จ่าย "
+            "ซึ่งทำไม่ได้จริงและดันผลตอบแทนสูงเกินจริง"
+        ),
+    )
+    cost_bps = st.number_input(
+        "ค่าธรรมเนียมซื้อขาย (bps ต่อมูลค่าที่เทรด)",
+        min_value=0.0, max_value=500.0, value=0.0, step=5.0,
+        help=(
+            "100 bps = 1% คิดจากมูลค่าที่ซื้อขายจริงในแต่ละรอบ rebalance เท่านั้น "
+            "(ไม่คิดตอนซื้อครั้งแรก) หมายเหตุ: NAV กองทุนและราคา ETF หัก "
+            "ค่าธรรมเนียมจัดการรายปีไปแล้ว ช่องนี้จึงมีไว้ใส่ค่าธรรมเนียมขาย/รับซื้อคืน "
+            "และค่าคอมมิชชั่นเท่านั้น ไม่ต้องใส่ TER ซ้ำ"
+        ),
+    )
+
     benchmark_symbol = st.text_input(
         "Benchmark (เว้นว่างได้)", value="SPY",
         help="สัญลักษณ์ Yahoo สำหรับเทียบผลงาน ไม่ถูกนับรวมเป็นสินทรัพย์ในพอร์ต เช่น SPY หรือ ^SET.BK",
@@ -146,6 +166,8 @@ input_signature = (
     backtest_mode,
     float(train_fraction),
     benchmark_symbol,
+    rebalance_label,
+    float(cost_bps),
     float(max_weight),
     float(shrinkage),
 )
@@ -403,6 +425,8 @@ if run_btn:
     st.session_state["backtest_mode"] = backtest_mode
     st.session_state["benchmark"] = benchmark_close
     st.session_state["benchmark_symbol"] = benchmark_symbol
+    st.session_state["rebalance_label"] = rebalance_label
+    st.session_state["cost_bps"] = cost_bps
     st.session_state["ar"] = ar
     st.session_state["covr"] = covr
     st.session_state["cleaned"] = cleaned
@@ -436,6 +460,9 @@ if st.session_state.get("calculated"):
     split_date = st.session_state["split_date"]
     benchmark = st.session_state["benchmark"]
     benchmark_symbol = st.session_state["benchmark_symbol"]
+    rebalance_label = st.session_state["rebalance_label"]
+    rebalance_freq = metrics.REBALANCE_FREQUENCIES[rebalance_label]
+    cost_bps = st.session_state["cost_bps"]
 
     if st.session_state.get("input_signature") != input_signature:
         st.warning(
@@ -569,8 +596,10 @@ if st.session_state.get("calculated"):
 
         # In split mode the weights were fitted on train_close only, so
         # the headline backtest runs on the untouched test window.
-        result = metrics.portfolio_daily_returns(test_close, active_w)
-        port_daily = result.portfolio
+        result = metrics.simulate_portfolio(
+            test_close, active_w, rebalance_freq, cost_bps
+        )
+        port_daily = result.returns
         daily_returns = result.assets
 
         if port_daily.empty:
@@ -633,9 +662,11 @@ if st.session_state.get("calculated"):
         # ── Train vs Test ──
         # The gap between the two columns is the overfitting, made visible.
         if split_date is not None:
-            train_result = metrics.portfolio_daily_returns(train_close, active_w)
-            if not train_result.portfolio.empty:
-                train_stats = metrics.backtest_stats(train_result.portfolio, risk_free_rate)
+            train_result = metrics.simulate_portfolio(
+                train_close, active_w, rebalance_freq, cost_bps
+            )
+            if not train_result.returns.empty:
+                train_stats = metrics.backtest_stats(train_result.returns, risk_free_rate)
                 st.subheader("Train vs Test")
                 comparison = pd.DataFrame({
                     "": ["Annual Return", "Annual Volatility", "Sharpe Ratio",
@@ -697,6 +728,30 @@ if st.session_state.get("calculated"):
                     f"ℹ️ พอร์ตนี้ให้ผลตอบแทนไม่ชนะการถือ **{benchmark_symbol}** เฉยๆ "
                     "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
                 )
+
+        # ── Rebalancing ──
+        st.subheader("การ Rebalance")
+        r1, r2, r3 = st.columns(3)
+        r1.metric("ความถี่", rebalance_label)
+        r2.metric("จำนวนครั้ง", f"{len(result.rebalances):,}")
+        r3.metric(
+            "Turnover รวม", f"{result.turnover.sum():.0%}",
+            help="มูลค่าที่ซื้อขายรวมทั้งช่วง คิดเป็นสัดส่วนของมูลค่าพอร์ต",
+        )
+        if cost_bps > 0:
+            gross = metrics.simulate_portfolio(test_close, active_w, rebalance_freq, 0.0)
+            gross_stats = metrics.backtest_stats(gross.returns, risk_free_rate)
+            st.caption(
+                f"ค่าธรรมเนียม {cost_bps:.0f} bps กินผลตอบแทนต่อปีไป "
+                f"**{gross_stats['annual_return'] - ann_ret:.2%}** "
+                f"(ก่อนหักค่าธรรมเนียม {gross_stats['annual_return']:.2%} → หลังหัก {ann_ret:.2%})"
+            )
+        if rebalance_freq is None and result.final_weights:
+            drift = ", ".join(
+                f"{sym} {active_w.get(sym, 0):.0%}→{final:.0%}"
+                for sym, final in sorted(result.final_weights.items())
+            )
+            st.caption(f"สัดส่วนเมื่อจบช่วง (ปล่อยให้ drift): {drift}")
 
         # ── Cumulative Returns Chart ──
         st.subheader("Cumulative Returns")
@@ -797,8 +852,10 @@ if st.session_state.get("calculated"):
 
         # Share the backtest's exact series so both tabs start on the
         # same date and report the same growth.
-        result = metrics.portfolio_daily_returns(test_close, active_w)
-        port_daily = result.portfolio
+        result = metrics.simulate_portfolio(
+            test_close, active_w, rebalance_freq, cost_bps
+        )
+        port_daily = result.returns
         daily_returns = result.assets
 
         if port_daily.empty:
