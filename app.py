@@ -7,6 +7,7 @@ import plotly.express as px
 from pypfopt.exceptions import OptimizationError
 
 import custom_data
+import fx
 import metrics
 import optimizer
 import thai_mf
@@ -16,6 +17,22 @@ st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 # Random portfolios are sampled at n_samples but only PLOT_SAMPLE of
 # them are drawn, which is what keeps the frontier tab responsive.
 PLOT_SAMPLE = 6_000
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_fx_rates(currencies, start, end):
+    """Units of each currency per one US dollar, from Yahoo."""
+    if not currencies:
+        return pd.DataFrame()
+    symbols = [fx.FX_SYMBOL_TEMPLATE.format(currency=c) for c in currencies]
+    frame = download_yf_close(tuple(symbols), start, end)
+    if frame.empty:
+        return pd.DataFrame()
+    rename = {
+        fx.FX_SYMBOL_TEMPLATE.format(currency=c): c
+        for c in currencies
+    }
+    return frame.rename(columns=rename)
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -62,7 +79,14 @@ with st.sidebar:
             max_value=pd.Timestamp.today(),
         )
 
-    total_cash = st.number_input("Total Cash (USD)", value=1_000_000, step=100_000)
+    base_currency = st.selectbox(
+        "สกุลเงินฐาน", fx.BASE_CURRENCIES,
+        help=(
+            "แปลงทุกสินทรัพย์เป็นสกุลนี้ก่อนคำนวณ กองทุนไทยเป็น THB หุ้น US เป็น USD "
+            "ถ้าไม่แปลง ผลของค่าเงินจะหายไปทั้งหมดและ volatility จะต่ำกว่าความจริง"
+        ),
+    )
+    total_cash = st.number_input(f"Total Cash ({base_currency})", value=1_000_000, step=100_000)
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
 
     backtest_mode = st.radio(
@@ -126,6 +150,10 @@ with st.sidebar:
             "(กรณี Date,Close จะใช้ชื่อไฟล์หรือชื่อ sheet เป็นชื่อสินทรัพย์)"
         ),
     )
+    upload_currency = st.selectbox(
+        "สกุลเงินของไฟล์ที่อัปโหลด", fx.BASE_CURRENCIES + ["EUR", "JPY", "GBP"],
+        help="ใช้เมื่อมีไฟล์ CSV/XLSX เท่านั้น",
+    )
     sec_factsheet_key = st.text_input(
         "SEC Fund Factsheet API Key (สำหรับกองทุนไทย)",
         value="",
@@ -168,6 +196,8 @@ input_signature = (
     benchmark_symbol,
     rebalance_label,
     float(cost_bps),
+    base_currency,
+    upload_currency,
     float(max_weight),
     float(shrinkage),
 )
@@ -275,6 +305,34 @@ if run_btn:
         st.error("No data downloaded. Check symbols and date range.")
         st.stop()
 
+    asset_currencies = {
+        column: fx.currency_for_symbol(
+            column,
+            default=upload_currency if column in uploaded_prices.columns else "USD",
+        )
+        for column in data_close.columns
+    }
+    needed = fx.required_currencies(asset_currencies, base_currency)
+    if needed:
+        with st.spinner("Downloading exchange rates..."):
+            rates = download_fx_rates(tuple(needed), str(start_date), str(end_date))
+        try:
+            data_close = fx.convert_prices(
+                data_close, asset_currencies, base_currency, rates
+            )
+        except fx.FXError as exc:
+            st.error(f"⚠️ {exc} — ลองเปลี่ยนสกุลเงินฐาน หรือเอาสินทรัพย์สกุลนั้นออก")
+            st.stop()
+        converted = sorted({
+            f"{sym} ({cur})" for sym, cur in asset_currencies.items()
+            if cur != base_currency
+        })
+        if converted:
+            st.caption(
+                f"💱 แปลงเป็น {base_currency} แล้ว: " + ", ".join(converted)
+                + " — ผลตอบแทนและความผันผวนที่แสดงรวมผลของค่าเงินไว้แล้ว"
+            )
+
     benchmark_close = pd.Series(dtype=float)
     if benchmark_symbol:
         with st.spinner(f"Downloading benchmark {benchmark_symbol}..."):
@@ -285,6 +343,27 @@ if run_btn:
             )
         else:
             benchmark_close = bench_df.iloc[:, 0].rename(benchmark_symbol)
+            bench_currency = fx.currency_for_symbol(benchmark_symbol)
+            if bench_currency != base_currency:
+                bench_needed = fx.required_currencies(
+                    {benchmark_symbol: bench_currency}, base_currency
+                )
+                bench_rates = download_fx_rates(
+                    tuple(bench_needed), str(start_date), str(end_date)
+                )
+                try:
+                    benchmark_close = fx.convert_prices(
+                        benchmark_close.to_frame(),
+                        {benchmark_symbol: bench_currency},
+                        base_currency,
+                        bench_rates,
+                    ).iloc[:, 0]
+                except fx.FXError:
+                    st.warning(
+                        f"⚠️ แปลงสกุลเงินของ benchmark **{benchmark_symbol}** ไม่ได้ "
+                        "— ข้ามการเปรียบเทียบ"
+                    )
+                    benchmark_close = pd.Series(dtype=float)
 
     # แจ้งหุ้นที่โหลดสำเร็จ / ไม่สำเร็จ
     loaded = list(data_close.columns)
@@ -427,6 +506,7 @@ if run_btn:
     st.session_state["benchmark_symbol"] = benchmark_symbol
     st.session_state["rebalance_label"] = rebalance_label
     st.session_state["cost_bps"] = cost_bps
+    st.session_state["base_currency"] = base_currency
     st.session_state["ar"] = ar
     st.session_state["covr"] = covr
     st.session_state["cleaned"] = cleaned
@@ -463,6 +543,7 @@ if st.session_state.get("calculated"):
     rebalance_label = st.session_state["rebalance_label"]
     rebalance_freq = metrics.REBALANCE_FREQUENCIES[rebalance_label]
     cost_bps = st.session_state["cost_bps"]
+    base_currency = st.session_state["base_currency"]
 
     if st.session_state.get("input_signature") != input_signature:
         st.warning(
@@ -883,9 +964,9 @@ if st.session_state.get("calculated"):
             ))
 
         fig_nav.update_layout(
-            title=f"NAV (Starting ${total_cash:,.0f})",
-            yaxis_title="NAV (USD)",
-            yaxis_tickformat="$,.0f",
+            title=f"NAV (เริ่มต้น {total_cash:,.0f} {base_currency})",
+            yaxis_title=f"NAV ({base_currency})",
+            yaxis_tickformat=",.0f",
             height=600,
         )
         st.plotly_chart(fig_nav, use_container_width=True)
@@ -896,8 +977,8 @@ if st.session_state.get("calculated"):
             "ส่วนเส้นรายตัวคือถือเดี่ยวไม่ปรับสัดส่วน จึงบวกกันแล้วไม่เท่ากับเส้นรวม"
         )
 
-        st.metric("Final NAV", f"${nav_total.iloc[-1]:,.0f}")
-        st.metric("Total P&L", f"${nav_total.iloc[-1] - total_cash:,.0f}")
+        st.metric("Final NAV", f"{nav_total.iloc[-1]:,.0f} {base_currency}")
+        st.metric("Total P&L", f"{nav_total.iloc[-1] - total_cash:,.0f} {base_currency}")
 
 else:
     st.info("Enter stock symbols and click **Calculate** to begin.")
