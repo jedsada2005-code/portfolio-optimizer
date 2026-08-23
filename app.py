@@ -65,6 +65,26 @@ with st.sidebar:
     total_cash = st.number_input("Total Cash (USD)", value=1_000_000, step=100_000)
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
 
+    backtest_mode = st.radio(
+        "โหมด Backtest",
+        ["Train / Test Split", "In-sample (ทั้งช่วง)"],
+        help=(
+            "In-sample หาน้ำหนักและทดสอบบนข้อมูลชุดเดียวกัน ผลลัพธ์จะสวยเกินจริงเสมอ "
+            "Train/Test หาน้ำหนักจากช่วงแรก แล้วทดสอบบนช่วงหลังที่ไม่เคยเห็น"
+        ),
+    )
+    train_fraction = 0.7
+    if backtest_mode == "Train / Test Split":
+        train_fraction = st.slider(
+            "สัดส่วนช่วง Train", 0.3, 0.9, 0.7, step=0.05, format="%.0f%%",
+            help="ที่เหลือใช้เป็นช่วง Test สำหรับวัดผลจริงแบบ out-of-sample",
+        )
+
+    benchmark_symbol = st.text_input(
+        "Benchmark (เว้นว่างได้)", value="SPY",
+        help="สัญลักษณ์ Yahoo สำหรับเทียบผลงาน ไม่ถูกนับรวมเป็นสินทรัพย์ในพอร์ต เช่น SPY หรือ ^SET.BK",
+    ).strip().upper()
+
     with st.expander("การตั้งค่าขั้นสูง"):
         max_weight = st.slider(
             "น้ำหนักสูงสุดต่อสินทรัพย์", 0.05, 1.0, 1.0, step=0.05, format="%.0f%%",
@@ -123,6 +143,11 @@ input_signature = (
     float(risk_free_rate),
     float(total_cash),
     tuple(sorted(f.name for f in uploaded_price_files)),
+    backtest_mode,
+    float(train_fraction),
+    benchmark_symbol,
+    float(max_weight),
+    float(shrinkage),
 )
 
 if run_btn:
@@ -228,6 +253,17 @@ if run_btn:
         st.error("No data downloaded. Check symbols and date range.")
         st.stop()
 
+    benchmark_close = pd.Series(dtype=float)
+    if benchmark_symbol:
+        with st.spinner(f"Downloading benchmark {benchmark_symbol}..."):
+            bench_df = download_yf_close((benchmark_symbol,), str(start_date), str(end_date))
+        if bench_df.empty:
+            st.warning(
+                f"⚠️ โหลด benchmark **{benchmark_symbol}** ไม่สำเร็จ — ข้ามการเปรียบเทียบ"
+            )
+        else:
+            benchmark_close = bench_df.iloc[:, 0].rename(benchmark_symbol)
+
     # แจ้งหุ้นที่โหลดสำเร็จ / ไม่สำเร็จ
     loaded = list(data_close.columns)
     missing = [s for s in yf_symbols if s not in loaded] + mf_missing
@@ -260,7 +296,21 @@ if run_btn:
 
     # ─── Calculations ───
     with st.spinner("Computing efficient frontier..."):
-        weekly = data_close.resample("W-FRI").last()
+        if backtest_mode == "Train / Test Split":
+            split_date = metrics.split_index(data_close.index, train_fraction)
+            train_close = data_close.loc[:split_date]
+            test_close = data_close.loc[split_date:]
+            if len(test_close) < 20:
+                st.error(
+                    "⚠️ ช่วง Test สั้นเกินไป — ลดสัดส่วน Train ลง หรือขยายช่วงวันที่"
+                )
+                st.stop()
+        else:
+            split_date = None
+            train_close = data_close
+            test_close = data_close
+
+        weekly = train_close.resample("W-FRI").last()
         ar, ar_observations = metrics.annual_return_estimates(weekly)
 
         # An expected return built from a handful of overlapping 52-week
@@ -280,6 +330,8 @@ if run_btn:
             )
             drop = list(insufficient)
             data_close = data_close.drop(columns=drop)
+            train_close = train_close.drop(columns=drop)
+            test_close = test_close.drop(columns=drop)
             weekly = weekly.drop(columns=drop)
             ar = ar.drop(index=drop)
 
@@ -345,6 +397,12 @@ if run_btn:
 
     # Store in session for tabs
     st.session_state["data_close"] = data_close
+    st.session_state["train_close"] = train_close
+    st.session_state["test_close"] = test_close
+    st.session_state["split_date"] = split_date
+    st.session_state["backtest_mode"] = backtest_mode
+    st.session_state["benchmark"] = benchmark_close
+    st.session_state["benchmark_symbol"] = benchmark_symbol
     st.session_state["ar"] = ar
     st.session_state["covr"] = covr
     st.session_state["cleaned"] = cleaned
@@ -373,6 +431,11 @@ if st.session_state.get("calculated"):
     stock_list = st.session_state["stock_list"]
     total_cash = st.session_state["total_cash"]
     risk_free_rate = st.session_state["risk_free_rate"]
+    train_close = st.session_state["train_close"]
+    test_close = st.session_state["test_close"]
+    split_date = st.session_state["split_date"]
+    benchmark = st.session_state["benchmark"]
+    benchmark_symbol = st.session_state["benchmark_symbol"]
 
     if st.session_state.get("input_signature") != input_signature:
         st.warning(
@@ -504,7 +567,9 @@ if st.session_state.get("calculated"):
 
         st.info(f"Backtesting with weights: {', '.join(f'{k}={v:.1%}' for k, v in active_w.items())}")
 
-        result = metrics.portfolio_daily_returns(data_close, active_w)
+        # In split mode the weights were fitted on train_close only, so
+        # the headline backtest runs on the untouched test window.
+        result = metrics.portfolio_daily_returns(test_close, active_w)
         port_daily = result.portfolio
         daily_returns = result.assets
 
@@ -516,9 +581,9 @@ if st.session_state.get("calculated"):
             st.stop()
 
         # The backtest can only begin once every holding actually exists.
-        requested_start = pd.Timestamp(data_close.index[0])
+        requested_start = pd.Timestamp(test_close.index[0])
         if result.start > requested_start:
-            firsts = metrics.first_valid_dates(data_close[result.held])
+            firsts = metrics.first_valid_dates(test_close[result.held])
             limiter = firsts.idxmax()
             st.warning(
                 f"⚠️ Backtest เริ่มจริงที่ **{result.start.date()}** ไม่ใช่ "
@@ -527,28 +592,31 @@ if st.session_state.get("calculated"):
             )
 
         cumulative = (1 + port_daily).cumprod()
-        # Derive both scalings from the index itself: merging a Thai fund
-        # with US equities yields ~300 rows a year, not 252.
-        periods_per_year = metrics.periods_per_year(port_daily.index)
-        n_years = metrics.years_elapsed(port_daily.index)
+        stats = metrics.backtest_stats(port_daily, risk_free_rate)
+        periods_per_year = stats["periods_per_year"]
+        n_years = stats["years"]
+        total_ret = stats["total_return"]
+        ann_ret = stats["annual_return"]
+        ann_vol = stats["annual_volatility"]
+        sharpe = stats["sharpe"]
+        max_dd = stats["max_drawdown"]
+        calmar = stats["calmar"]
+        sortino = stats["sortino"]
+        drawdown = (cumulative - cumulative.cummax()) / cumulative.cummax()
+
+        if split_date is not None:
+            st.success(
+                f"🔒 **Out-of-sample** — น้ำหนักคำนวณจากข้อมูลถึง **{split_date.date()}** "
+                f"แล้วทดสอบบน **{result.start.date()} ถึง {port_daily.index[-1].date()}** "
+                "ซึ่งเป็นข้อมูลที่ optimizer ไม่เคยเห็น"
+            )
+        else:
+            st.warning(
+                "⚠️ **In-sample** — น้ำหนักถูกหาจากข้อมูลชุดเดียวกับที่ใช้ทดสอบ "
+                "ผลลัพธ์จึงสวยเกินจริงเสมอ เปลี่ยนเป็นโหมด Train/Test Split เพื่อดูผลจริง"
+            )
 
         # ── Performance Stats ──
-        total_ret = cumulative.iloc[-1] - 1
-        ann_ret = metrics.cagr(total_ret, n_years)
-        ann_vol = port_daily.std() * np.sqrt(periods_per_year)
-        sharpe = (ann_ret - risk_free_rate) / ann_vol if ann_vol > 0 else 0
-
-        # Drawdown
-        running_max = cumulative.cummax()
-        drawdown = (cumulative - running_max) / running_max
-        max_dd = drawdown.min()
-        calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
-
-        # Sortino
-        downside_std = metrics.downside_deviation(port_daily, periods_per_year)
-        sortino = metrics.sortino_ratio(ann_ret, downside_std, risk_free_rate)
-
-        # Display metrics
         st.subheader("Performance Summary")
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Annual Return", f"{ann_ret:.2%}")
@@ -562,6 +630,74 @@ if st.session_state.get("calculated"):
         m7.metric("Sortino Ratio", f"{sortino:.2f}")
         m8.metric("Total Years", f"{n_years:.1f}")
 
+        # ── Train vs Test ──
+        # The gap between the two columns is the overfitting, made visible.
+        if split_date is not None:
+            train_result = metrics.portfolio_daily_returns(train_close, active_w)
+            if not train_result.portfolio.empty:
+                train_stats = metrics.backtest_stats(train_result.portfolio, risk_free_rate)
+                st.subheader("Train vs Test")
+                comparison = pd.DataFrame({
+                    "": ["Annual Return", "Annual Volatility", "Sharpe Ratio",
+                         "Max Drawdown", "Total Years"],
+                    "Train (in-sample)": [
+                        f"{train_stats['annual_return']:.2%}",
+                        f"{train_stats['annual_volatility']:.2%}",
+                        f"{train_stats['sharpe']:.2f}",
+                        f"{train_stats['max_drawdown']:.2%}",
+                        f"{train_stats['years']:.1f}",
+                    ],
+                    "Test (out-of-sample)": [
+                        f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}",
+                        f"{max_dd:.2%}", f"{n_years:.1f}",
+                    ],
+                })
+                st.dataframe(comparison, use_container_width=True, hide_index=True)
+                decay = train_stats["sharpe"] - sharpe
+                if decay > 0.5:
+                    st.warning(
+                        f"⚠️ Sharpe ตกจาก {train_stats['sharpe']:.2f} เหลือ {sharpe:.2f} "
+                        f"(−{decay:.2f}) — น้ำหนักชุดนี้ fit กับอดีตมากกว่าที่จะใช้ได้จริง"
+                    )
+
+        # ── Benchmark ──
+        bench_daily = pd.Series(dtype=float)
+        if not benchmark.empty:
+            bench_window = benchmark.reindex(
+                benchmark.index.union(port_daily.index)
+            ).ffill().reindex(port_daily.index)
+            bench_daily = bench_window.pct_change().fillna(0.0)
+            bench_stats = metrics.backtest_stats(bench_daily, risk_free_rate)
+            beta, alpha = metrics.beta_alpha(
+                port_daily, bench_daily, risk_free_rate, periods_per_year
+            )
+
+            st.subheader(f"เทียบกับ Benchmark: {benchmark_symbol}")
+            versus = pd.DataFrame({
+                "": ["Annual Return", "Annual Volatility", "Sharpe Ratio", "Max Drawdown"],
+                "Portfolio": [
+                    f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}", f"{max_dd:.2%}",
+                ],
+                benchmark_symbol: [
+                    f"{bench_stats['annual_return']:.2%}",
+                    f"{bench_stats['annual_volatility']:.2%}",
+                    f"{bench_stats['sharpe']:.2f}",
+                    f"{bench_stats['max_drawdown']:.2%}",
+                ],
+            })
+            st.dataframe(versus, use_container_width=True, hide_index=True)
+
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Beta", f"{beta:.2f}", help="ความอ่อนไหวต่อ benchmark — 1.0 คือเคลื่อนไหวตามกัน")
+            b2.metric("Alpha (ต่อปี)", f"{alpha:.2%}", help="ผลตอบแทนส่วนเกินหลังปรับความเสี่ยงตาม beta")
+            b3.metric("ชนะ Benchmark", f"{ann_ret - bench_stats['annual_return']:+.2%}")
+
+            if ann_ret <= bench_stats["annual_return"]:
+                st.info(
+                    f"ℹ️ พอร์ตนี้ให้ผลตอบแทนไม่ชนะการถือ **{benchmark_symbol}** เฉยๆ "
+                    "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
+                )
+
         # ── Cumulative Returns Chart ──
         st.subheader("Cumulative Returns")
         fig_cum = go.Figure()
@@ -570,8 +706,14 @@ if st.session_state.get("calculated"):
             mode="lines", name="Portfolio",
             line=dict(color="#2196F3"),
         ))
+        if not bench_daily.empty:
+            fig_cum.add_trace(go.Scatter(
+                x=bench_daily.index, y=(1 + bench_daily).cumprod().values,
+                mode="lines", name=benchmark_symbol,
+                line=dict(color="#9E9E9E", width=1.5, dash="dash"),
+            ))
         fig_cum.update_layout(
-            yaxis_title="Growth of $1",
+            yaxis_title="Growth of 1 unit",
             height=400,
         )
         st.plotly_chart(fig_cum, use_container_width=True)
@@ -655,7 +797,7 @@ if st.session_state.get("calculated"):
 
         # Share the backtest's exact series so both tabs start on the
         # same date and report the same growth.
-        result = metrics.portfolio_daily_returns(data_close, active_w)
+        result = metrics.portfolio_daily_returns(test_close, active_w)
         port_daily = result.portfolio
         daily_returns = result.assets
 

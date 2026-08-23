@@ -212,3 +212,92 @@ class TestAnnualReturnEstimates:
     def test_nothing_flagged_when_all_have_enough(self):
         counts = pd.Series({"A": 100, "B": 60})
         assert metrics.unreliable_assets(counts, 52) == {}
+
+
+class TestSplitIndex:
+    def test_splits_on_calendar_time_not_row_count(self):
+        # Rows are dense in the second half; splitting by position would
+        # land far later than the halfway point in time.
+        idx = pd.DatetimeIndex(
+            list(pd.date_range("2020-01-01", periods=10, freq="30D"))
+            + list(pd.date_range("2021-01-01", periods=200, freq="D"))
+        )
+        split = metrics.split_index(idx, 0.5)
+        span = (idx[-1] - idx[0]).days
+        assert abs((split - idx[0]).days - span * 0.5) <= 1
+
+    def test_fraction_of_one_returns_the_last_date(self):
+        idx = pd.bdate_range("2020-01-01", periods=100)
+        assert metrics.split_index(idx, 1.0) == idx[-1]
+
+    def test_rejects_a_fraction_outside_the_range(self):
+        idx = pd.bdate_range("2020-01-01", periods=100)
+        for bad in (0.0, 1.5, -0.1):
+            with pytest.raises(ValueError):
+                metrics.split_index(idx, bad)
+
+    def test_empty_index_returns_none(self):
+        assert metrics.split_index(pd.DatetimeIndex([]), 0.7) is None
+
+
+class TestBacktestStats:
+    def _flat_growth(self, daily, days):
+        idx = pd.bdate_range("2020-01-01", periods=days)
+        return pd.Series([0.0] + [daily] * (days - 1), index=idx)
+
+    def test_reports_every_headline_number(self):
+        stats = metrics.backtest_stats(self._flat_growth(0.001, 500), 0.02)
+        assert set(stats) == {
+            "total_return", "years", "annual_return", "annual_volatility",
+            "sharpe", "max_drawdown", "calmar", "sortino", "periods_per_year",
+        }
+
+    def test_a_never_losing_series_has_no_drawdown(self):
+        stats = metrics.backtest_stats(self._flat_growth(0.001, 500), 0.02)
+        assert stats["max_drawdown"] == pytest.approx(0.0)
+        assert stats["sortino"] == 0.0  # no downside at all, not infinity
+        assert stats["calmar"] == 0.0
+
+    def test_annual_return_compounds_over_calendar_years(self):
+        r = self._flat_growth(0.0005, 505)
+        stats = metrics.backtest_stats(r, 0.02)
+        expected = metrics.cagr((1 + r).prod() - 1, metrics.years_elapsed(r.index))
+        assert stats["annual_return"] == pytest.approx(expected)
+
+    def test_empty_series_is_safe(self):
+        stats = metrics.backtest_stats(pd.Series(dtype=float), 0.02)
+        assert stats["total_return"] == 0.0
+        assert stats["sharpe"] == 0.0
+
+
+class TestBetaAlpha:
+    def test_tracking_the_benchmark_exactly_gives_beta_one_alpha_zero(self):
+        rng = np.random.default_rng(4)
+        b = pd.Series(rng.normal(0.0004, 0.01, 1000), index=pd.bdate_range("2020-01-01", periods=1000))
+        beta, alpha = metrics.beta_alpha(b, b, 0.02, 252)
+        assert beta == pytest.approx(1.0)
+        assert alpha == pytest.approx(0.0, abs=1e-9)
+
+    def test_double_exposure_gives_beta_two(self):
+        rng = np.random.default_rng(4)
+        b = pd.Series(rng.normal(0.0004, 0.01, 1000), index=pd.bdate_range("2020-01-01", periods=1000))
+        beta, _ = metrics.beta_alpha(2 * b, b, 0.02, 252)
+        assert beta == pytest.approx(2.0)
+
+    def test_constant_outperformance_shows_positive_alpha(self):
+        rng = np.random.default_rng(4)
+        b = pd.Series(rng.normal(0.0004, 0.01, 1000), index=pd.bdate_range("2020-01-01", periods=1000))
+        _, alpha = metrics.beta_alpha(b + 0.0002, b, 0.02, 252)
+        assert alpha > 0
+
+    def test_a_flat_benchmark_gives_no_beta(self):
+        idx = pd.bdate_range("2020-01-01", periods=50)
+        beta, alpha = metrics.beta_alpha(pd.Series(0.001, index=idx), pd.Series(0.0, index=idx), 0.02, 252)
+        assert beta == 0.0
+
+    def test_only_overlapping_dates_are_compared(self):
+        rng = np.random.default_rng(4)
+        idx = pd.bdate_range("2020-01-01", periods=300)
+        b = pd.Series(rng.normal(0.0004, 0.01, 300), index=idx)
+        beta, _ = metrics.beta_alpha(b.iloc[100:], b, 0.02, 252)
+        assert beta == pytest.approx(1.0)

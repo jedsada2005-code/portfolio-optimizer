@@ -163,3 +163,75 @@ def unreliable_assets(observation_counts, minimum=MIN_ANNUAL_OBSERVATIONS):
         for asset, count in observation_counts.items()
         if int(count) < minimum
     }
+
+
+def split_index(index, train_fraction):
+    """Date that divides an index into a training and a testing window.
+
+    Splits on elapsed calendar time rather than row position, so a
+    period with denser trading days does not drag the boundary with it.
+    """
+    if not 0.0 < train_fraction <= 1.0:
+        raise ValueError("train_fraction ต้องอยู่ระหว่าง 0 (ไม่รวม) ถึง 1")
+    if len(index) == 0:
+        return None
+    start, end = index[0], index[-1]
+    return start + pd.Timedelta(days=(end - start).days * train_fraction)
+
+
+def backtest_stats(returns, risk_free_rate):
+    """Headline statistics for one return series.
+
+    Shared by the portfolio, the benchmark and each side of a
+    train/test split so the three are always computed identically.
+    """
+    r = pd.Series(returns).dropna()
+    blank = {
+        "total_return": 0.0, "years": 0.0, "annual_return": 0.0,
+        "annual_volatility": 0.0, "sharpe": 0.0, "max_drawdown": 0.0,
+        "calmar": 0.0, "sortino": 0.0, "periods_per_year": FALLBACK_PERIODS_PER_YEAR,
+    }
+    if r.empty:
+        return blank
+
+    ppy = periods_per_year(r.index)
+    years = years_elapsed(r.index)
+    cumulative = (1.0 + r).cumprod()
+    total = float(cumulative.iloc[-1] - 1.0)
+    annual = cagr(total, years)
+    vol = float(r.std() * np.sqrt(ppy))
+    drawdown = float(((cumulative - cumulative.cummax()) / cumulative.cummax()).min())
+    dd_dev = downside_deviation(r, ppy)
+
+    return {
+        "total_return": total,
+        "years": years,
+        "annual_return": annual,
+        "annual_volatility": vol,
+        "sharpe": (annual - risk_free_rate) / vol if vol > 0 else 0.0,
+        "max_drawdown": drawdown,
+        "calmar": annual / abs(drawdown) if drawdown < 0 else 0.0,
+        "sortino": sortino_ratio(annual, dd_dev, risk_free_rate),
+        "periods_per_year": ppy,
+    }
+
+
+def beta_alpha(portfolio_returns, benchmark_returns, risk_free_rate, periods_per_year_value):
+    """Beta against a benchmark and the resulting Jensen's alpha."""
+    joined = pd.concat(
+        [pd.Series(portfolio_returns), pd.Series(benchmark_returns)],
+        axis=1, join="inner",
+    ).dropna()
+    if len(joined) < 2:
+        return 0.0, 0.0
+
+    port, bench = joined.iloc[:, 0], joined.iloc[:, 1]
+    variance = float(bench.var())
+    if variance <= 0:
+        return 0.0, 0.0
+
+    beta = float(port.cov(bench) / variance)
+    port_annual = cagr(float((1 + port).prod() - 1), years_elapsed(joined.index))
+    bench_annual = cagr(float((1 + bench).prod() - 1), years_elapsed(joined.index))
+    alpha = port_annual - (risk_free_rate + beta * (bench_annual - risk_free_rate))
+    return beta, float(alpha)
