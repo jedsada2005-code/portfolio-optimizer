@@ -7,9 +7,9 @@ import plotly.express as px
 from pypfopt import EfficientFrontier, CLA, plotting
 from pypfopt.exceptions import OptimizationError
 import matplotlib.pyplot as plt
-import io
 
 import custom_data
+import metrics
 import thai_mf
 
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
@@ -33,7 +33,7 @@ with st.sidebar:
     with col2:
         end_date = st.date_input(
             "End Date",
-            value=pd.Timestamp("2022-01-01"),
+            value=pd.Timestamp.today(),
             min_value=pd.Timestamp("1990-01-01"),
             max_value=pd.Timestamp.today(),
         )
@@ -65,9 +65,9 @@ with st.sidebar:
 
     st.divider()
     st.caption("⚠️ **Beta Version — ข้อควรระวัง**")
-    st.caption("1. รองรับเฉพาะสินทรัพย์ที่มีใน Yahoo Finance เท่านั้น")
+    st.caption("1. รองรับหุ้น/ETF จาก Yahoo Finance, กองทุนรวมไทยจาก SEC (prefix `MF:`) และไฟล์ราคาที่อัปโหลดเอง (CSV/XLSX)")
     st.caption("2. หุ้นไทยต้องเติม `.BK` หลังชื่อ เช่น `PTT.BK` หุ้น US ใส่ชื่อได้เลย")
-    st.caption("3. Custom Weight รวมกันต้องเท่ากับ 1.0 เท่านั้น")
+    st.caption("3. Custom Weight ไม่ต้องรวมกันเป็น 1.0 ระบบจะปรับสัดส่วน (normalize) ให้อัตโนมัติ")
     st.caption("4. ตัวอย่าง: `AMZN, META, NVDA, SPY, LLY`")
     st.caption("5. ค่า Return, Vol, Sharpe ใน Expected กับ Backtest มีค่าใกล้เคียงกันแต่อาจต่างกันเล็กน้อย เนื่องจากคำนวณคนละวิธี")
     st.caption("6. หุ้นบางตัวอาจโหลดไม่สำเร็จ เพราะเขียนชื่อผิด หรือในปีนั้นยังไม่มีข้อมูล (ตรวจสอบชื่อและปีที่ดึงข้อมูลให้ดี)")
@@ -78,6 +78,13 @@ with st.sidebar:
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
 
 if run_btn:
+    if start_date >= end_date:
+        st.error(
+            f"⚠️ ช่วงวันที่ไม่ถูกต้อง — Start Date ({start_date}) ต้องอยู่ก่อน "
+            f"End Date ({end_date})"
+        )
+        st.stop()
+
     uploaded_frames = []
     file_errors = []
     for uploaded_file in uploaded_price_files:
@@ -241,15 +248,16 @@ if run_btn:
 
         # Random portfolios
         n_samples = 200_000
-        w = np.random.dirichlet([0.5] * len(ar), n_samples)
+        rng = np.random.default_rng(42)
+        w = rng.dirichlet([0.5] * len(ar), n_samples)
         rets = w.dot(ar)
         stds = np.sqrt((w.T * (covr.values @ w.T)).sum(axis=0))
-        sharpes = rets / stds
+        sharpes = (rets - risk_free_rate) / stds
 
         # Max Sharpe weights
         ef = EfficientFrontier(ar, covr)
         try:
-            raw_weights = ef.max_sharpe(risk_free_rate=risk_free_rate)
+            ef.max_sharpe(risk_free_rate=risk_free_rate)
         except (ValueError, OptimizationError):
             st.error(
                 "⚠️ หาพอร์ต Max Sharpe ไม่ได้ — สินทรัพย์ที่เลือกมีผลตอบแทนคาดหวังใกล้เคียงหรือต่ำกว่า "
@@ -257,14 +265,14 @@ if run_btn:
                 "ลองลด Risk-Free Rate ลง หรือเพิ่มสินทรัพย์ที่ผลตอบแทนสูงกว่าเข้าไปในพอร์ต"
             )
             st.stop()
-        cleaned = dict(raw_weights)
+        cleaned = dict(ef.clean_weights())
         perf = ef.portfolio_performance(risk_free_rate=risk_free_rate)
         opt_ret, opt_vol, opt_sharpe = perf
 
         # Min Volatility weights
         ef_mv = EfficientFrontier(ar, covr)
-        mv_weights = ef_mv.min_volatility()
-        mv_cleaned = dict(mv_weights)
+        ef_mv.min_volatility()
+        mv_cleaned = dict(ef_mv.clean_weights())
         mv_perf = ef_mv.portfolio_performance(risk_free_rate=risk_free_rate)
         mv_ret, mv_vol, mv_sharpe = mv_perf
 
@@ -441,13 +449,15 @@ if st.session_state.get("calculated"):
         port_daily = port_daily.loc[first_valid:]
 
         cumulative = (1 + port_daily).cumprod()
-        trading_days = 252
+        # Derive both scalings from the index itself: merging a Thai fund
+        # with US equities yields ~300 rows a year, not 252.
+        periods_per_year = metrics.periods_per_year(port_daily.index)
+        n_years = metrics.years_elapsed(port_daily.index)
 
         # ── Performance Stats ──
         total_ret = cumulative.iloc[-1] - 1
-        n_years = len(port_daily) / trading_days
-        ann_ret = (1 + total_ret) ** (1 / n_years) - 1
-        ann_vol = port_daily.std() * np.sqrt(trading_days)
+        ann_ret = metrics.cagr(total_ret, n_years)
+        ann_vol = port_daily.std() * np.sqrt(periods_per_year)
         sharpe = (ann_ret - risk_free_rate) / ann_vol if ann_vol > 0 else 0
 
         # Drawdown
@@ -457,9 +467,8 @@ if st.session_state.get("calculated"):
         calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0
 
         # Sortino
-        downside = port_daily[port_daily < 0]
-        downside_std = downside.std() * np.sqrt(trading_days)
-        sortino = (ann_ret - risk_free_rate) / downside_std if downside_std > 0 else 0
+        downside_std = metrics.downside_deviation(port_daily, periods_per_year)
+        sortino = metrics.sortino_ratio(ann_ret, downside_std, risk_free_rate)
 
         # Display metrics
         st.subheader("Performance Summary")
@@ -512,10 +521,7 @@ if st.session_state.get("calculated"):
             "Month": monthly.index.month,
             "Return": monthly.values,
         }).pivot(index="Year", columns="Month", values="Return")
-        monthly_pivot.columns = [
-            "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-            "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-        ][:len(monthly_pivot.columns)]
+        monthly_pivot.columns = metrics.month_labels(monthly_pivot.columns)
 
         fig_hm = px.imshow(
             monthly_pivot.values,
