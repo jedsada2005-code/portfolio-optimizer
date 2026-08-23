@@ -134,9 +134,9 @@ with st.sidebar:
     refit_label = "รายปี"
     if backtest_mode == "Train / Test Split":
         train_fraction = st.slider(
-            "สัดส่วนช่วง Train", 0.3, 0.9, 0.7, step=0.05, format="%.0f%%",
+            "สัดส่วนช่วง Train", 30, 90, 70, step=5, format="%d%%",
             help="ที่เหลือใช้เป็นช่วง Test สำหรับวัดผลจริงแบบ out-of-sample",
-        )
+        ) / 100
     elif backtest_mode == "Walk-Forward":
         refit_label = st.selectbox(
             "ความถี่การคำนวณน้ำหนักใหม่", ["รายไตรมาส", "รายปี"], index=1,
@@ -170,20 +170,25 @@ with st.sidebar:
 
     with st.expander("การตั้งค่าขั้นสูง"):
         max_weight = st.slider(
-            "น้ำหนักสูงสุดต่อสินทรัพย์", 0.05, 1.0, qp_number("maxw", 1.0),
-            step=0.05, format="%.0f%%",
-            help="กันไม่ให้ optimizer ทุ่มน้ำหนักเกือบทั้งหมดลงสินทรัพย์ตัวเดียว",
-        )
+            "น้ำหนักสูงสุดต่อสินทรัพย์", 5, 100,
+            int(round(qp_number("maxw", 1.0) * 100)), step=5, format="%d%%",
+            help=(
+                "กันไม่ให้ optimizer ทุ่มน้ำหนักเกือบทั้งหมดลงสินทรัพย์ตัวเดียว "
+                "ต้องตั้งไม่ต่ำกว่า 100% หารด้วยจำนวนสินทรัพย์ เช่น 4 ตัวต้องอย่างน้อย 25%"
+            ),
+        ) / 100
         cash_fraction = st.slider(
-            "สัดส่วนเงินสด", 0.0, 0.9, qp_number("cashpct", 0.0), step=0.05, format="%.0f%%",
+            "สัดส่วนเงินสด", 0, 90,
+            int(round(qp_number("cashpct", 0.0) * 100)), step=5, format="%d%%",
             help=(
                 "กันเงินไว้เป็นเงินสดที่ได้ผลตอบแทนเท่า Risk-Free Rate "
                 "สินทรัพย์เสี่ยงที่เหลือคงสัดส่วนภายในเดิม (two-fund separation)"
             ),
-        )
+        ) / 100
         shrinkage = st.slider(
             "Covariance Shrinkage", 0.0, 1.0,
             qp_number("shrink", optimizer.DEFAULT_SHRINKAGE), step=0.05,
+            format="%.2f",
             help=(
                 "ดึงค่าสหสัมพันธ์เข้าหาค่าเฉลี่ย ทำให้น้ำหนักที่ได้เสถียรขึ้นและ "
                 "ไม่สุดขั้ว 0 = ใช้ค่าจากข้อมูลดิบ, 1 = ใช้ค่าเฉลี่ยทั้งหมด"
@@ -517,7 +522,11 @@ if run_btn:
         w = optimizer.sample_weights(rng, len(ar), n_samples, max_weight)
         n_samples = len(w)
         rets = w.dot(ar)
-        stds = np.sqrt((w.T * (covr.values @ w.T)).sum(axis=0))
+        # NumPy's BLAS kernels raise spurious divide/overflow warnings on
+        # matmuls this wide -- an identity matrix times ones trips them
+        # too. The results are finite; only the FPU flags are wrong.
+        with np.errstate(divide="ignore", over="ignore", invalid="ignore"):
+            stds = np.sqrt((w.T * (covr.values @ w.T)).sum(axis=0))
         sharpes = (rets - risk_free_rate) / stds
 
         # Plot a subsample: 200k markers is what makes this tab crawl,
