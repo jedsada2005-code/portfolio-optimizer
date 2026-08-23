@@ -4,12 +4,11 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objs as go
 import plotly.express as px
-from pypfopt import EfficientFrontier, CLA, plotting
 from pypfopt.exceptions import OptimizationError
-import matplotlib.pyplot as plt
 
 import custom_data
 import metrics
+import optimizer
 import thai_mf
 
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
@@ -65,6 +64,19 @@ with st.sidebar:
 
     total_cash = st.number_input("Total Cash (USD)", value=1_000_000, step=100_000)
     risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
+
+    with st.expander("การตั้งค่าขั้นสูง"):
+        max_weight = st.slider(
+            "น้ำหนักสูงสุดต่อสินทรัพย์", 0.05, 1.0, 1.0, step=0.05, format="%.0f%%",
+            help="กันไม่ให้ optimizer ทุ่มน้ำหนักเกือบทั้งหมดลงสินทรัพย์ตัวเดียว",
+        )
+        shrinkage = st.slider(
+            "Covariance Shrinkage", 0.0, 1.0, optimizer.DEFAULT_SHRINKAGE, step=0.05,
+            help=(
+                "ดึงค่าสหสัมพันธ์เข้าหาค่าเฉลี่ย ทำให้น้ำหนักที่ได้เสถียรขึ้นและ "
+                "ไม่สุดขั้ว 0 = ใช้ค่าจากข้อมูลดิบ, 1 = ใช้ค่าเฉลี่ยทั้งหมด"
+            ),
+        )
     uploaded_price_files = st.file_uploader(
         "Upload CSV/XLSX Price Data",
         type=["csv", "xlsx"],
@@ -177,8 +189,13 @@ if run_btn:
         with st.spinner("Downloading Thai mutual fund data..."):
             client = thai_mf.SECFundClient(sec_factsheet_key, sec_daily_info_key)
             fund_navs = {}
-            for name in mf_symbols:
+            mf_progress = st.progress(0.0, text="กำลังดึงข้อมูลกองทุนไทย...")
+            for position, name in enumerate(mf_symbols, start=1):
                 display_symbol = f"MF:{name}"
+                mf_progress.progress(
+                    (position - 1) / len(mf_symbols),
+                    text=f"กำลังดึง {position}/{len(mf_symbols)}: {display_symbol}",
+                )
                 try:
                     proj_id, preferred_class = thai_mf.resolve_fund_id(name, client)
                     if proj_id is None:
@@ -197,6 +214,7 @@ if run_btn:
                     mf_incomplete.append(display_symbol)
                 mf_resolved_classes[display_symbol] = chosen_class
                 fund_navs[display_symbol] = nav_series
+            mf_progress.empty()
             data_close = thai_mf.merge_fund_navs(data_close, fund_navs)
 
     if not uploaded_prices.empty:
@@ -272,12 +290,21 @@ if run_btn:
             )
             st.stop()
 
-        covr = weekly.pct_change().cov() * 52
+        if max_weight * len(ar) < 1.0:
+            st.error(
+                f"⚠️ น้ำหนักสูงสุดต่อสินทรัพย์ {max_weight:.0%} × {len(ar)} ตัว ไม่ถึง 100% "
+                f"— ต้องตั้งเพดานอย่างน้อย {1 / len(ar):.0%} หรือเพิ่มสินทรัพย์"
+            )
+            st.stop()
+
+        sample_cov = weekly.pct_change().cov() * 52
+        covr = optimizer.shrink_covariance(sample_cov, shrinkage)
 
         # Random portfolios
         n_samples = 200_000
         rng = np.random.default_rng(42)
-        w = rng.dirichlet([0.5] * len(ar), n_samples)
+        w = optimizer.sample_weights(rng, len(ar), n_samples, max_weight)
+        n_samples = len(w)
         rets = w.dot(ar)
         stds = np.sqrt((w.T * (covr.values @ w.T)).sum(axis=0))
         sharpes = (rets - risk_free_rate) / stds
@@ -289,9 +316,10 @@ if run_btn:
         stds, rets, sharpes = stds[pick], rets[pick], sharpes[pick]
 
         # Max Sharpe weights
-        ef = EfficientFrontier(ar, covr)
         try:
-            ef.max_sharpe(risk_free_rate=risk_free_rate)
+            cleaned = optimizer.optimize_weights(
+                ar, covr, "Max Sharpe", risk_free_rate, max_weight
+            )
         except (ValueError, OptimizationError):
             st.error(
                 "⚠️ หาพอร์ต Max Sharpe ไม่ได้ — สินทรัพย์ที่เลือกมีผลตอบแทนคาดหวังใกล้เคียงหรือต่ำกว่า "
@@ -299,26 +327,21 @@ if run_btn:
                 "ลองลด Risk-Free Rate ลง หรือเพิ่มสินทรัพย์ที่ผลตอบแทนสูงกว่าเข้าไปในพอร์ต"
             )
             st.stop()
-        cleaned = dict(ef.clean_weights())
-        perf = ef.portfolio_performance(risk_free_rate=risk_free_rate)
-        opt_ret, opt_vol, opt_sharpe = perf
+        opt_ret, opt_vol, opt_sharpe = optimizer.portfolio_performance(
+            ar, covr, cleaned, risk_free_rate
+        )
 
         # Min Volatility weights
-        ef_mv = EfficientFrontier(ar, covr)
-        ef_mv.min_volatility()
-        mv_cleaned = dict(ef_mv.clean_weights())
-        mv_perf = ef_mv.portfolio_performance(risk_free_rate=risk_free_rate)
-        mv_ret, mv_vol, mv_sharpe = mv_perf
+        mv_cleaned = optimizer.optimize_weights(
+            ar, covr, "Min Volatility", risk_free_rate, max_weight
+        )
+        mv_ret, mv_vol, mv_sharpe = optimizer.portfolio_performance(
+            ar, covr, mv_cleaned, risk_free_rate
+        )
 
-        # Efficient frontier curve
-        ef2 = EfficientFrontier(ar, covr)
-        fig_mpl, ax_mpl = plt.subplots()
-        plotting.plot_efficient_frontier(ef2, ax=ax_mpl, show_assets=False)
-        # extract the line data
-        ef_line = ax_mpl.get_lines()[0]
-        ef_x = ef_line.get_xdata()
-        ef_y = ef_line.get_ydata()
-        plt.close(fig_mpl)
+        # Efficient frontier curve, solved directly instead of read back
+        # out of a throwaway matplotlib figure.
+        ef_x, ef_y = optimizer.frontier_curve(ar, covr, max_weight)
 
     # Store in session for tabs
     st.session_state["data_close"] = data_close

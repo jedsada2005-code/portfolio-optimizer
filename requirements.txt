@@ -5,6 +5,5 @@ openpyxl
 numpy
 plotly
 pyportfolioopt
-matplotlib
 requests
 pytest
