@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objs as go
 import plotly.express as px
+import io
 from pypfopt.exceptions import OptimizationError
 
 import custom_data
@@ -17,6 +18,34 @@ st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 # Random portfolios are sampled at n_samples but only PLOT_SAMPLE of
 # them are drawn, which is what keeps the frontier tab responsive.
 PLOT_SAMPLE = 6_000
+
+
+MODES = ["Train / Test Split", "Walk-Forward", "In-sample (ทั้งช่วง)"]
+
+
+def qp_text(key, default):
+    """Widget default taken from the URL, falling back to the built-in."""
+    value = st.query_params.get(key)
+    return value if value not in (None, "") else default
+
+
+def qp_number(key, default, cast=float):
+    try:
+        return cast(st.query_params[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def qp_date(key, default):
+    try:
+        return pd.Timestamp(st.query_params[key])
+    except (KeyError, TypeError, ValueError):
+        return default
+
+
+def qp_choice(key, options, default_index=0):
+    value = st.query_params.get(key)
+    return options.index(value) if value in options else default_index
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -61,53 +90,63 @@ with st.sidebar:
     st.header("Settings")
     symbols_input = st.text_input(
         "Stock Symbols (comma-separated)",
-        value="AMZN, META, LLY, SPY, NVDA, GOOGL",
+        value=qp_text("symbols", "AMZN, META, LLY, SPY, NVDA, GOOGL"),
     )
     col1, col2 = st.columns(2)
     with col1:
         start_date = st.date_input(
             "Start Date",
-            value=pd.Timestamp("2010-01-01"),
+            value=qp_date("start", pd.Timestamp("2010-01-01")),
             min_value=pd.Timestamp("1990-01-01"),
             max_value=pd.Timestamp.today(),
         )
     with col2:
         end_date = st.date_input(
             "End Date",
-            value=pd.Timestamp.today(),
+            value=qp_date("end", pd.Timestamp.today()),
             min_value=pd.Timestamp("1990-01-01"),
             max_value=pd.Timestamp.today(),
         )
 
     base_currency = st.selectbox(
-        "สกุลเงินฐาน", fx.BASE_CURRENCIES,
+        "สกุลเงินฐาน", fx.BASE_CURRENCIES, index=qp_choice("base", fx.BASE_CURRENCIES),
         help=(
             "แปลงทุกสินทรัพย์เป็นสกุลนี้ก่อนคำนวณ กองทุนไทยเป็น THB หุ้น US เป็น USD "
             "ถ้าไม่แปลง ผลของค่าเงินจะหายไปทั้งหมดและ volatility จะต่ำกว่าความจริง"
         ),
     )
-    total_cash = st.number_input(f"Total Cash ({base_currency})", value=1_000_000, step=100_000)
-    risk_free_rate = st.number_input("Risk-Free Rate", value=0.02, step=0.01, format="%.4f")
+    total_cash = st.number_input(f"Total Cash ({base_currency})", value=qp_number("cash", 1_000_000, int), step=100_000)
+    risk_free_rate = st.number_input(
+        "Risk-Free Rate", value=qp_number("rf", 0.02), step=0.01, format="%.4f"
+    )
 
     backtest_mode = st.radio(
         "โหมด Backtest",
-        ["Train / Test Split", "In-sample (ทั้งช่วง)"],
+        MODES,
+        index=qp_choice("mode", MODES),
         help=(
             "In-sample หาน้ำหนักและทดสอบบนข้อมูลชุดเดียวกัน ผลลัพธ์จะสวยเกินจริงเสมอ "
-            "Train/Test หาน้ำหนักจากช่วงแรก แล้วทดสอบบนช่วงหลังที่ไม่เคยเห็น"
+            "Train/Test หาน้ำหนักจากช่วงแรก แล้วทดสอบบนช่วงหลังที่ไม่เคยเห็น "
+            "Walk-Forward คำนวณน้ำหนักใหม่เป็นงวดๆ โดยใช้เฉพาะข้อมูลที่มีอยู่ ณ ตอนนั้น"
         ),
     )
     train_fraction = 0.7
+    refit_label = "รายปี"
     if backtest_mode == "Train / Test Split":
         train_fraction = st.slider(
             "สัดส่วนช่วง Train", 0.3, 0.9, 0.7, step=0.05, format="%.0f%%",
             help="ที่เหลือใช้เป็นช่วง Test สำหรับวัดผลจริงแบบ out-of-sample",
         )
+    elif backtest_mode == "Walk-Forward":
+        refit_label = st.selectbox(
+            "ความถี่การคำนวณน้ำหนักใหม่", ["รายไตรมาส", "รายปี"], index=1,
+            help="ต้องมีข้อมูลอย่างน้อย 2 ปีก่อนการคำนวณครั้งแรก",
+        )
 
     rebalance_label = st.selectbox(
         "ความถี่การ Rebalance",
         list(metrics.REBALANCE_FREQUENCIES),
-        index=2,
+        index=qp_choice("reb", list(metrics.REBALANCE_FREQUENCIES), 2),
         help=(
             "การคำนวณแบบเดิมสมมติว่าปรับพอร์ตกลับสัดส่วนเดิมทุกวันทำการโดยไม่มีค่าใช้จ่าย "
             "ซึ่งทำไม่ได้จริงและดันผลตอบแทนสูงเกินจริง"
@@ -115,7 +154,7 @@ with st.sidebar:
     )
     cost_bps = st.number_input(
         "ค่าธรรมเนียมซื้อขาย (bps ต่อมูลค่าที่เทรด)",
-        min_value=0.0, max_value=500.0, value=0.0, step=5.0,
+        min_value=0.0, max_value=500.0, value=qp_number("cost", 0.0), step=5.0,
         help=(
             "100 bps = 1% คิดจากมูลค่าที่ซื้อขายจริงในแต่ละรอบ rebalance เท่านั้น "
             "(ไม่คิดตอนซื้อครั้งแรก) หมายเหตุ: NAV กองทุนและราคา ETF หัก "
@@ -125,17 +164,26 @@ with st.sidebar:
     )
 
     benchmark_symbol = st.text_input(
-        "Benchmark (เว้นว่างได้)", value="SPY",
+        "Benchmark (เว้นว่างได้)", value=qp_text("bench", "SPY"),
         help="สัญลักษณ์ Yahoo สำหรับเทียบผลงาน ไม่ถูกนับรวมเป็นสินทรัพย์ในพอร์ต เช่น SPY หรือ ^SET.BK",
     ).strip().upper()
 
     with st.expander("การตั้งค่าขั้นสูง"):
         max_weight = st.slider(
-            "น้ำหนักสูงสุดต่อสินทรัพย์", 0.05, 1.0, 1.0, step=0.05, format="%.0f%%",
+            "น้ำหนักสูงสุดต่อสินทรัพย์", 0.05, 1.0, qp_number("maxw", 1.0),
+            step=0.05, format="%.0f%%",
             help="กันไม่ให้ optimizer ทุ่มน้ำหนักเกือบทั้งหมดลงสินทรัพย์ตัวเดียว",
         )
+        cash_fraction = st.slider(
+            "สัดส่วนเงินสด", 0.0, 0.9, qp_number("cashpct", 0.0), step=0.05, format="%.0f%%",
+            help=(
+                "กันเงินไว้เป็นเงินสดที่ได้ผลตอบแทนเท่า Risk-Free Rate "
+                "สินทรัพย์เสี่ยงที่เหลือคงสัดส่วนภายในเดิม (two-fund separation)"
+            ),
+        )
         shrinkage = st.slider(
-            "Covariance Shrinkage", 0.0, 1.0, optimizer.DEFAULT_SHRINKAGE, step=0.05,
+            "Covariance Shrinkage", 0.0, 1.0,
+            qp_number("shrink", optimizer.DEFAULT_SHRINKAGE), step=0.05,
             help=(
                 "ดึงค่าสหสัมพันธ์เข้าหาค่าเฉลี่ย ทำให้น้ำหนักที่ได้เสถียรขึ้นและ "
                 "ไม่สุดขั้ว 0 = ใช้ค่าจากข้อมูลดิบ, 1 = ใช้ค่าเฉลี่ยทั้งหมด"
@@ -174,10 +222,14 @@ with st.sidebar:
     st.caption("2. หุ้นไทยต้องเติม `.BK` หลังชื่อ เช่น `PTT.BK` หุ้น US ใส่ชื่อได้เลย")
     st.caption("3. Custom Weight ไม่ต้องรวมกันเป็น 1.0 ระบบจะปรับสัดส่วน (normalize) ให้อัตโนมัติ")
     st.caption("4. ตัวอย่าง: `AMZN, META, NVDA, SPY, LLY`")
-    st.caption("5. ค่า Return, Vol, Sharpe ใน Expected กับ Backtest มีค่าใกล้เคียงกันแต่อาจต่างกันเล็กน้อย เนื่องจากคำนวณคนละวิธี")
+    st.caption("5. โหมด **Train/Test** และ **Walk-Forward** วัดผลจากข้อมูลที่ optimizer ไม่เคยเห็น ส่วน **In-sample** จะให้ผลสวยเกินจริงเสมอ")
     st.caption("6. หุ้นบางตัวอาจโหลดไม่สำเร็จ เพราะเขียนชื่อผิด หรือในปีนั้นยังไม่มีข้อมูล (ตรวจสอบชื่อและปีที่ดึงข้อมูลให้ดี)")
     st.caption("7. กองทุนรวมไทยใส่ prefix `MF:` เช่น `MF:K-CHANGE-A(A)` ข้อมูลมาจาก SEC Open Data และต้องกรอก API Key ทั้ง 2 ช่องด้านบน (Fund Factsheet กับ Fund Daily Info เป็นคนละ key กัน ต้อง subscribe แยกกัน)")
     st.caption("8. CSV/XLSX ต้องเป็นราคาหรือ NAV ไม่ใช่ daily return และต้องมีคอลัมน์วันที่ เช่น `Date`")
+    st.caption("9. สินทรัพย์ทุกตัวถูกแปลงเป็นสกุลเงินฐานก่อนคำนวณ ผลตอบแทนที่เห็นจึงรวมผลของค่าเงินไว้แล้ว")
+    st.caption("10. Backtest เริ่มนับจากวันแรกที่ **ทุกตัว** ในพอร์ตมีข้อมูลครบ ไม่ใช่จาก Start Date เสมอไป")
+    st.caption("11. NAV กองทุนและราคา ETF หักค่าธรรมเนียมจัดการรายปีไปแล้ว ช่องค่าธรรมเนียมมีไว้ใส่ค่าซื้อขาย/ค่าคอมมิชชั่นเท่านั้น")
+    st.caption("12. กด Calculate แล้ว URL จะเก็บการตั้งค่าทั้งหมด — bookmark หรือส่งลิงก์ให้คนอื่นเปิดต่อได้")
 
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
@@ -198,6 +250,8 @@ input_signature = (
     float(cost_bps),
     base_currency,
     upload_currency,
+    refit_label,
+    float(cash_fraction),
     float(max_weight),
     float(shrinkage),
 )
@@ -397,7 +451,11 @@ if run_btn:
 
     # ─── Calculations ───
     with st.spinner("Computing efficient frontier..."):
-        if backtest_mode == "Train / Test Split":
+        if backtest_mode == "Walk-Forward":
+            split_date = None
+            train_close = data_close
+            test_close = data_close
+        elif backtest_mode == "Train / Test Split":
             split_date = metrics.split_index(data_close.index, train_fraction)
             train_close = data_close.loc[:split_date]
             test_close = data_close.loc[split_date:]
@@ -507,6 +565,11 @@ if run_btn:
     st.session_state["rebalance_label"] = rebalance_label
     st.session_state["cost_bps"] = cost_bps
     st.session_state["base_currency"] = base_currency
+    st.session_state["refit_freq"] = metrics.REBALANCE_FREQUENCIES[refit_label]
+    st.session_state["refit_label"] = refit_label
+    st.session_state["cash_fraction"] = cash_fraction
+    st.session_state["max_weight"] = max_weight
+    st.session_state["shrinkage"] = shrinkage
     st.session_state["ar"] = ar
     st.session_state["covr"] = covr
     st.session_state["cleaned"] = cleaned
@@ -520,6 +583,16 @@ if run_btn:
     st.session_state["risk_free_rate"] = risk_free_rate
     st.session_state["calculated"] = True
     st.session_state["input_signature"] = input_signature
+
+    # D5: the URL now carries the whole setup, so it can be bookmarked
+    # or shared and will reopen with the same inputs.
+    st.query_params.update({
+        "symbols": symbols_input, "start": str(start_date), "end": str(end_date),
+        "base": base_currency, "cash": str(total_cash), "rf": str(risk_free_rate),
+        "mode": backtest_mode, "reb": rebalance_label, "bench": benchmark_symbol,
+        "cost": str(cost_bps), "maxw": str(max_weight), "cashpct": str(cash_fraction),
+        "shrink": str(shrinkage),
+    })
 
 # ─── Display results ───
 if st.session_state.get("calculated"):
@@ -544,6 +617,12 @@ if st.session_state.get("calculated"):
     rebalance_freq = metrics.REBALANCE_FREQUENCIES[rebalance_label]
     cost_bps = st.session_state["cost_bps"]
     base_currency = st.session_state["base_currency"]
+    refit_freq = st.session_state["refit_freq"]
+    refit_label = st.session_state["refit_label"]
+    cash_fraction = st.session_state["cash_fraction"]
+    max_weight = st.session_state["max_weight"]
+    shrinkage = st.session_state["shrinkage"]
+    backtest_mode = st.session_state["backtest_mode"]
 
     if st.session_state.get("input_signature") != input_signature:
         st.warning(
@@ -593,6 +672,31 @@ if st.session_state.get("calculated"):
             height=600,
         )
         st.plotly_chart(fig, use_container_width=True)
+
+        st.subheader("ค่าสหสัมพันธ์ระหว่างสินทรัพย์")
+        correlation = data_close.resample("W-FRI").last().pct_change().corr()
+        fig_corr = px.imshow(
+            correlation.values,
+            x=correlation.columns.tolist(), y=correlation.index.tolist(),
+            color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+            aspect="auto", text_auto=".2f",
+        )
+        fig_corr.update_layout(height=max(320, len(correlation) * 42))
+        st.plotly_chart(fig_corr, use_container_width=True)
+
+        off_diagonal = correlation.where(~np.eye(len(correlation), dtype=bool))
+        average_corr = off_diagonal.stack().mean()
+        st.caption(
+            f"ค่าสหสัมพันธ์เฉลี่ย **{average_corr:.2f}** "
+            + (
+                "— สูงมาก สินทรัพย์เคลื่อนไหวไปทางเดียวกันเกือบทั้งหมด "
+                "การถือหลายตัวจึงกระจายความเสี่ยงได้น้อยกว่าที่คิด"
+                if average_corr > 0.7 else
+                "— กระจายตัวได้ดี สินทรัพย์ไม่ได้เคลื่อนไหวตามกันทั้งหมด"
+                if average_corr < 0.4 else
+                "— กระจายตัวปานกลาง"
+            )
+        )
 
     # ════════════════════════════════════════
     # Tab 2: Optimal Weights + Custom Sliders
@@ -675,13 +779,49 @@ if st.session_state.get("calculated"):
 
         st.info(f"Backtesting with weights: {', '.join(f'{k}={v:.1%}' for k, v in active_w.items())}")
 
-        # In split mode the weights were fitted on train_close only, so
-        # the headline backtest runs on the untouched test window.
-        result = metrics.simulate_portfolio(
-            test_close, active_w, rebalance_freq, cost_bps
-        )
-        port_daily = result.returns
-        daily_returns = result.assets
+        # C2: a cash sleeve is modelled as a synthetic holding accruing
+        # the risk-free rate, so it flows through the ordinary simulator.
+        backtest_w = metrics.blend_with_cash(active_w, cash_fraction)
+        test_prices = test_close
+        train_prices = train_close
+        if cash_fraction > 0:
+            test_prices = test_close.assign(
+                **{metrics.CASH_SYMBOL: metrics.cash_price_series(test_close.index, risk_free_rate)}
+            )
+            train_prices = train_close.assign(
+                **{metrics.CASH_SYMBOL: metrics.cash_price_series(train_close.index, risk_free_rate)}
+            )
+            st.caption(
+                f"💵 ถือเงินสด {cash_fraction:.0%} ที่ได้ผลตอบแทน {risk_free_rate:.2%} ต่อปี "
+                f"— สินทรัพย์เสี่ยงที่เหลือ {1 - cash_fraction:.0%} คงสัดส่วนภายในเดิม"
+            )
+
+        walk_result = None
+        if backtest_mode == "Walk-Forward":
+            with st.spinner("Running walk-forward..."):
+                walk_result = optimizer.walk_forward(
+                    test_prices, risk_free_rate, strategy, max_weight,
+                    shrinkage, refit_freq, cost_bps,
+                )
+            if walk_result.returns.empty:
+                st.error(
+                    "⚠️ ข้อมูลไม่พอสำหรับ Walk-Forward — ต้องมีอย่างน้อย 2 ปี "
+                    "ก่อนการคำนวณน้ำหนักครั้งแรก ลองขยายช่วงวันที่"
+                )
+                st.stop()
+            result = metrics.simulate_portfolio(
+                test_prices, walk_result.weight_history[-1][1], rebalance_freq, cost_bps
+            )
+            port_daily = walk_result.returns
+            daily_returns = result.assets
+        else:
+            # In split mode the weights were fitted on train_close only,
+            # so the headline backtest runs on the untouched test window.
+            result = metrics.simulate_portfolio(
+                test_prices, backtest_w, rebalance_freq, cost_bps
+            )
+            port_daily = result.returns
+            daily_returns = result.assets
 
         if port_daily.empty:
             st.error(
@@ -691,9 +831,9 @@ if st.session_state.get("calculated"):
             st.stop()
 
         # The backtest can only begin once every holding actually exists.
-        requested_start = pd.Timestamp(test_close.index[0])
-        if result.start > requested_start:
-            firsts = metrics.first_valid_dates(test_close[result.held])
+        requested_start = pd.Timestamp(test_prices.index[0])
+        if result.start is not None and result.start > requested_start:
+            firsts = metrics.first_valid_dates(test_prices[result.held])
             limiter = firsts.idxmax()
             st.warning(
                 f"⚠️ Backtest เริ่มจริงที่ **{result.start.date()}** ไม่ใช่ "
@@ -714,7 +854,13 @@ if st.session_state.get("calculated"):
         sortino = stats["sortino"]
         drawdown = (cumulative - cumulative.cummax()) / cumulative.cummax()
 
-        if split_date is not None:
+        if backtest_mode == "Walk-Forward":
+            st.success(
+                f"🔒 **Walk-Forward** — คำนวณน้ำหนักใหม่{refit_label} "
+                f"รวม **{len(walk_result.weight_history)} ครั้ง** โดยแต่ละครั้งใช้เฉพาะข้อมูล "
+                "ที่มีอยู่ ณ วันนั้น ทั้งช่วงที่ทดสอบจึงเป็น out-of-sample ทั้งหมด"
+            )
+        elif split_date is not None:
             st.success(
                 f"🔒 **Out-of-sample** — น้ำหนักคำนวณจากข้อมูลถึง **{split_date.date()}** "
                 f"แล้วทดสอบบน **{result.start.date()} ถึง {port_daily.index[-1].date()}** "
@@ -740,11 +886,26 @@ if st.session_state.get("calculated"):
         m7.metric("Sortino Ratio", f"{sortino:.2f}")
         m8.metric("Total Years", f"{n_years:.1f}")
 
+        # ── Walk-forward weight history ──
+        if walk_result is not None:
+            st.subheader("น้ำหนักที่คำนวณใหม่ในแต่ละงวด")
+            history = pd.DataFrame(
+                [w for _, w in walk_result.weight_history],
+                index=[d.date() for d, _ in walk_result.weight_history],
+            ).fillna(0.0)
+            st.dataframe(
+                history.style.format("{:.1%}"), use_container_width=True
+            )
+            st.caption(
+                f"Turnover เฉลี่ยต่อการคำนวณใหม่ 1 ครั้ง: "
+                f"**{walk_result.turnover.mean():.0%}** ของมูลค่าพอร์ต"
+            )
+
         # ── Train vs Test ──
         # The gap between the two columns is the overfitting, made visible.
         if split_date is not None:
             train_result = metrics.simulate_portfolio(
-                train_close, active_w, rebalance_freq, cost_bps
+                train_prices, backtest_w, rebalance_freq, cost_bps
             )
             if not train_result.returns.empty:
                 train_stats = metrics.backtest_stats(train_result.returns, risk_free_rate)
@@ -820,7 +981,7 @@ if st.session_state.get("calculated"):
             help="มูลค่าที่ซื้อขายรวมทั้งช่วง คิดเป็นสัดส่วนของมูลค่าพอร์ต",
         )
         if cost_bps > 0:
-            gross = metrics.simulate_portfolio(test_close, active_w, rebalance_freq, 0.0)
+            gross = metrics.simulate_portfolio(test_prices, backtest_w, rebalance_freq, 0.0)
             gross_stats = metrics.backtest_stats(gross.returns, risk_free_rate)
             st.caption(
                 f"ค่าธรรมเนียม {cost_bps:.0f} bps กินผลตอบแทนต่อปีไป "
@@ -890,6 +1051,34 @@ if st.session_state.get("calculated"):
         fig_hm.update_layout(height=max(300, len(monthly_pivot) * 30))
         st.plotly_chart(fig_hm, use_container_width=True)
 
+        # ── Export ──
+        st.subheader("ดาวน์โหลดผลลัพธ์")
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            pd.DataFrame(
+                {"Asset": list(backtest_w), "Weight": list(backtest_w.values())}
+            ).to_excel(writer, sheet_name="Weights", index=False)
+            pd.DataFrame(
+                {"Metric": list(stats), "Value": list(stats.values())}
+            ).to_excel(writer, sheet_name="Stats", index=False)
+            pd.DataFrame({
+                "Date": port_daily.index, "Daily Return": port_daily.values,
+                "Cumulative": cumulative.values, "Drawdown": drawdown.values,
+            }).to_excel(writer, sheet_name="Backtest", index=False)
+            data_close.to_excel(writer, sheet_name="Prices")
+            if walk_result is not None:
+                pd.DataFrame(
+                    [w for _, w in walk_result.weight_history],
+                    index=[d.date() for d, _ in walk_result.weight_history],
+                ).to_excel(writer, sheet_name="Walk-Forward Weights")
+        st.download_button(
+            "📥 ดาวน์โหลดเป็น Excel",
+            data=buffer.getvalue(),
+            file_name="portfolio_backtest.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
         # ── Worst Drawdown Periods ──
         st.subheader("Worst Drawdown Periods")
         dd_series = drawdown.copy()
@@ -933,8 +1122,14 @@ if st.session_state.get("calculated"):
 
         # Share the backtest's exact series so both tabs start on the
         # same date and report the same growth.
+        nav_w = metrics.blend_with_cash(active_w, cash_fraction)
+        nav_prices = test_close
+        if cash_fraction > 0:
+            nav_prices = test_close.assign(
+                **{metrics.CASH_SYMBOL: metrics.cash_price_series(test_close.index, risk_free_rate)}
+            )
         result = metrics.simulate_portfolio(
-            test_close, active_w, rebalance_freq, cost_bps
+            nav_prices, nav_w, rebalance_freq, cost_bps
         )
         port_daily = result.returns
         daily_returns = result.assets
@@ -955,7 +1150,7 @@ if st.session_state.get("calculated"):
         # Each sleeve held on its own, for comparison against the
         # rebalanced portfolio line above.
         for sym in sorted(result.held):
-            stock_nav = total_cash * active_w[sym] * (1 + daily_returns[sym]).cumprod()
+            stock_nav = total_cash * nav_w[sym] * (1 + daily_returns[sym]).cumprod()
             fig_nav.add_trace(go.Scatter(
                 x=stock_nav.index, y=stock_nav.values,
                 mode="lines", name=f"{sym} (ถือเดี่ยว)",

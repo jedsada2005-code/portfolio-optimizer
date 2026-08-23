@@ -151,3 +151,51 @@ class TestSampleWeights:
     def test_infeasible_cap_returns_nothing(self):
         rng = np.random.default_rng(0)
         assert len(optimizer.sample_weights(rng, 4, 100, 0.2)) == 0
+
+
+def _trending_prices(days=1500, seed=3):
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2015-01-01", periods=days)
+    return pd.DataFrame(
+        {"A": 100 * np.cumprod(1 + rng.normal(0.0006, 0.012, days)),
+         "B": 100 * np.cumprod(1 + rng.normal(0.0003, 0.008, days)),
+         "C": 100 * np.cumprod(1 + rng.normal(0.0004, 0.020, days))},
+        index=idx,
+    )
+
+
+class TestWalkForward:
+    def test_refits_repeatedly_and_the_weights_move(self):
+        result = optimizer.walk_forward(_trending_prices(), 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0)
+        assert len(result.weight_history) >= 2
+        first, last = result.weight_history[0][1], result.weight_history[-1][1]
+        assert first != last
+
+    def test_only_covers_the_period_after_the_first_fit(self):
+        prices = _trending_prices()
+        result = optimizer.walk_forward(prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0)
+        assert result.returns.index[0] > prices.index[0]
+        assert result.returns.index[-1] == prices.index[-1]
+
+    def test_refitting_more_often_produces_more_weight_sets(self):
+        prices = _trending_prices()
+        yearly = optimizer.walk_forward(prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0)
+        quarterly = optimizer.walk_forward(prices, 0.02, "Max Sharpe", 1.0, 0.2, "Q", 0.0)
+        assert len(quarterly.weight_history) > len(yearly.weight_history)
+
+    def test_costs_reduce_the_outcome(self):
+        prices = _trending_prices()
+        free = optimizer.walk_forward(prices, 0.02, "Max Sharpe", 1.0, 0.2, "Q", 0.0)
+        charged = optimizer.walk_forward(prices, 0.02, "Max Sharpe", 1.0, 0.2, "Q", 100.0)
+        assert (1 + charged.returns).prod() < (1 + free.returns).prod()
+
+    def test_respects_the_weight_cap_at_every_refit(self):
+        result = optimizer.walk_forward(_trending_prices(), 0.02, "Max Sharpe", 0.5, 0.2, "Y", 0.0)
+        for _, weights in result.weight_history:
+            assert max(weights.values()) <= 0.5 + 1e-6
+
+    def test_too_little_history_produces_nothing(self):
+        short = _trending_prices(days=200)
+        result = optimizer.walk_forward(short, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0)
+        assert result.returns.empty
+        assert result.weight_history == []

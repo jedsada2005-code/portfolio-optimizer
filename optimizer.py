@@ -4,10 +4,14 @@ Kept out of app.py so the constraint handling and the covariance
 treatment can be unit tested without a Streamlit session.
 """
 
+from collections import namedtuple
+
 import numpy as np
 import pandas as pd
 from pypfopt import EfficientFrontier
 from pypfopt.exceptions import OptimizationError
+
+import metrics
 
 
 DEFAULT_SHRINKAGE = 0.2
@@ -169,3 +173,92 @@ def sample_weights(rng, n_assets, n_samples, max_weight=1.0, max_passes=12):
     totals = w.sum(axis=1, keepdims=True)
     keep = np.isclose(totals[:, 0], 1.0, atol=1e-6)
     return w[keep]
+
+
+WalkForwardResult = namedtuple("WalkForwardResult", "returns weight_history turnover")
+
+
+def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage):
+    """Expected returns and covariance from a price window, then solve."""
+    weekly = prices.resample("W-FRI").last()
+    expected, observations = metrics.annual_return_estimates(weekly)
+    usable = [
+        asset for asset in expected.index
+        if int(observations[asset]) >= metrics.MIN_ANNUAL_OBSERVATIONS
+    ]
+    if len(usable) < 2:
+        return None
+    expected = expected[usable]
+    cov = shrink_covariance(weekly[usable].pct_change().cov() * 52, shrinkage)
+    try:
+        return optimize_weights(expected, cov, objective, risk_free_rate, max_weight)
+    except (ValueError, OptimizationError):
+        return None
+
+
+def walk_forward(
+    prices, risk_free_rate, objective, max_weight, shrinkage,
+    refit_freq="Y", cost_bps=0.0, min_train_years=2.0,
+):
+    """Re-fit on a schedule using only data available at that moment.
+
+    A single train/test split gives one out-of-sample observation. This
+    re-solves at every refit date from history up to that date and holds
+    the result until the next one, so the whole tested period is out of
+    sample and the weights never see their own future.
+    """
+    empty = pd.Series(dtype=float)
+    refit_dates = metrics.rebalance_dates(prices.index, refit_freq)
+    earliest = prices.index[0] + pd.Timedelta(days=min_train_years * metrics.DAYS_PER_YEAR)
+    refit_dates = [d for d in refit_dates if d >= earliest]
+    if not refit_dates:
+        return WalkForwardResult(empty, [], empty)
+
+    segments, history, turnovers = [], [], []
+    previous_weights = {}
+    for position, refit_date in enumerate(refit_dates):
+        weights = fit_weights(
+            prices.loc[:refit_date], risk_free_rate, objective, max_weight, shrinkage
+        )
+        if weights is None:
+            continue
+        history.append((refit_date, weights))
+
+        end = refit_dates[position + 1] if position + 1 < len(refit_dates) else prices.index[-1]
+        window = prices.loc[refit_date:end]
+        if len(window) < 2:
+            continue
+
+        # Hold the new weights untouched until the next refit; the refit
+        # itself is the only trade.
+        segment = metrics.simulate_portfolio(window, weights, None, 0.0)
+        if segment.returns.empty:
+            continue
+
+        # The opening row of every segment is a 0.0 base day that repeats
+        # the previous segment's final date, so drop it before charging
+        # the refit -- otherwise the cost is applied to a row that is
+        # then discarded as a duplicate.
+        returns = segment.returns.iloc[1:] if segments else segment.returns.copy()
+        if returns.empty:
+            continue
+
+        assets = set(previous_weights) | set(weights)
+        traded = sum(
+            abs(weights.get(a, 0.0) - previous_weights.get(a, 0.0)) for a in assets
+        ) if previous_weights else 0.0
+        turnovers.append(traded)
+        if cost_bps and traded:
+            returns = returns.copy()
+            returns.iloc[0] -= traded * cost_bps / 10_000.0
+
+        segments.append(returns)
+        previous_weights = segment.final_weights or weights
+
+    if not segments:
+        return WalkForwardResult(empty, history, empty)
+
+    chained = pd.concat(segments)
+    chained = chained[~chained.index.duplicated(keep="first")].sort_index()
+    turnover = pd.Series(turnovers, index=[d for d, _ in history][: len(turnovers)])
+    return WalkForwardResult(chained, history, turnover)

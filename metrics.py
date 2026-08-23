@@ -318,3 +318,33 @@ def simulate_portfolio(prices, weights, freq="Q", cost_bps=0.0):
         start=start,
         rebalances=sorted(schedule),
     )
+
+
+CASH_SYMBOL = "CASH"
+
+
+def cash_price_series(index, annual_rate):
+    """A synthetic price for a cash sleeve accruing the risk-free rate.
+
+    Expressed as a price so the cash holding flows through the ordinary
+    simulator, NAV chart and statistics with no special cases.
+    """
+    if len(index) == 0:
+        return pd.Series(dtype=float)
+    elapsed = np.array([(d - index[0]).days for d in index], dtype=float)
+    return pd.Series((1.0 + annual_rate) ** (elapsed / DAYS_PER_YEAR), index=index)
+
+
+def blend_with_cash(weights, cash_fraction):
+    """Scale a risky portfolio down and hold the remainder in cash.
+
+    Two-fund separation: the risky sleeve keeps its internal proportions
+    so its Sharpe ratio is unchanged, and cash only moves the portfolio
+    along the capital allocation line.
+    """
+    if cash_fraction <= 0:
+        return dict(weights)
+    risky = 1.0 - cash_fraction
+    blended = {asset: weight * risky for asset, weight in weights.items()}
+    blended[CASH_SYMBOL] = cash_fraction
+    return blended

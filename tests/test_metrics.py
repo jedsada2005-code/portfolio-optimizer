@@ -387,3 +387,40 @@ class TestSimulatePortfolio:
         sim = metrics.simulate_portfolio(self._prices(), {"A": 0.0, "B": 0.0}, "M", 0.0)
         assert sim.returns.empty
         assert sim.held == []
+
+
+class TestCashPriceSeries:
+    def test_grows_at_the_annual_rate(self):
+        idx = pd.date_range("2020-01-01", "2021-01-01", freq="D")
+        cash = metrics.cash_price_series(idx, 0.05)
+        assert cash.iloc[0] == pytest.approx(1.0)
+        # 2020 is a leap year, so this accrues over 366/365.25 years.
+        assert cash.iloc[-1] == pytest.approx(1.05 ** (366 / 365.25), abs=1e-9)
+
+    def test_a_zero_rate_stays_flat(self):
+        idx = pd.bdate_range("2020-01-01", periods=100)
+        assert metrics.cash_price_series(idx, 0.0).nunique() == 1
+
+    def test_never_loses_value_at_a_positive_rate(self):
+        idx = pd.bdate_range("2020-01-01", periods=500)
+        assert metrics.cash_price_series(idx, 0.03).diff().dropna().min() >= 0
+
+    def test_empty_index_gives_an_empty_series(self):
+        assert metrics.cash_price_series(pd.DatetimeIndex([]), 0.02).empty
+
+
+class TestBlendWithCash:
+    def test_scales_the_risky_sleeve_and_adds_the_rest(self):
+        blended = metrics.blend_with_cash({"A": 0.6, "B": 0.4}, 0.10)
+        assert blended["A"] == pytest.approx(0.54)
+        assert blended["B"] == pytest.approx(0.36)
+        assert blended[metrics.CASH_SYMBOL] == pytest.approx(0.10)
+        assert sum(blended.values()) == pytest.approx(1.0)
+
+    def test_zero_cash_leaves_the_weights_alone(self):
+        assert metrics.blend_with_cash({"A": 0.6, "B": 0.4}, 0.0) == {"A": 0.6, "B": 0.4}
+
+    def test_all_cash_empties_the_risky_sleeve(self):
+        blended = metrics.blend_with_cash({"A": 1.0}, 1.0)
+        assert blended[metrics.CASH_SYMBOL] == pytest.approx(1.0)
+        assert blended["A"] == pytest.approx(0.0)
