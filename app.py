@@ -22,7 +22,7 @@ PLOT_SAMPLE = 6_000
 
 MODES = ["Train / Test Split", "Walk-Forward", "In-sample (ทั้งช่วง)"]
 OBJECTIVES = ["Max Sharpe", "Min Volatility"]
-CUSTOM_SOURCE = "Custom (จาก Tab 2)"
+CUSTOM_SOURCE = "Custom (จากแท็บน้ำหนักพอร์ต)"
 
 
 def qp_text(key, default):
@@ -90,9 +90,15 @@ st.title("Portfolio Optimizer & Backtesting")
 # ─── Sidebar: Inputs ───
 with st.sidebar:
     st.header("Settings")
+
+    # Only the inputs a typical run actually touches stay visible. Every
+    # default below is usable as-is, so grouping the rest behind
+    # expanders costs nothing and stops Calculate from sitting at the
+    # bottom of nineteen controls.
     symbols_input = st.text_input(
-        "Stock Symbols (comma-separated)",
+        "สินทรัพย์ในพอร์ต (คั่นด้วยจุลภาค)",
         value=qp_text("symbols", "AMZN, META, LLY, SPY, NVDA, GOOGL"),
+        help="หุ้น/ETF เช่น `SPY` · หุ้นไทยเติม `.BK` เช่น `PTT.BK` · กองทุนไทยเติม `MF:` เช่น `MF:K-GOLD-A(A)`",
     )
     col1, col2 = st.columns(2)
     with col1:
@@ -110,67 +116,74 @@ with st.sidebar:
             max_value=pd.Timestamp.today(),
         )
 
-    base_currency = st.selectbox(
-        "สกุลเงินฐาน", fx.BASE_CURRENCIES, index=qp_choice("base", fx.BASE_CURRENCIES),
-        help=(
-            "แปลงทุกสินทรัพย์เป็นสกุลนี้ก่อนคำนวณ กองทุนไทยเป็น THB หุ้น US เป็น USD "
-            "ถ้าไม่แปลง ผลของค่าเงินจะหายไปทั้งหมดและ volatility จะต่ำกว่าความจริง"
-        ),
-    )
-    total_cash = st.number_input(f"Total Cash ({base_currency})", value=qp_number("cash", 1_000_000, int), step=100_000)
-    risk_free_rate = st.number_input(
-        "Risk-Free Rate", value=qp_number("rf", 0.02), step=0.01, format="%.4f"
-    )
+    run_btn = st.button("Calculate", type="primary", use_container_width=True)
 
-    backtest_mode = st.radio(
-        "โหมด Backtest",
-        MODES,
-        index=qp_choice("mode", MODES),
-        help=(
-            "In-sample หาน้ำหนักและทดสอบบนข้อมูลชุดเดียวกัน ผลลัพธ์จะสวยเกินจริงเสมอ "
-            "Train/Test หาน้ำหนักจากช่วงแรก แล้วทดสอบบนช่วงหลังที่ไม่เคยเห็น "
-            "Walk-Forward คำนวณน้ำหนักใหม่เป็นงวดๆ โดยใช้เฉพาะข้อมูลที่มีอยู่ ณ ตอนนั้น"
-        ),
-    )
-    train_fraction = 0.7
-    refit_label = "รายปี"
-    if backtest_mode == "Train / Test Split":
-        train_fraction = st.slider(
-            "สัดส่วนช่วง Train", 30, 90, 70, step=5, format="%d%%",
-            help="ที่เหลือใช้เป็นช่วง Test สำหรับวัดผลจริงแบบ out-of-sample",
-        ) / 100
-    elif backtest_mode == "Walk-Forward":
-        refit_label = st.selectbox(
-            "ความถี่การคำนวณน้ำหนักใหม่", ["รายไตรมาส", "รายปี"], index=1,
-            help="ต้องมีข้อมูลอย่างน้อย 2 ปีก่อนการคำนวณครั้งแรก",
+    with st.expander("💱 เงินและสกุลเงิน"):
+        base_currency = st.selectbox(
+            "สกุลเงินฐาน", fx.BASE_CURRENCIES, index=qp_choice("base", fx.BASE_CURRENCIES),
+            help=(
+                "แปลงทุกสินทรัพย์เป็นสกุลนี้ก่อนคำนวณ กองทุนไทยเป็น THB หุ้น US เป็น USD "
+                "ถ้าไม่แปลง ผลของค่าเงินจะหายไปทั้งหมดและ volatility จะต่ำกว่าความจริง"
+            ),
+        )
+        total_cash = st.number_input(
+            f"เงินลงทุนตั้งต้น ({base_currency})",
+            value=qp_number("cash", 1_000_000, int), step=100_000,
+        )
+        risk_free_rate = st.number_input(
+            "Risk-Free Rate", value=qp_number("rf", 0.02), step=0.01, format="%.4f",
+            help="ผลตอบแทนที่ได้โดยไม่มีความเสี่ยง ใช้เป็นฐานคำนวณ Sharpe และเป็นดอกเบี้ยของสัดส่วนเงินสด",
         )
 
-    rebalance_label = st.selectbox(
-        "ความถี่การ Rebalance",
-        list(metrics.REBALANCE_FREQUENCIES),
-        index=qp_choice("reb", list(metrics.REBALANCE_FREQUENCIES), 2),
-        help=(
-            "การคำนวณแบบเดิมสมมติว่าปรับพอร์ตกลับสัดส่วนเดิมทุกวันทำการโดยไม่มีค่าใช้จ่าย "
-            "ซึ่งทำไม่ได้จริงและดันผลตอบแทนสูงเกินจริง"
-        ),
-    )
-    cost_bps = st.number_input(
-        "ค่าธรรมเนียมซื้อขาย (bps ต่อมูลค่าที่เทรด)",
-        min_value=0.0, max_value=500.0, value=qp_number("cost", 0.0), step=5.0,
-        help=(
-            "100 bps = 1% คิดจากมูลค่าที่ซื้อขายจริงในแต่ละรอบ rebalance เท่านั้น "
-            "(ไม่คิดตอนซื้อครั้งแรก) หมายเหตุ: NAV กองทุนและราคา ETF หัก "
-            "ค่าธรรมเนียมจัดการรายปีไปแล้ว ช่องนี้จึงมีไว้ใส่ค่าธรรมเนียมขาย/รับซื้อคืน "
-            "และค่าคอมมิชชั่นเท่านั้น ไม่ต้องใส่ TER ซ้ำ"
-        ),
-    )
+    with st.expander("🔍 วิธีทดสอบ"):
+        backtest_mode = st.radio(
+            "โหมด Backtest",
+            MODES,
+            index=qp_choice("mode", MODES),
+            help=(
+                "In-sample หาน้ำหนักและทดสอบบนข้อมูลชุดเดียวกัน ผลลัพธ์จะสวยเกินจริงเสมอ "
+                "Train/Test หาน้ำหนักจากช่วงแรก แล้วทดสอบบนช่วงหลังที่ไม่เคยเห็น "
+                "Walk-Forward คำนวณน้ำหนักใหม่เป็นงวดๆ โดยใช้เฉพาะข้อมูลที่มีอยู่ ณ ตอนนั้น"
+            ),
+        )
+        train_fraction = 0.7
+        refit_label = "รายปี"
+        if backtest_mode == "Train / Test Split":
+            train_fraction = st.slider(
+                "สัดส่วนช่วง Train", 30, 90, 70, step=5, format="%d%%",
+                help="ที่เหลือใช้เป็นช่วง Test สำหรับวัดผลจริงแบบ out-of-sample",
+            ) / 100
+        elif backtest_mode == "Walk-Forward":
+            refit_label = st.selectbox(
+                "ความถี่การคำนวณน้ำหนักใหม่", ["รายไตรมาส", "รายปี"], index=1,
+                help="ต้องมีข้อมูลอย่างน้อย 2 ปีก่อนการคำนวณครั้งแรก",
+            )
 
-    benchmark_symbol = st.text_input(
-        "Benchmark (เว้นว่างได้)", value=qp_text("bench", "SPY"),
-        help="สัญลักษณ์ Yahoo สำหรับเทียบผลงาน ไม่ถูกนับรวมเป็นสินทรัพย์ในพอร์ต เช่น SPY หรือ ^SET.BK",
-    ).strip().upper()
+        rebalance_label = st.selectbox(
+            "ความถี่การ Rebalance",
+            list(metrics.REBALANCE_FREQUENCIES),
+            index=qp_choice("reb", list(metrics.REBALANCE_FREQUENCIES), 2),
+            help=(
+                "การคำนวณแบบเดิมสมมติว่าปรับพอร์ตกลับสัดส่วนเดิมทุกวันทำการโดยไม่มีค่าใช้จ่าย "
+                "ซึ่งทำไม่ได้จริงและดันผลตอบแทนสูงเกินจริง"
+            ),
+        )
+        cost_bps = st.number_input(
+            "ค่าธรรมเนียมซื้อขาย (bps ต่อมูลค่าที่เทรด)",
+            min_value=0.0, max_value=500.0, value=qp_number("cost", 0.0), step=5.0,
+            help=(
+                "100 bps = 1% คิดจากมูลค่าที่ซื้อขายจริงในแต่ละรอบ rebalance เท่านั้น "
+                "(ไม่คิดตอนซื้อครั้งแรก) หมายเหตุ: NAV กองทุนและราคา ETF หัก "
+                "ค่าธรรมเนียมจัดการรายปีไปแล้ว ช่องนี้จึงมีไว้ใส่ค่าธรรมเนียมขาย/รับซื้อคืน "
+                "และค่าคอมมิชชั่นเท่านั้น ไม่ต้องใส่ TER ซ้ำ"
+            ),
+        )
+        benchmark_symbol = st.text_input(
+            "Benchmark (เว้นว่างได้)", value=qp_text("bench", "SPY"),
+            help="สัญลักษณ์ Yahoo สำหรับเทียบผลงาน ไม่ถูกนับรวมเป็นสินทรัพย์ในพอร์ต เช่น SPY หรือ ^SET.BK",
+        ).strip().upper()
 
-    with st.expander("การตั้งค่าขั้นสูง"):
+    with st.expander("⚙️ การตั้งค่าขั้นสูง"):
         max_weight = st.slider(
             "น้ำหนักสูงสุดต่อสินทรัพย์", 5, 100,
             int(round(qp_number("maxw", 1.0) * 100)), step=5, format="%d%%",
@@ -196,47 +209,50 @@ with st.sidebar:
                 "ไม่สุดขั้ว 0 = ใช้ค่าจากข้อมูลดิบ, 1 = ใช้ค่าเฉลี่ยทั้งหมด"
             ),
         )
-    uploaded_price_files = st.file_uploader(
-        "Upload CSV/XLSX Price Data",
-        type=["csv", "xlsx"],
-        accept_multiple_files=True,
-        help=(
-            "รองรับ Date,AAPL,SPY... หรือ Date,Symbol,Close หรือ Date,Close "
-            "(กรณี Date,Close จะใช้ชื่อไฟล์หรือชื่อ sheet เป็นชื่อสินทรัพย์)"
-        ),
-    )
-    upload_currency = st.selectbox(
-        "สกุลเงินของไฟล์ที่อัปโหลด", fx.BASE_CURRENCIES + ["EUR", "JPY", "GBP"],
-        help="ใช้เมื่อมีไฟล์ CSV/XLSX เท่านั้น",
-    )
-    sec_factsheet_key = st.text_input(
-        "SEC Fund Factsheet API Key (สำหรับกองทุนไทย)",
-        value="",
-        type="password",
-        help="จำเป็นเฉพาะเมื่อกรอกกองทุนรวมไทยด้วย prefix MF: สมัครฟรีที่ secopendata.sec.or.th",
-    )
-    sec_daily_info_key = st.text_input(
-        "SEC Fund Daily Info API Key (สำหรับกองทุนไทย)",
-        value="",
-        type="password",
-        help="เป็น API key คนละตัวกับ Fund Factsheet ต้อง subscribe แยกกันที่ secopendata.sec.or.th",
-    )
-    run_btn = st.button("Calculate", type="primary", use_container_width=True)
 
-    st.divider()
-    st.caption("⚠️ **Beta Version — ข้อควรระวัง**")
-    st.caption("1. รองรับหุ้น/ETF จาก Yahoo Finance, กองทุนรวมไทยจาก SEC (prefix `MF:`) และไฟล์ราคาที่อัปโหลดเอง (CSV/XLSX)")
-    st.caption("2. หุ้นไทยต้องเติม `.BK` หลังชื่อ เช่น `PTT.BK` หุ้น US ใส่ชื่อได้เลย")
-    st.caption("3. Custom Weight ไม่ต้องรวมกันเป็น 1.0 ระบบจะปรับสัดส่วน (normalize) ให้อัตโนมัติ")
-    st.caption("4. ตัวอย่าง: `AMZN, META, NVDA, SPY, LLY`")
-    st.caption("5. โหมด **Train/Test** และ **Walk-Forward** วัดผลจากข้อมูลที่ optimizer ไม่เคยเห็น ส่วน **In-sample** จะให้ผลสวยเกินจริงเสมอ")
-    st.caption("6. หุ้นบางตัวอาจโหลดไม่สำเร็จ เพราะเขียนชื่อผิด หรือในปีนั้นยังไม่มีข้อมูล (ตรวจสอบชื่อและปีที่ดึงข้อมูลให้ดี)")
-    st.caption("7. กองทุนรวมไทยใส่ prefix `MF:` เช่น `MF:K-CHANGE-A(A)` ข้อมูลมาจาก SEC Open Data และต้องกรอก API Key ทั้ง 2 ช่องด้านบน (Fund Factsheet กับ Fund Daily Info เป็นคนละ key กัน ต้อง subscribe แยกกัน)")
-    st.caption("8. CSV/XLSX ต้องเป็นราคาหรือ NAV ไม่ใช่ daily return และต้องมีคอลัมน์วันที่ เช่น `Date`")
-    st.caption("9. สินทรัพย์ทุกตัวถูกแปลงเป็นสกุลเงินฐานก่อนคำนวณ ผลตอบแทนที่เห็นจึงรวมผลของค่าเงินไว้แล้ว")
-    st.caption("10. Backtest เริ่มนับจากวันแรกที่ **ทุกตัว** ในพอร์ตมีข้อมูลครบ ไม่ใช่จาก Start Date เสมอไป")
-    st.caption("11. NAV กองทุนและราคา ETF หักค่าธรรมเนียมจัดการรายปีไปแล้ว ช่องค่าธรรมเนียมมีไว้ใส่ค่าซื้อขาย/ค่าคอมมิชชั่นเท่านั้น")
-    st.caption("12. กด Calculate แล้ว URL จะเก็บการตั้งค่าทั้งหมด — bookmark หรือส่งลิงก์ให้คนอื่นเปิดต่อได้")
+    with st.expander("📄 ข้อมูลของคุณเอง"):
+        uploaded_price_files = st.file_uploader(
+            "อัปโหลดไฟล์ราคา CSV/XLSX",
+            type=["csv", "xlsx"],
+            accept_multiple_files=True,
+            help=(
+                "รองรับ Date,AAPL,SPY... หรือ Date,Symbol,Close หรือ Date,Close "
+                "(กรณี Date,Close จะใช้ชื่อไฟล์หรือชื่อ sheet เป็นชื่อสินทรัพย์)"
+            ),
+        )
+        upload_currency = st.selectbox(
+            "สกุลเงินของไฟล์ที่อัปโหลด", fx.BASE_CURRENCIES + ["EUR", "JPY", "GBP"],
+            help="ใช้เมื่อมีไฟล์ CSV/XLSX เท่านั้น",
+        )
+        st.caption("กองทุนรวมไทย (`MF:`) ต้องใช้ API Key สองตัวคนละชุด สมัครฟรีที่ secopendata.sec.or.th")
+        sec_factsheet_key = st.text_input(
+            "SEC Fund Factsheet API Key",
+            value="",
+            type="password",
+            help="จำเป็นเฉพาะเมื่อกรอกกองทุนรวมไทยด้วย prefix MF:",
+        )
+        sec_daily_info_key = st.text_input(
+            "SEC Fund Daily Info API Key",
+            value="",
+            type="password",
+            help="เป็น API key คนละตัวกับ Fund Factsheet ต้อง subscribe แยกกัน",
+        )
+
+    with st.expander("📖 คู่มือและข้อควรระวัง"):
+        st.caption("**รูปแบบสัญลักษณ์**")
+        st.caption("• หุ้น/ETF ต่างประเทศ ใส่ชื่อได้เลย เช่น `AMZN`, `SPY`")
+        st.caption("• หุ้นไทยเติม `.BK` เช่น `PTT.BK`")
+        st.caption("• กองทุนรวมไทยเติม `MF:` เช่น `MF:K-CHANGE-A(A)` — ต้องกรอก API Key ทั้ง 2 ช่อง")
+        st.caption("• ไฟล์อัปโหลดต้องเป็นราคาหรือ NAV ไม่ใช่ daily return และต้องมีคอลัมน์วันที่")
+        st.caption("**การอ่านผลลัพธ์**")
+        st.caption("• **Train/Test** และ **Walk-Forward** วัดจากข้อมูลที่ optimizer ไม่เคยเห็น ส่วน **In-sample** สวยเกินจริงเสมอ")
+        st.caption("• Backtest เริ่มนับจากวันแรกที่ **ทุกตัว** ในพอร์ตมีข้อมูลครบ ไม่ใช่จาก Start Date เสมอไป")
+        st.caption("• ทุกสินทรัพย์ถูกแปลงเป็นสกุลเงินฐานก่อนคำนวณ ผลตอบแทนจึงรวมผลของค่าเงินแล้ว")
+        st.caption("• NAV กองทุนและราคา ETF หักค่าธรรมเนียมจัดการรายปีไปแล้ว ช่องค่าธรรมเนียมมีไว้ใส่ค่าซื้อขายเท่านั้น")
+        st.caption("**อื่นๆ**")
+        st.caption("• Custom Weight ไม่ต้องรวมกันเป็น 1.0 ระบบ normalize ให้อัตโนมัติ")
+        st.caption("• สินทรัพย์บางตัวอาจโหลดไม่สำเร็จเพราะเขียนชื่อผิด หรือปีนั้นยังไม่มีข้อมูล")
+        st.caption("• กด Calculate แล้ว URL จะเก็บการตั้งค่าทั้งหมด bookmark หรือส่งต่อได้")
 
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
@@ -581,6 +597,7 @@ if run_btn:
     st.session_state["cash_fraction"] = cash_fraction
     st.session_state["max_weight"] = max_weight
     st.session_state["shrinkage"] = shrinkage
+    st.session_state["cost_bps_used"] = cost_bps
     st.session_state["ar"] = ar
     st.session_state["covr"] = covr
     st.session_state["cleaned"] = cleaned
@@ -641,11 +658,29 @@ if st.session_state.get("calculated"):
             "ผลลัพธ์ด้านล่างยังเป็นของค่าเดิม กด **Calculate** เพื่อคำนวณใหม่"
         )
 
+    # A run's mode and settings change what every number below means,
+    # so state them once, above the tabs, instead of only inside one.
+    mode_icon = {"Walk-Forward": "🔒", "Train / Test Split": "🔒"}.get(backtest_mode, "⚠️")
+    status = [
+        f"{mode_icon} **{backtest_mode}**",
+        f"💱 {base_currency}",
+        f"🔄 Rebalance {rebalance_label}",
+    ]
+    if cost_bps:
+        status.append(f"💸 {cost_bps:.0f} bps")
+    if cash_fraction:
+        status.append(f"💵 เงินสด {cash_fraction:.0%}")
+    if max_weight < 1.0:
+        status.append(f"⚖️ สูงสุด {max_weight:.0%}/ตัว")
+    if benchmark_symbol:
+        status.append(f"📊 เทียบ {benchmark_symbol}")
+    st.caption(" · ".join(status))
+
     tab1, tab2, tab3, tab4 = st.tabs([
-        "Efficient Frontier",
-        "Optimal Weights",
-        "Backtesting",
-        "NAV Breakdown",
+        "📈 เส้นขอบประสิทธิภาพ",
+        "⚖️ น้ำหนักพอร์ต",
+        "🔍 ทดสอบย้อนหลัง",
+        "💰 มูลค่าพอร์ต",
     ])
 
     # ════════════════════════════════════════
@@ -745,13 +780,13 @@ if st.session_state.get("calculated"):
         st.subheader("Custom Weights")
         st.caption(
             "ปรับน้ำหนักเองได้ ระบบจะ normalize ให้รวมเป็น 1.0 — "
-            "ค่าเหล่านี้จะถูกใช้ในแท็บ Backtesting และ NAV Breakdown "
-            "ก็ต่อเมื่อเลือก **Custom** ในแท็บ Backtesting เท่านั้น"
+            "ค่าเหล่านี้จะถูกใช้ในแท็บทดสอบย้อนหลังและมูลค่าพอร์ต "
+            "ก็ต่อเมื่อเลือก **Custom** ในแท็บทดสอบย้อนหลังเท่านั้น"
         )
         st.caption(
             "⚠️ slider ขยับทีละ 1% จึงปัดเศษน้ำหนักจาก optimizer เล็กน้อย "
             "ถ้าต้องการน้ำหนักที่ optimizer คำนวณแบบเป๊ะๆ ให้เลือก "
-            "Max Sharpe หรือ Min Volatility ในแท็บ Backtesting แทน"
+            "Max Sharpe หรือ Min Volatility ในแท็บทดสอบย้อนหลังแทน"
         )
 
         custom_w = {}
@@ -814,7 +849,7 @@ if st.session_state.get("calculated"):
                 "น้ำหนักที่ใช้ backtest", sources, horizontal=True,
                 help=(
                     "Max Sharpe และ Min Volatility ใช้น้ำหนักที่ optimizer คำนวณแบบเป๊ะๆ "
-                    "ส่วน Custom ใช้ค่าจาก slider ในแท็บ Optimal Weights ซึ่งปัดเศษทีละ 1%"
+                    "ส่วน Custom ใช้ค่าจาก slider ในแท็บน้ำหนักพอร์ต ซึ่งปัดเศษทีละ 1%"
                 ),
             )
             walk_objective = (
@@ -1203,7 +1238,7 @@ if st.session_state.get("calculated"):
         # every period.
         view = st.session_state.get("nav_view")
         if view is None or view["returns"].empty:
-            st.info("เปิดแท็บ Backtesting ก่อนหนึ่งครั้ง เพื่อให้คำนวณผลลัพธ์")
+            st.info("เปิดแท็บทดสอบย้อนหลังก่อนหนึ่งครั้ง เพื่อให้คำนวณผลลัพธ์")
             st.stop()
 
         port_daily = view["returns"]
@@ -1217,7 +1252,7 @@ if st.session_state.get("calculated"):
                 f"(วัตถุประสงค์ {view['source']}) ส่วนเส้นรายตัวใช้น้ำหนักของงวดล่าสุด"
             )
         else:
-            st.info(f"ใช้น้ำหนัก **{view['source']}** (ตรงกับแท็บ Backtesting)")
+            st.info(f"ใช้น้ำหนัก **{view['source']}** (ตรงกับแท็บทดสอบย้อนหลัง)")
 
         fig_nav = go.Figure()
         fig_nav.add_trace(go.Scatter(
@@ -1249,7 +1284,7 @@ if st.session_state.get("calculated"):
 
         st.caption(
             f"เริ่มนับตั้งแต่ **{view['start'].date()}** ซึ่งเป็นวันแรกที่ทุกตัวในพอร์ตมีข้อมูลครบ "
-            f"(ตรงกับแท็บ Backtesting) — เส้น Portfolio NAV ปรับสัดส่วนกลับ{rebalance_label} "
+            f"(ตรงกับแท็บทดสอบย้อนหลัง) — เส้น Portfolio NAV ปรับสัดส่วนกลับ{rebalance_label} "
             "ส่วนเส้นรายตัวคือถือเดี่ยวไม่ปรับสัดส่วน จึงบวกกันแล้วไม่เท่ากับเส้นรวม"
         )
 

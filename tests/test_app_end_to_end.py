@@ -32,7 +32,7 @@ def app():
     at = AppTest.from_file("app.py", default_timeout=300)
     at.run()
     assert not at.exception, at.exception
-    _widget(at.text_input, "Stock Symbols").set_value(SYMBOLS)
+    _widget(at.text_input, "สินทรัพย์ในพอร์ต").set_value(SYMBOLS)
     return at
 
 
@@ -72,7 +72,7 @@ def test_trading_costs_run(app):
 
 
 def test_cash_sleeve_and_weight_cap_run_together(app):
-    _widget(app.slider, "น้ำหนักสูงสุด").set_value(40)
+    _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(40)
     _widget(app.slider, "เงินสด").set_value(20)
     assert not _calculate(app).error
 
@@ -83,7 +83,7 @@ def test_benchmark_can_be_left_empty(app):
 
 
 def test_a_single_symbol_is_refused(app):
-    _widget(app.text_input, "Stock Symbols").set_value("SPY")
+    _widget(app.text_input, "สินทรัพย์ในพอร์ต").set_value("SPY")
     at = _calculate(app)
     assert any("อย่างน้อย 2 ตัว" in e.value for e in at.error)
 
@@ -103,7 +103,7 @@ def _one(value):
 
 def test_settings_are_written_back_to_the_url(app):
     _widget(app.selectbox, "สกุลเงินฐาน").set_value("THB")
-    _widget(app.slider, "น้ำหนักสูงสุด").set_value(40)
+    _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(40)
     at = _calculate(app)
     assert _one(at.query_params["symbols"]) == SYMBOLS
     assert _one(at.query_params["base"]) == "THB"
@@ -119,10 +119,10 @@ def test_a_shared_link_reopens_with_the_same_settings():
     at.query_params["reb"] = "รายปี"
     at.run()
     assert not at.exception, at.exception
-    assert _widget(at.text_input, "Stock Symbols").value == "AAPL, MSFT"
+    assert _widget(at.text_input, "สินทรัพย์ในพอร์ต").value == "AAPL, MSFT"
     assert _widget(at.selectbox, "สกุลเงินฐาน").value == "THB"
     # Stored as a fraction in the URL, shown as whole percent.
-    assert _widget(at.slider, "น้ำหนักสูงสุด").value == 45
+    assert _widget(at.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").value == 45
     assert at.radio[0].value == "In-sample (ทั้งช่วง)"
     assert _widget(at.selectbox, "Rebalance").value == "รายปี"
 
@@ -138,7 +138,7 @@ class TestPercentSliders:
 
     @pytest.mark.parametrize(
         "label, low, high",
-        [("น้ำหนักสูงสุด", 5, 100), ("เงินสด", 0, 90)],
+        [("น้ำหนักสูงสุดต่อสินทรัพย์", 5, 100), ("เงินสด", 0, 90)],
     )
     def test_range_is_expressed_in_percent(self, app, label, high, low):
         slider = _widget(app.slider, label)
@@ -152,7 +152,7 @@ class TestPercentSliders:
 
     def test_a_mid_range_setting_survives_the_round_trip(self, app):
         # 45% used to be indistinguishable from 5% on screen.
-        _widget(app.slider, "น้ำหนักสูงสุด").set_value(45)
+        _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(45)
         at = _calculate(app)
         assert not at.error
         assert at.session_state["max_weight"] == pytest.approx(0.45)
@@ -160,7 +160,7 @@ class TestPercentSliders:
 
     def test_a_cap_below_equal_weight_is_refused_with_the_minimum(self, app):
         # Four holdings need at least 25% each to reach a full allocation.
-        _widget(app.slider, "น้ำหนักสูงสุด").set_value(20)
+        _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(20)
         at = _calculate(app)
         assert any("25%" in e.value for e in at.error)
 
@@ -170,7 +170,7 @@ class TestPercentSliders:
         at.query_params["cashpct"] = "0.25"
         at.run()
         assert not at.exception, at.exception
-        assert _widget(at.slider, "น้ำหนักสูงสุด").value == 35
+        assert _widget(at.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").value == 35
         assert _widget(at.slider, "เงินสด").value == 25
 
 
@@ -192,9 +192,9 @@ class TestWeightSourceSelection:
 
     def test_custom_is_offered_once_the_sliders_have_rendered(self, app):
         at = _calculate(app)
-        assert "Custom (จาก Tab 2)" in self._source_radio(at).options
+        assert "Custom (จากแท็บน้ำหนักพอร์ต)" in self._source_radio(at).options
 
-    @pytest.mark.parametrize("source", ["Max Sharpe", "Min Volatility", "Custom (จาก Tab 2)"])
+    @pytest.mark.parametrize("source", ["Max Sharpe", "Min Volatility", "Custom (จากแท็บน้ำหนักพอร์ต)"])
     def test_every_source_runs(self, app, source):
         at = _calculate(app)
         self._source_radio(at).set_value(source).run()
