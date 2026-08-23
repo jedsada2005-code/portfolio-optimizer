@@ -296,3 +296,86 @@ class TestWelcomeScreen:
         assert not any("แชร์พอร์ตนี้" in (e.label or "") for e in fresh.expander)
         at = _calculate(app)
         assert any("แชร์พอร์ตนี้" in (e.label or "") for e in at.expander)
+
+
+class TestCustomWeightEditing:
+    """Custom weights moved into keyed number inputs.
+
+    A fixed four-column grid of sliders became unreadable past a handful
+    of holdings, and slider state could only be read after the weights
+    tab had drawn itself -- which is what forced the backtest to live
+    inside a tab.
+    """
+
+    def test_one_input_per_asset(self, app):
+        at = _calculate(app)
+        labels = [n.label for n in at.number_input]
+        for symbol in ["SPY", "QQQ", "GLD", "TLT"]:
+            assert symbol in labels
+
+    def test_equal_weight_button_levels_everything(self, app):
+        at = _calculate(app)
+        _widget(at.button, "เท่ากันทุกตัว").click().run()
+        assert not at.exception, at.exception
+        for symbol in ["SPY", "QQQ", "GLD", "TLT"]:
+            assert at.session_state[f"cw_{symbol}"] == pytest.approx(25.0)
+
+    def test_restore_buttons_bring_back_each_objective(self, app):
+        at = _calculate(app)
+        _widget(at.button, "เท่ากันทุกตัว").click().run()
+        _widget(at.button, "กลับไปใช้ Max Sharpe").click().run()
+        assert not at.exception, at.exception
+        optimal = at.session_state["cleaned"]
+        for symbol, weight in optimal.items():
+            assert at.session_state[f"cw_{symbol}"] == pytest.approx(round(weight * 100, 1))
+
+    def test_edited_weights_reach_the_backtest(self, app):
+        at = _calculate(app)
+        _widget(at.button, "เท่ากันทุกตัว").click().run()
+        _widget(at.radio, "น้ำหนักที่ใช้ backtest").set_value("Custom (จากแท็บน้ำหนักพอร์ต)").run()
+        assert not at.exception, at.exception
+        used = at.session_state["nav_view"]["weights"]
+        for symbol in ["SPY", "QQQ", "GLD", "TLT"]:
+            assert used[symbol] == pytest.approx(0.25)
+
+    def test_weights_are_normalised_not_rejected(self, app):
+        at = _calculate(app)
+        for symbol in ["SPY", "QQQ", "GLD", "TLT"]:
+            _widget(at.number_input, symbol).set_value(10.0)
+        _widget(at.radio, "น้ำหนักที่ใช้ backtest").set_value("Custom (จากแท็บน้ำหนักพอร์ต)").run()
+        assert not at.error
+        used = at.session_state["nav_view"]["weights"]
+        assert sum(used.values()) == pytest.approx(1.0)
+
+
+class TestTabsAreRenderers:
+    """The backtest is computed before any tab draws.
+
+    Weight diagnostics could not previously sit on the weights tab,
+    because it renders before the backtest tab that produced them.
+    """
+
+    def test_weight_diagnostics_reach_the_weights_tab(self, app):
+        at = _calculate(app)
+        headings = [h.value for h in at.subheader]
+        assert "Train vs Test" in headings
+
+    def test_walk_forward_history_reaches_the_weights_tab(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        at = _calculate(app)
+        assert not at.error
+        assert "น้ำหนักที่คำนวณใหม่ในแต่ละงวด" in [h.value for h in at.subheader]
+
+    def test_nav_view_is_published_before_the_tabs_draw(self, app):
+        at = _calculate(app)
+        assert at.session_state["nav_view"]["returns"] is not None
+
+
+class TestResetButton:
+    def test_reset_clears_saved_settings(self, app):
+        at = _calculate(app)
+        assert at.query_params
+        _widget(at.button, "รีเซ็ตการตั้งค่าทั้งหมด").click().run()
+        assert not at.exception, at.exception
+        assert "calculated" not in at.session_state
+        assert _widget(at.text_input, "สินทรัพย์ในพอร์ต").value == "AMZN, META, LLY, SPY, NVDA, GOOGL"

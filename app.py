@@ -67,6 +67,20 @@ def qp_date(key, default):
         return default
 
 
+def read_custom_weights(assets):
+    """Normalised custom weights, read straight from the widget state.
+
+    Keyed widgets keep their value in session_state from the start of a
+    run, so the backtest can be computed before the tabs render without
+    waiting for the weights tab to draw itself.
+    """
+    raw = {sym: float(st.session_state.get(f"cw_{sym}", 0.0)) for sym in assets}
+    total = sum(raw.values())
+    if total <= 0:
+        return {sym: 1.0 / len(assets) for sym in assets}
+    return {sym: value / total for sym, value in raw.items()}
+
+
 def current_url():
     """Full page URL including the saved settings, for copying."""
     try:
@@ -152,6 +166,10 @@ with st.sidebar:
         )
 
     run_btn = st.button("Calculate", type="primary", use_container_width=True)
+    if st.button("↺ รีเซ็ตการตั้งค่าทั้งหมด", use_container_width=True):
+        st.query_params.clear()
+        st.session_state.clear()
+        st.rerun()
 
     with st.expander("💱 เงินและสกุลเงิน"):
         base_currency = st.selectbox(
@@ -715,6 +733,197 @@ if st.session_state.get("calculated"):
         st.caption("ลิงก์นี้เก็บการตั้งค่าทั้งหมดไว้ เปิดแล้วได้ค่าเดิม ส่งต่อให้คนอื่นได้")
         st.code(current_url(), language=None)
 
+    # Computed before the tabs so every tab is a renderer: the weights
+    # tab can show backtest diagnostics, and the NAV tab cannot drift
+    # from the backtest by recomputing its own version.
+    custom_w_available = read_custom_weights(sorted(ar.index))
+    if backtest_mode == "Walk-Forward":
+        walk_objective = st.radio(
+            "วัตถุประสงค์ที่ใช้คำนวณน้ำหนักใหม่ทุกงวด",
+            OBJECTIVES, horizontal=True,
+        )
+        weight_source = walk_objective
+        active_w = cleaned if walk_objective == "Max Sharpe" else mv_cleaned
+    else:
+        sources = OBJECTIVES + ([CUSTOM_SOURCE] if custom_w_available else [])
+        weight_source = st.radio(
+            "น้ำหนักที่ใช้ backtest", sources, horizontal=True,
+            help=(
+                "Max Sharpe และ Min Volatility ใช้น้ำหนักที่ optimizer คำนวณแบบเป๊ะๆ "
+                "ส่วน Custom ใช้ค่าจาก slider ในแท็บน้ำหนักพอร์ต ซึ่งปัดเศษทีละ 1%"
+            ),
+        )
+        walk_objective = (
+            weight_source if weight_source in OBJECTIVES else "Max Sharpe"
+        )
+        if weight_source == "Max Sharpe":
+            active_w = cleaned
+        elif weight_source == "Min Volatility":
+            active_w = mv_cleaned
+        else:
+            active_w = custom_w_available
+    
+    if backtest_mode == "Walk-Forward":
+        st.info(
+            f"โหมด Walk-Forward คำนวณน้ำหนักใหม่ทุกงวดด้วยวัตถุประสงค์ **{walk_objective}** "
+            "— น้ำหนักของแต่ละงวดดูได้จากตารางด้านล่าง"
+        )
+    else:
+        st.info(
+            f"ใช้น้ำหนัก **{weight_source}**: "
+            + ", ".join(
+                f"{k}={v:.1%}" for k, v in sorted(active_w.items()) if v > 0
+            )
+        )
+    
+    # C2: a cash sleeve is modelled as a synthetic holding accruing
+    # the risk-free rate, so it flows through the ordinary simulator.
+    backtest_w = metrics.blend_with_cash(active_w, cash_fraction)
+    test_prices = test_close
+    train_prices = train_close
+    if cash_fraction > 0:
+        test_prices = test_close.assign(
+            **{metrics.CASH_SYMBOL: metrics.cash_price_series(test_close.index, risk_free_rate)}
+        )
+        train_prices = train_close.assign(
+            **{metrics.CASH_SYMBOL: metrics.cash_price_series(train_close.index, risk_free_rate)}
+        )
+        st.caption(
+            f"💵 ถือเงินสด {cash_fraction:.0%} ที่ได้ผลตอบแทน {risk_free_rate:.2%} ต่อปี "
+            f"— สินทรัพย์เสี่ยงที่เหลือ {1 - cash_fraction:.0%} คงสัดส่วนภายในเดิม"
+        )
+    
+    walk_result = None
+    if backtest_mode == "Walk-Forward":
+        with st.spinner("Running walk-forward..."):
+            walk_result = optimizer.walk_forward(
+                test_prices, risk_free_rate, walk_objective, max_weight,
+                shrinkage, refit_freq, cost_bps,
+            )
+        if walk_result.returns.empty:
+            st.error(
+                "⚠️ ข้อมูลไม่พอสำหรับ Walk-Forward — ต้องมีอย่างน้อย 2 ปี "
+                "ก่อนการคำนวณน้ำหนักครั้งแรก ลองขยายช่วงวันที่"
+            )
+            st.stop()
+        weights_in_force = walk_result.weight_history[-1][1]
+        result = metrics.simulate_portfolio(
+            test_prices, weights_in_force, rebalance_freq, cost_bps
+        )
+        port_daily = walk_result.returns
+        daily_returns = result.assets
+    else:
+        weights_in_force = backtest_w
+        # In split mode the weights were fitted on train_close only,
+        # so the headline backtest runs on the untouched test window.
+        result = metrics.simulate_portfolio(
+            test_prices, backtest_w, rebalance_freq, cost_bps
+        )
+        port_daily = result.returns
+        daily_returns = result.assets
+    
+    if port_daily.empty:
+        st.error(
+            "⚠️ ช่วงเวลาของสินทรัพย์ในพอร์ตไม่ทับซ้อนกันเลย จึง backtest ไม่ได้ "
+            "— ลองเอาสินทรัพย์ที่เพิ่งเริ่มมีข้อมูลออก หรือขยายช่วงวันที่"
+        )
+        st.stop()
+    
+    # The backtest can only begin once every holding actually exists.
+    requested_start = pd.Timestamp(test_prices.index[0])
+    if result.start is not None and result.start > requested_start:
+        firsts = metrics.first_valid_dates(test_prices[result.held])
+        limiter = firsts.idxmax()
+        st.warning(
+            f"⚠️ Backtest เริ่มจริงที่ **{result.start.date()}** ไม่ใช่ "
+            f"{requested_start.date()} เพราะ **{limiter}** เพิ่งมีข้อมูลวันแรกตอนนั้น "
+            "— พอร์ตจะถือครบทุกตัวได้ก็ต่อเมื่อทุกตัวมีอยู่จริงแล้ว"
+        )
+    
+    cumulative = (1 + port_daily).cumprod()
+    stats = metrics.backtest_stats(port_daily, risk_free_rate)
+    periods_per_year = stats["periods_per_year"]
+    n_years = stats["years"]
+    total_ret = stats["total_return"]
+    ann_ret = stats["annual_return"]
+    ann_vol = stats["annual_volatility"]
+    sharpe = stats["sharpe"]
+    max_dd = stats["max_drawdown"]
+    calmar = stats["calmar"]
+    sortino = stats["sortino"]
+    drawdown = (cumulative - cumulative.cummax()) / cumulative.cummax()
+    
+    if backtest_mode == "Walk-Forward":
+        st.success(
+            f"🔒 **Walk-Forward** — คำนวณน้ำหนักใหม่{refit_label} "
+            f"รวม **{len(walk_result.weight_history)} ครั้ง** โดยแต่ละครั้งใช้เฉพาะข้อมูล "
+            "ที่มีอยู่ ณ วันนั้น ทั้งช่วงที่ทดสอบจึงเป็น out-of-sample ทั้งหมด"
+        )
+    elif split_date is not None:
+        st.success(
+            f"🔒 **Out-of-sample** — น้ำหนักคำนวณจากข้อมูลถึง **{split_date.date()}** "
+            f"แล้วทดสอบบน **{result.start.date()} ถึง {port_daily.index[-1].date()}** "
+            "ซึ่งเป็นข้อมูลที่ optimizer ไม่เคยเห็น"
+        )
+    else:
+        st.warning(
+            "⚠️ **In-sample** — น้ำหนักถูกหาจากข้อมูลชุดเดียวกับที่ใช้ทดสอบ "
+            "ผลลัพธ์จึงสวยเกินจริงเสมอ เปลี่ยนเป็นโหมด Train/Test Split เพื่อดูผลจริง"
+        )
+    
+    # ── Benchmark ──
+    # Computed before the summary so the headline metrics can carry
+    # a delta against it.
+    bench_daily = pd.Series(dtype=float)
+    bench_stats = None
+    beta = alpha = 0.0
+    if not benchmark.empty:
+        bench_window = benchmark.reindex(
+            benchmark.index.union(port_daily.index)
+        ).ffill().reindex(port_daily.index)
+        bench_daily = bench_window.pct_change().fillna(0.0)
+        bench_stats = metrics.backtest_stats(bench_daily, risk_free_rate)
+        beta, alpha = metrics.beta_alpha(
+            port_daily, bench_daily, risk_free_rate, periods_per_year
+        )
+    
+    def build_workbook():
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            pd.DataFrame({
+                "Asset": list(weights_in_force),
+                "Weight": list(weights_in_force.values()),
+                "Source": [
+                    f"{weight_source} (งวดล่าสุด)" if walk_result is not None
+                    else weight_source
+                ] * len(weights_in_force),
+            }).to_excel(writer, sheet_name="Weights", index=False)
+            pd.DataFrame(
+                {"Metric": list(stats), "Value": list(stats.values())}
+            ).to_excel(writer, sheet_name="Stats", index=False)
+            pd.DataFrame({
+                "Date": port_daily.index, "Daily Return": port_daily.values,
+                "Cumulative": cumulative.values, "Drawdown": drawdown.values,
+            }).to_excel(writer, sheet_name="Backtest", index=False)
+            data_close.to_excel(writer, sheet_name="Prices")
+            if walk_result is not None:
+                pd.DataFrame(
+                    [w for _, w in walk_result.weight_history],
+                    index=[d.date() for d, _ in walk_result.weight_history],
+                ).to_excel(writer, sheet_name="Walk-Forward Weights")
+        return buffer.getvalue()
+
+    # Hand the NAV tab the exact series behind these numbers.
+    st.session_state["nav_view"] = {
+        "returns": port_daily,
+        "asset_returns": daily_returns,
+        "weights": backtest_w if walk_result is None else weights_in_force,
+        "held": result.held,
+        "start": result.start,
+        "source": weight_source,
+        "is_walk_forward": walk_result is not None,
+    }
+
     tab1, tab2, tab3, tab4 = st.tabs([
         "📈 เส้นขอบประสิทธิภาพ",
         "⚖️ น้ำหนักพอร์ต",
@@ -815,242 +1024,124 @@ if st.session_state.get("calculated"):
         })
         st.dataframe(weights_df, use_container_width=True, hide_index=True)
 
+
+        # ── Walk-forward weight history ──
+        if walk_result is not None:
+            st.subheader("น้ำหนักที่คำนวณใหม่ในแต่ละงวด")
+            history = pd.DataFrame(
+                [w for _, w in walk_result.weight_history],
+                index=[d.date() for d, _ in walk_result.weight_history],
+            ).fillna(0.0)
+            st.dataframe(
+                history.style.format("{:.1%}"), use_container_width=True
+            )
+            st.caption(
+                f"Turnover เฉลี่ยต่อการคำนวณใหม่ 1 ครั้ง: "
+                f"**{walk_result.turnover.mean():.0%}** ของมูลค่าพอร์ต"
+            )
+
+        # ── Train vs Test ──
+        # The gap between the two columns is the overfitting, made visible.
+        if split_date is not None:
+            train_result = metrics.simulate_portfolio(
+                train_prices, backtest_w, rebalance_freq, cost_bps
+            )
+            if not train_result.returns.empty:
+                train_stats = metrics.backtest_stats(train_result.returns, risk_free_rate)
+                st.subheader("Train vs Test")
+                comparison = pd.DataFrame({
+                    "": ["Annual Return", "Annual Volatility", "Sharpe Ratio",
+                         "Max Drawdown", "Total Years"],
+                    "Train (in-sample)": [
+                        f"{train_stats['annual_return']:.2%}",
+                        f"{train_stats['annual_volatility']:.2%}",
+                        f"{train_stats['sharpe']:.2f}",
+                        f"{train_stats['max_drawdown']:.2%}",
+                        f"{train_stats['years']:.1f}",
+                    ],
+                    "Test (out-of-sample)": [
+                        f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}",
+                        f"{max_dd:.2%}", f"{n_years:.1f}",
+                    ],
+                })
+                st.dataframe(comparison, use_container_width=True, hide_index=True)
+                decay = train_stats["sharpe"] - sharpe
+                if decay > 0.5:
+                    st.warning(
+                        f"⚠️ Sharpe ตกจาก {train_stats['sharpe']:.2f} เหลือ {sharpe:.2f} "
+                        f"(−{decay:.2f}) — น้ำหนักชุดนี้ fit กับอดีตมากกว่าที่จะใช้ได้จริง"
+                    )
+
         st.divider()
-        st.subheader("Custom Weights")
+        st.subheader("น้ำหนักที่กำหนดเอง")
         st.caption(
-            "ปรับน้ำหนักเองได้ ระบบจะ normalize ให้รวมเป็น 1.0 — "
-            "ค่าเหล่านี้จะถูกใช้ในแท็บทดสอบย้อนหลังและมูลค่าพอร์ต "
-            "ก็ต่อเมื่อเลือก **Custom** ในแท็บทดสอบย้อนหลังเท่านั้น"
-        )
-        st.caption(
-            "⚠️ slider ขยับทีละ 1% จึงปัดเศษน้ำหนักจาก optimizer เล็กน้อย "
-            "ถ้าต้องการน้ำหนักที่ optimizer คำนวณแบบเป๊ะๆ ให้เลือก "
-            "Max Sharpe หรือ Min Volatility ในแท็บทดสอบย้อนหลังแทน"
+            "ปรับน้ำหนักเองได้ ระบบจะ normalize ให้รวมเป็น 100% — "
+            "ค่าเหล่านี้จะถูกใช้ก็ต่อเมื่อเลือก **Custom** เป็นแหล่งน้ำหนักด้านบนสุดของหน้า"
         )
 
-        custom_w = {}
-        cols = st.columns(min(len(stock_list), 4))
-        for i, sym in enumerate(sorted(sel_weights.keys())):
-            with cols[i % len(cols)]:
-                default = sel_weights.get(sym, 0.0)
-                custom_w[sym] = st.slider(
-                    sym, 0.0, 1.0, float(round(default, 3)),
-                    step=0.01, key=f"w_{sym}_{display_strategy}",
+        assets = sorted(ar.index)
+        preset_cols = st.columns(3)
+        if preset_cols[0].button("⚖️ เท่ากันทุกตัว", use_container_width=True):
+            for sym in assets:
+                st.session_state[f"cw_{sym}"] = round(100 / len(assets), 1)
+            st.rerun()
+        if preset_cols[1].button("↩️ กลับไปใช้ Max Sharpe", use_container_width=True):
+            for sym in assets:
+                st.session_state[f"cw_{sym}"] = round(cleaned.get(sym, 0.0) * 100, 1)
+            st.rerun()
+        if preset_cols[2].button("↩️ กลับไปใช้ Min Volatility", use_container_width=True):
+            for sym in assets:
+                st.session_state[f"cw_{sym}"] = round(mv_cleaned.get(sym, 0.0) * 100, 1)
+            st.rerun()
+
+        # A fixed four-column grid of sliders became unreadable past a
+        # handful of holdings; number inputs stay one row per asset and
+        # accept an exact figure.
+        for sym in assets:
+            if f"cw_{sym}" not in st.session_state:
+                st.session_state[f"cw_{sym}"] = round(cleaned.get(sym, 0.0) * 100, 1)
+        rows = st.columns(2)
+        for position, sym in enumerate(assets):
+            with rows[position % 2]:
+                st.number_input(
+                    sym, min_value=0.0, max_value=100.0, step=1.0,
+                    format="%.1f", key=f"cw_{sym}",
                 )
 
-        total_w = sum(custom_w.values())
-        if total_w > 0:
-            custom_w_norm = {k: v / total_w for k, v in custom_w.items()}
-        else:
-            custom_w_norm = {k: 1 / len(custom_w) for k in custom_w}
+        custom_w_norm = read_custom_weights(assets)
+        raw_total = sum(st.session_state[f"cw_{sym}"] for sym in assets)
+        if abs(raw_total - 100.0) > 0.05:
+            st.caption(
+                f"รวมกันได้ {raw_total:.1f}% — จะถูก normalize เป็น 100% ให้อัตโนมัติ"
+            )
 
-        # Compute custom portfolio performance
-        w_arr = np.array([custom_w_norm[s] for s in ar.index])
-        custom_ret = w_arr.dot(ar.values)
-        custom_vol = np.sqrt(w_arr @ covr.values @ w_arr)
-        custom_sharpe = (custom_ret - risk_free_rate) / custom_vol if custom_vol > 0 else 0
-
-        st.markdown("**Custom Portfolio Performance (normalized):**")
+        custom_ret, custom_vol, custom_sharpe = optimizer.portfolio_performance(
+            ar, covr, custom_w_norm, risk_free_rate
+        )
+        st.markdown("**ผลลัพธ์คาดหวังของน้ำหนักที่กำหนดเอง (หลัง normalize):**")
         cc1, cc2, cc3 = st.columns(3)
-        cc1.metric("Expected Annual Return", f"{custom_ret:.2%}")
-        cc2.metric("Annual Volatility", f"{custom_vol:.2%}")
-        cc3.metric("Sharpe Ratio", f"{custom_sharpe:.2f}")
+        cc1.metric("ผลตอบแทนคาดหวังต่อปี", f"{custom_ret:.2%}")
+        cc2.metric("ความผันผวนต่อปี", f"{custom_vol:.2%}")
+        cc3.metric(
+            "Sharpe Ratio", f"{custom_sharpe:.2f}",
+            delta=f"{custom_sharpe - opt_sharpe:+.2f} vs Max Sharpe",
+        )
 
-        # Show normalized weights
-        norm_df = pd.DataFrame({
-            "Stock": list(custom_w_norm.keys()),
-            "Raw": [f"{custom_w[k]:.2f}" for k in custom_w_norm],
-            "Normalized": [f"{v:.1%}" for v in custom_w_norm.values()],
-        })
-        st.dataframe(norm_df, use_container_width=True, hide_index=True)
-
-        # Store for backtesting
-        st.session_state["active_weights"] = custom_w_norm
+        st.dataframe(
+            pd.DataFrame({
+                "สินทรัพย์": assets,
+                "ที่กรอก (%)": [f"{st.session_state[f'cw_{a}']:.1f}" for a in assets],
+                "หลัง normalize": [f"{custom_w_norm[a]:.1%}" for a in assets],
+                "Max Sharpe": [f"{cleaned.get(a, 0.0):.1%}" for a in assets],
+                "Min Volatility": [f"{mv_cleaned.get(a, 0.0):.1%}" for a in assets],
+            }),
+            use_container_width=True, hide_index=True,
+        )
 
     # ════════════════════════════════════════
     # Tab 3: Backtesting
     # ════════════════════════════════════════
     with tab3:
-        # This tab owns the choice of which weights get tested, and
-        # publishes the result for the NAV tab, so the two can never
-        # disagree about what they are showing.
-        custom_w_available = st.session_state.get("active_weights")
-        if backtest_mode == "Walk-Forward":
-            walk_objective = st.radio(
-                "วัตถุประสงค์ที่ใช้คำนวณน้ำหนักใหม่ทุกงวด",
-                OBJECTIVES, horizontal=True,
-            )
-            weight_source = walk_objective
-            active_w = cleaned if walk_objective == "Max Sharpe" else mv_cleaned
-        else:
-            sources = OBJECTIVES + ([CUSTOM_SOURCE] if custom_w_available else [])
-            weight_source = st.radio(
-                "น้ำหนักที่ใช้ backtest", sources, horizontal=True,
-                help=(
-                    "Max Sharpe และ Min Volatility ใช้น้ำหนักที่ optimizer คำนวณแบบเป๊ะๆ "
-                    "ส่วน Custom ใช้ค่าจาก slider ในแท็บน้ำหนักพอร์ต ซึ่งปัดเศษทีละ 1%"
-                ),
-            )
-            walk_objective = (
-                weight_source if weight_source in OBJECTIVES else "Max Sharpe"
-            )
-            if weight_source == "Max Sharpe":
-                active_w = cleaned
-            elif weight_source == "Min Volatility":
-                active_w = mv_cleaned
-            else:
-                active_w = custom_w_available
-
-        if backtest_mode == "Walk-Forward":
-            st.info(
-                f"โหมด Walk-Forward คำนวณน้ำหนักใหม่ทุกงวดด้วยวัตถุประสงค์ **{walk_objective}** "
-                "— น้ำหนักของแต่ละงวดดูได้จากตารางด้านล่าง"
-            )
-        else:
-            st.info(
-                f"ใช้น้ำหนัก **{weight_source}**: "
-                + ", ".join(
-                    f"{k}={v:.1%}" for k, v in sorted(active_w.items()) if v > 0
-                )
-            )
-
-        # C2: a cash sleeve is modelled as a synthetic holding accruing
-        # the risk-free rate, so it flows through the ordinary simulator.
-        backtest_w = metrics.blend_with_cash(active_w, cash_fraction)
-        test_prices = test_close
-        train_prices = train_close
-        if cash_fraction > 0:
-            test_prices = test_close.assign(
-                **{metrics.CASH_SYMBOL: metrics.cash_price_series(test_close.index, risk_free_rate)}
-            )
-            train_prices = train_close.assign(
-                **{metrics.CASH_SYMBOL: metrics.cash_price_series(train_close.index, risk_free_rate)}
-            )
-            st.caption(
-                f"💵 ถือเงินสด {cash_fraction:.0%} ที่ได้ผลตอบแทน {risk_free_rate:.2%} ต่อปี "
-                f"— สินทรัพย์เสี่ยงที่เหลือ {1 - cash_fraction:.0%} คงสัดส่วนภายในเดิม"
-            )
-
-        walk_result = None
-        if backtest_mode == "Walk-Forward":
-            with st.spinner("Running walk-forward..."):
-                walk_result = optimizer.walk_forward(
-                    test_prices, risk_free_rate, walk_objective, max_weight,
-                    shrinkage, refit_freq, cost_bps,
-                )
-            if walk_result.returns.empty:
-                st.error(
-                    "⚠️ ข้อมูลไม่พอสำหรับ Walk-Forward — ต้องมีอย่างน้อย 2 ปี "
-                    "ก่อนการคำนวณน้ำหนักครั้งแรก ลองขยายช่วงวันที่"
-                )
-                st.stop()
-            weights_in_force = walk_result.weight_history[-1][1]
-            result = metrics.simulate_portfolio(
-                test_prices, weights_in_force, rebalance_freq, cost_bps
-            )
-            port_daily = walk_result.returns
-            daily_returns = result.assets
-        else:
-            weights_in_force = backtest_w
-            # In split mode the weights were fitted on train_close only,
-            # so the headline backtest runs on the untouched test window.
-            result = metrics.simulate_portfolio(
-                test_prices, backtest_w, rebalance_freq, cost_bps
-            )
-            port_daily = result.returns
-            daily_returns = result.assets
-
-        if port_daily.empty:
-            st.error(
-                "⚠️ ช่วงเวลาของสินทรัพย์ในพอร์ตไม่ทับซ้อนกันเลย จึง backtest ไม่ได้ "
-                "— ลองเอาสินทรัพย์ที่เพิ่งเริ่มมีข้อมูลออก หรือขยายช่วงวันที่"
-            )
-            st.stop()
-
-        # The backtest can only begin once every holding actually exists.
-        requested_start = pd.Timestamp(test_prices.index[0])
-        if result.start is not None and result.start > requested_start:
-            firsts = metrics.first_valid_dates(test_prices[result.held])
-            limiter = firsts.idxmax()
-            st.warning(
-                f"⚠️ Backtest เริ่มจริงที่ **{result.start.date()}** ไม่ใช่ "
-                f"{requested_start.date()} เพราะ **{limiter}** เพิ่งมีข้อมูลวันแรกตอนนั้น "
-                "— พอร์ตจะถือครบทุกตัวได้ก็ต่อเมื่อทุกตัวมีอยู่จริงแล้ว"
-            )
-
-        cumulative = (1 + port_daily).cumprod()
-        stats = metrics.backtest_stats(port_daily, risk_free_rate)
-        periods_per_year = stats["periods_per_year"]
-        n_years = stats["years"]
-        total_ret = stats["total_return"]
-        ann_ret = stats["annual_return"]
-        ann_vol = stats["annual_volatility"]
-        sharpe = stats["sharpe"]
-        max_dd = stats["max_drawdown"]
-        calmar = stats["calmar"]
-        sortino = stats["sortino"]
-        drawdown = (cumulative - cumulative.cummax()) / cumulative.cummax()
-
-        if backtest_mode == "Walk-Forward":
-            st.success(
-                f"🔒 **Walk-Forward** — คำนวณน้ำหนักใหม่{refit_label} "
-                f"รวม **{len(walk_result.weight_history)} ครั้ง** โดยแต่ละครั้งใช้เฉพาะข้อมูล "
-                "ที่มีอยู่ ณ วันนั้น ทั้งช่วงที่ทดสอบจึงเป็น out-of-sample ทั้งหมด"
-            )
-        elif split_date is not None:
-            st.success(
-                f"🔒 **Out-of-sample** — น้ำหนักคำนวณจากข้อมูลถึง **{split_date.date()}** "
-                f"แล้วทดสอบบน **{result.start.date()} ถึง {port_daily.index[-1].date()}** "
-                "ซึ่งเป็นข้อมูลที่ optimizer ไม่เคยเห็น"
-            )
-        else:
-            st.warning(
-                "⚠️ **In-sample** — น้ำหนักถูกหาจากข้อมูลชุดเดียวกับที่ใช้ทดสอบ "
-                "ผลลัพธ์จึงสวยเกินจริงเสมอ เปลี่ยนเป็นโหมด Train/Test Split เพื่อดูผลจริง"
-            )
-
-        # ── Benchmark ──
-        # Computed before the summary so the headline metrics can carry
-        # a delta against it.
-        bench_daily = pd.Series(dtype=float)
-        bench_stats = None
-        beta = alpha = 0.0
-        if not benchmark.empty:
-            bench_window = benchmark.reindex(
-                benchmark.index.union(port_daily.index)
-            ).ffill().reindex(port_daily.index)
-            bench_daily = bench_window.pct_change().fillna(0.0)
-            bench_stats = metrics.backtest_stats(bench_daily, risk_free_rate)
-            beta, alpha = metrics.beta_alpha(
-                port_daily, bench_daily, risk_free_rate, periods_per_year
-            )
-
-        def build_workbook():
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                pd.DataFrame({
-                    "Asset": list(weights_in_force),
-                    "Weight": list(weights_in_force.values()),
-                    "Source": [
-                        f"{weight_source} (งวดล่าสุด)" if walk_result is not None
-                        else weight_source
-                    ] * len(weights_in_force),
-                }).to_excel(writer, sheet_name="Weights", index=False)
-                pd.DataFrame(
-                    {"Metric": list(stats), "Value": list(stats.values())}
-                ).to_excel(writer, sheet_name="Stats", index=False)
-                pd.DataFrame({
-                    "Date": port_daily.index, "Daily Return": port_daily.values,
-                    "Cumulative": cumulative.values, "Drawdown": drawdown.values,
-                }).to_excel(writer, sheet_name="Backtest", index=False)
-                data_close.to_excel(writer, sheet_name="Prices")
-                if walk_result is not None:
-                    pd.DataFrame(
-                        [w for _, w in walk_result.weight_history],
-                        index=[d.date() for d, _ in walk_result.weight_history],
-                    ).to_excel(writer, sheet_name="Walk-Forward Weights")
-            return buffer.getvalue()
-
         # ── Performance Stats ──
         # Four headline figures answer the question people actually ask:
         # what did it make, how badly did it hurt, was that worth the
@@ -1168,63 +1259,32 @@ if st.session_state.get("calculated"):
                     "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
                 )
 
-        # ── Walk-forward weight history ──
-        if walk_result is not None:
-            st.subheader("น้ำหนักที่คำนวณใหม่ในแต่ละงวด")
-            history = pd.DataFrame(
-                [w for _, w in walk_result.weight_history],
-                index=[d.date() for d, _ in walk_result.weight_history],
-            ).fillna(0.0)
-            st.dataframe(
-                history.style.format("{:.1%}"), use_container_width=True
-            )
-            st.caption(
-                f"Turnover เฉลี่ยต่อการคำนวณใหม่ 1 ครั้ง: "
-                f"**{walk_result.turnover.mean():.0%}** ของมูลค่าพอร์ต"
-            )
+        if bench_stats is not None:
+            st.subheader(f"เทียบกับ Benchmark: {benchmark_symbol}")
+            versus = pd.DataFrame({
+                "": ["Annual Return", "Annual Volatility", "Sharpe Ratio", "Max Drawdown"],
+                "Portfolio": [
+                    f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}", f"{max_dd:.2%}",
+                ],
+                benchmark_symbol: [
+                    f"{bench_stats['annual_return']:.2%}",
+                    f"{bench_stats['annual_volatility']:.2%}",
+                    f"{bench_stats['sharpe']:.2f}",
+                    f"{bench_stats['max_drawdown']:.2%}",
+                ],
+            })
+            st.dataframe(versus, use_container_width=True, hide_index=True)
 
-        # ── Train vs Test ──
-        # The gap between the two columns is the overfitting, made visible.
-        if split_date is not None:
-            train_result = metrics.simulate_portfolio(
-                train_prices, backtest_w, rebalance_freq, cost_bps
-            )
-            if not train_result.returns.empty:
-                train_stats = metrics.backtest_stats(train_result.returns, risk_free_rate)
-                st.subheader("Train vs Test")
-                comparison = pd.DataFrame({
-                    "": ["Annual Return", "Annual Volatility", "Sharpe Ratio",
-                         "Max Drawdown", "Total Years"],
-                    "Train (in-sample)": [
-                        f"{train_stats['annual_return']:.2%}",
-                        f"{train_stats['annual_volatility']:.2%}",
-                        f"{train_stats['sharpe']:.2f}",
-                        f"{train_stats['max_drawdown']:.2%}",
-                        f"{train_stats['years']:.1f}",
-                    ],
-                    "Test (out-of-sample)": [
-                        f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}",
-                        f"{max_dd:.2%}", f"{n_years:.1f}",
-                    ],
-                })
-                st.dataframe(comparison, use_container_width=True, hide_index=True)
-                decay = train_stats["sharpe"] - sharpe
-                if decay > 0.5:
-                    st.warning(
-                        f"⚠️ Sharpe ตกจาก {train_stats['sharpe']:.2f} เหลือ {sharpe:.2f} "
-                        f"(−{decay:.2f}) — น้ำหนักชุดนี้ fit กับอดีตมากกว่าที่จะใช้ได้จริง"
-                    )
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Beta", f"{beta:.2f}", help="ความอ่อนไหวต่อ benchmark — 1.0 คือเคลื่อนไหวตามกัน")
+            b2.metric("Alpha (ต่อปี)", f"{alpha:.2%}", help="ผลตอบแทนส่วนเกินหลังปรับความเสี่ยงตาม beta")
+            b3.metric("ชนะ Benchmark", f"{ann_ret - bench_stats['annual_return']:+.2%}")
 
-        # Hand the NAV tab the exact series behind these numbers.
-        st.session_state["nav_view"] = {
-            "returns": port_daily,
-            "asset_returns": daily_returns,
-            "weights": backtest_w if walk_result is None else weights_in_force,
-            "held": result.held,
-            "start": result.start,
-            "source": weight_source,
-            "is_walk_forward": walk_result is not None,
-        }
+            if ann_ret <= bench_stats["annual_return"]:
+                st.info(
+                    f"ℹ️ พอร์ตนี้ให้ผลตอบแทนไม่ชนะการถือ **{benchmark_symbol}** เฉยๆ "
+                    "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
+                )
 
         # ── Rebalancing ──
         st.subheader("การ Rebalance")
