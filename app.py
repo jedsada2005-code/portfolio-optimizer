@@ -21,6 +21,8 @@ PLOT_SAMPLE = 6_000
 
 
 MODES = ["Train / Test Split", "Walk-Forward", "In-sample (ทั้งช่วง)"]
+OBJECTIVES = ["Max Sharpe", "Min Volatility"]
+CUSTOM_SOURCE = "Custom (จาก Tab 2)"
 
 
 def qp_text(key, default):
@@ -711,20 +713,23 @@ if st.session_state.get("calculated"):
     # Tab 2: Optimal Weights + Custom Sliders
     # ════════════════════════════════════════
     with tab2:
-        strategy = st.radio(
+        # Display only. Which weights actually get backtested is chosen
+        # on the Backtesting tab, so that choice cannot depend on a bare
+        # local defined over here.
+        display_strategy = st.radio(
             "Optimization Strategy",
-            ["Max Sharpe", "Min Volatility"],
+            OBJECTIVES,
             horizontal=True,
         )
 
-        if strategy == "Max Sharpe":
+        if display_strategy == "Max Sharpe":
             sel_weights = cleaned
             sel_ret, sel_vol, sel_sharpe = opt_ret, opt_vol, opt_sharpe
         else:
             sel_weights = mv_cleaned
             sel_ret, sel_vol, sel_sharpe = mv_ret, mv_vol, mv_sharpe
 
-        st.subheader(f"{strategy} Optimal Weights")
+        st.subheader(f"{display_strategy} Optimal Weights")
         col_m1, col_m2, col_m3 = st.columns(3)
         col_m1.metric("Expected Annual Return", f"{sel_ret:.2%}")
         col_m2.metric("Annual Volatility", f"{sel_vol:.2%}")
@@ -738,7 +743,16 @@ if st.session_state.get("calculated"):
 
         st.divider()
         st.subheader("Custom Weights")
-        st.caption("Adjust weights manually. They will be normalized to sum to 1.0.")
+        st.caption(
+            "ปรับน้ำหนักเองได้ ระบบจะ normalize ให้รวมเป็น 1.0 — "
+            "ค่าเหล่านี้จะถูกใช้ในแท็บ Backtesting และ NAV Breakdown "
+            "ก็ต่อเมื่อเลือก **Custom** ในแท็บ Backtesting เท่านั้น"
+        )
+        st.caption(
+            "⚠️ slider ขยับทีละ 1% จึงปัดเศษน้ำหนักจาก optimizer เล็กน้อย "
+            "ถ้าต้องการน้ำหนักที่ optimizer คำนวณแบบเป๊ะๆ ให้เลือก "
+            "Max Sharpe หรือ Min Volatility ในแท็บ Backtesting แทน"
+        )
 
         custom_w = {}
         cols = st.columns(min(len(stock_list), 4))
@@ -747,7 +761,7 @@ if st.session_state.get("calculated"):
                 default = sel_weights.get(sym, 0.0)
                 custom_w[sym] = st.slider(
                     sym, 0.0, 1.0, float(round(default, 3)),
-                    step=0.01, key=f"w_{sym}_{strategy}",
+                    step=0.01, key=f"w_{sym}_{display_strategy}",
                 )
 
         total_w = sum(custom_w.values())
@@ -783,10 +797,48 @@ if st.session_state.get("calculated"):
     # Tab 3: Backtesting
     # ════════════════════════════════════════
     with tab3:
-        # Use custom weights if available, else optimal
-        active_w = st.session_state.get("active_weights", cleaned)
+        # This tab owns the choice of which weights get tested, and
+        # publishes the result for the NAV tab, so the two can never
+        # disagree about what they are showing.
+        custom_w_available = st.session_state.get("active_weights")
+        if backtest_mode == "Walk-Forward":
+            walk_objective = st.radio(
+                "วัตถุประสงค์ที่ใช้คำนวณน้ำหนักใหม่ทุกงวด",
+                OBJECTIVES, horizontal=True,
+            )
+            weight_source = walk_objective
+            active_w = cleaned if walk_objective == "Max Sharpe" else mv_cleaned
+        else:
+            sources = OBJECTIVES + ([CUSTOM_SOURCE] if custom_w_available else [])
+            weight_source = st.radio(
+                "น้ำหนักที่ใช้ backtest", sources, horizontal=True,
+                help=(
+                    "Max Sharpe และ Min Volatility ใช้น้ำหนักที่ optimizer คำนวณแบบเป๊ะๆ "
+                    "ส่วน Custom ใช้ค่าจาก slider ในแท็บ Optimal Weights ซึ่งปัดเศษทีละ 1%"
+                ),
+            )
+            walk_objective = (
+                weight_source if weight_source in OBJECTIVES else "Max Sharpe"
+            )
+            if weight_source == "Max Sharpe":
+                active_w = cleaned
+            elif weight_source == "Min Volatility":
+                active_w = mv_cleaned
+            else:
+                active_w = custom_w_available
 
-        st.info(f"Backtesting with weights: {', '.join(f'{k}={v:.1%}' for k, v in active_w.items())}")
+        if backtest_mode == "Walk-Forward":
+            st.info(
+                f"โหมด Walk-Forward คำนวณน้ำหนักใหม่ทุกงวดด้วยวัตถุประสงค์ **{walk_objective}** "
+                "— น้ำหนักของแต่ละงวดดูได้จากตารางด้านล่าง"
+            )
+        else:
+            st.info(
+                f"ใช้น้ำหนัก **{weight_source}**: "
+                + ", ".join(
+                    f"{k}={v:.1%}" for k, v in sorted(active_w.items()) if v > 0
+                )
+            )
 
         # C2: a cash sleeve is modelled as a synthetic holding accruing
         # the risk-free rate, so it flows through the ordinary simulator.
@@ -809,7 +861,7 @@ if st.session_state.get("calculated"):
         if backtest_mode == "Walk-Forward":
             with st.spinner("Running walk-forward..."):
                 walk_result = optimizer.walk_forward(
-                    test_prices, risk_free_rate, strategy, max_weight,
+                    test_prices, risk_free_rate, walk_objective, max_weight,
                     shrinkage, refit_freq, cost_bps,
                 )
             if walk_result.returns.empty:
@@ -818,12 +870,14 @@ if st.session_state.get("calculated"):
                     "ก่อนการคำนวณน้ำหนักครั้งแรก ลองขยายช่วงวันที่"
                 )
                 st.stop()
+            weights_in_force = walk_result.weight_history[-1][1]
             result = metrics.simulate_portfolio(
-                test_prices, walk_result.weight_history[-1][1], rebalance_freq, cost_bps
+                test_prices, weights_in_force, rebalance_freq, cost_bps
             )
             port_daily = walk_result.returns
             daily_returns = result.assets
         else:
+            weights_in_force = backtest_w
             # In split mode the weights were fitted on train_close only,
             # so the headline backtest runs on the untouched test window.
             result = metrics.simulate_portfolio(
@@ -980,6 +1034,17 @@ if st.session_state.get("calculated"):
                     "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
                 )
 
+        # Hand the NAV tab the exact series behind these numbers.
+        st.session_state["nav_view"] = {
+            "returns": port_daily,
+            "asset_returns": daily_returns,
+            "weights": backtest_w if walk_result is None else weights_in_force,
+            "held": result.held,
+            "start": result.start,
+            "source": weight_source,
+            "is_walk_forward": walk_result is not None,
+        }
+
         # ── Rebalancing ──
         st.subheader("การ Rebalance")
         r1, r2, r3 = st.columns(3)
@@ -1064,9 +1129,14 @@ if st.session_state.get("calculated"):
         st.subheader("ดาวน์โหลดผลลัพธ์")
         buffer = io.BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            pd.DataFrame(
-                {"Asset": list(backtest_w), "Weight": list(backtest_w.values())}
-            ).to_excel(writer, sheet_name="Weights", index=False)
+            pd.DataFrame({
+                "Asset": list(weights_in_force),
+                "Weight": list(weights_in_force.values()),
+                "Source": [
+                    f"{weight_source} (งวดล่าสุด)" if walk_result is not None
+                    else weight_source
+                ] * len(weights_in_force),
+            }).to_excel(writer, sheet_name="Weights", index=False)
             pd.DataFrame(
                 {"Metric": list(stats), "Value": list(stats.values())}
             ).to_excel(writer, sheet_name="Stats", index=False)
@@ -1127,27 +1197,27 @@ if st.session_state.get("calculated"):
     # Tab 4: NAV Breakdown
     # ════════════════════════════════════════
     with tab4:
-        active_w = st.session_state.get("active_weights", cleaned)
-
-        # Share the backtest's exact series so both tabs start on the
-        # same date and report the same growth.
-        nav_w = metrics.blend_with_cash(active_w, cash_fraction)
-        nav_prices = test_close
-        if cash_fraction > 0:
-            nav_prices = test_close.assign(
-                **{metrics.CASH_SYMBOL: metrics.cash_price_series(test_close.index, risk_free_rate)}
-            )
-        result = metrics.simulate_portfolio(
-            nav_prices, nav_w, rebalance_freq, cost_bps
-        )
-        port_daily = result.returns
-        daily_returns = result.assets
-
-        if port_daily.empty:
-            st.error("⚠️ ช่วงเวลาของสินทรัพย์ในพอร์ตไม่ทับซ้อนกันเลย จึงคำนวณ NAV ไม่ได้")
+        # Render exactly what the Backtesting tab computed. Recomputing
+        # here is what let the two tabs drift apart -- most visibly under
+        # walk-forward, where this tab had no idea the weights changed
+        # every period.
+        view = st.session_state.get("nav_view")
+        if view is None or view["returns"].empty:
+            st.info("เปิดแท็บ Backtesting ก่อนหนึ่งครั้ง เพื่อให้คำนวณผลลัพธ์")
             st.stop()
 
+        port_daily = view["returns"]
+        daily_returns = view["asset_returns"]
+        nav_w = view["weights"]
         nav_total = total_cash * (1 + port_daily).cumprod()
+
+        if view["is_walk_forward"]:
+            st.info(
+                f"โหมด Walk-Forward — เส้น Portfolio NAV มาจากน้ำหนักที่คำนวณใหม่ทุกงวด "
+                f"(วัตถุประสงค์ {view['source']}) ส่วนเส้นรายตัวใช้น้ำหนักของงวดล่าสุด"
+            )
+        else:
+            st.info(f"ใช้น้ำหนัก **{view['source']}** (ตรงกับแท็บ Backtesting)")
 
         fig_nav = go.Figure()
         fig_nav.add_trace(go.Scatter(
@@ -1158,8 +1228,10 @@ if st.session_state.get("calculated"):
 
         # Each sleeve held on its own, for comparison against the
         # rebalanced portfolio line above.
-        for sym in sorted(result.held):
-            stock_nav = total_cash * nav_w[sym] * (1 + daily_returns[sym]).cumprod()
+        for sym in sorted(view["held"]):
+            if sym not in daily_returns.columns:
+                continue
+            stock_nav = total_cash * nav_w.get(sym, 0.0) * (1 + daily_returns[sym]).cumprod()
             fig_nav.add_trace(go.Scatter(
                 x=stock_nav.index, y=stock_nav.values,
                 mode="lines", name=f"{sym} (ถือเดี่ยว)",
@@ -1176,8 +1248,8 @@ if st.session_state.get("calculated"):
         st.plotly_chart(fig_nav, use_container_width=True)
 
         st.caption(
-            f"เริ่มนับตั้งแต่ **{result.start.date()}** ซึ่งเป็นวันแรกที่ทุกตัวในพอร์ตมีข้อมูลครบ "
-            "(ตรงกับแท็บ Backtesting) — เส้น Portfolio NAV ปรับสัดส่วนกลับทุกวันทำการ "
+            f"เริ่มนับตั้งแต่ **{view['start'].date()}** ซึ่งเป็นวันแรกที่ทุกตัวในพอร์ตมีข้อมูลครบ "
+            f"(ตรงกับแท็บ Backtesting) — เส้น Portfolio NAV ปรับสัดส่วนกลับ{rebalance_label} "
             "ส่วนเส้นรายตัวคือถือเดี่ยวไม่ปรับสัดส่วน จึงบวกกันแล้วไม่เท่ากับเส้นรวม"
         )
 

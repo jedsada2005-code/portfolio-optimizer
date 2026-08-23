@@ -12,6 +12,8 @@ import pytest
 
 from streamlit.testing.v1 import AppTest
 
+import metrics
+
 
 pytestmark = pytest.mark.slow
 
@@ -170,3 +172,82 @@ class TestPercentSliders:
         assert not at.exception, at.exception
         assert _widget(at.slider, "น้ำหนักสูงสุด").value == 35
         assert _widget(at.slider, "เงินสด").value == 25
+
+
+class TestWeightSourceSelection:
+    """The Backtesting tab owns which weights get tested.
+
+    It used to always read the Custom Weights sliders, which snap to 1%
+    steps -- so a 35.49% optimal allocation was silently backtested as
+    36%, and nothing on screen said so. The NAV tab recomputed its own
+    series, which let the two tabs disagree outright under walk-forward.
+    """
+
+    def _source_radio(self, at):
+        return _widget(at.radio, "น้ำหนักที่ใช้ backtest")
+
+    def test_optimal_weights_are_the_default(self, app):
+        at = _calculate(app)
+        assert self._source_radio(at).value == "Max Sharpe"
+
+    def test_custom_is_offered_once_the_sliders_have_rendered(self, app):
+        at = _calculate(app)
+        assert "Custom (จาก Tab 2)" in self._source_radio(at).options
+
+    @pytest.mark.parametrize("source", ["Max Sharpe", "Min Volatility", "Custom (จาก Tab 2)"])
+    def test_every_source_runs(self, app, source):
+        at = _calculate(app)
+        self._source_radio(at).set_value(source).run()
+        assert not at.exception, at.exception
+        assert at.session_state["nav_view"]["source"] == source
+
+    def test_optimal_source_is_not_rounded_to_slider_steps(self, app):
+        at = _calculate(app)
+        self._source_radio(at).set_value("Max Sharpe").run()
+        used = at.session_state["nav_view"]["weights"]
+        optimal = at.session_state["cleaned"]
+        for asset, weight in optimal.items():
+            assert used[asset] == pytest.approx(weight)
+        # A slider-rounded copy would land on whole percents.
+        assert any(
+            abs(w * 100 - round(w * 100)) > 1e-6 for w in used.values() if w > 0
+        ), "expected at least one non-integer percent to prove no rounding"
+
+    def test_switching_source_changes_the_weights_actually_used(self, app):
+        at = _calculate(app)
+        self._source_radio(at).set_value("Max Sharpe").run()
+        sharpe_weights = dict(at.session_state["nav_view"]["weights"])
+        self._source_radio(at).set_value("Min Volatility").run()
+        assert at.session_state["nav_view"]["weights"] != sharpe_weights
+
+
+class TestNavTabAgreesWithBacktest:
+    def test_both_tabs_share_one_series(self, app):
+        at = _calculate(app)
+        view = at.session_state["nav_view"]
+        assert not view["returns"].empty
+        assert view["start"] is not None
+
+    def test_walk_forward_reaches_the_nav_tab(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        at = _calculate(app)
+        assert not at.error
+        view = at.session_state["nav_view"]
+        assert view["is_walk_forward"] is True
+        # The NAV line must be the walk-forward series, not a constant
+        # weight simulation standing in for it.
+        assert len(view["returns"]) > 0
+        assert view["source"] in ("Max Sharpe", "Min Volatility")
+
+    def test_walk_forward_hides_the_custom_option(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        at = _calculate(app)
+        labels = [r.label for r in at.radio]
+        assert "น้ำหนักที่ใช้ backtest" not in labels
+        assert _widget(at.radio, "วัตถุประสงค์").options == ["Max Sharpe", "Min Volatility"]
+
+    def test_cash_sleeve_reaches_the_nav_tab(self, app):
+        _widget(app.slider, "เงินสด").set_value(25)
+        at = _calculate(app)
+        view = at.session_state["nav_view"]
+        assert view["weights"][metrics.CASH_SYMBOL] == pytest.approx(0.25)
