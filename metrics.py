@@ -4,6 +4,8 @@ These live outside app.py so the formulas can be unit tested directly
 instead of only through the Streamlit UI.
 """
 
+from collections import namedtuple
+
 import numpy as np
 import pandas as pd
 
@@ -85,3 +87,79 @@ def month_labels(month_numbers):
     when the backtest does not happen to start in January.
     """
     return [_MONTH_ABBR[int(m)] for m in month_numbers]
+
+
+MIN_ANNUAL_OBSERVATIONS = 52
+ANNUAL_LOOKBACK_WEEKS = 52
+
+
+PortfolioReturns = namedtuple("PortfolioReturns", "portfolio assets held start")
+
+
+def first_valid_dates(prices):
+    """First date each column actually has a price."""
+    return prices.apply(lambda col: col.first_valid_index())
+
+
+def common_start(prices):
+    """First date on which every column has a price, or None.
+
+    A portfolio cannot be backtested before all of its holdings exist.
+    """
+    if prices.empty or prices.shape[1] == 0:
+        return None
+    complete = prices.notna().all(axis=1)
+    if not complete.any():
+        return None
+    return complete.idxmax()
+
+
+def portfolio_daily_returns(prices, weights):
+    """Daily returns of a constant-weight portfolio.
+
+    Starts only once every held asset has a real price. Filling missing
+    pre-inception prices with a zero return instead keeps the asset's
+    full weight in the portfolio while contributing nothing, which
+    silently dilutes the result towards cash.
+    """
+    empty = pd.Series(dtype=float)
+    held = [c for c in prices.columns if float(weights.get(c, 0.0) or 0.0) > 0]
+    if not held:
+        return PortfolioReturns(empty, pd.DataFrame(), [], None)
+
+    sub = prices[held]
+    start = common_start(sub)
+    if start is None:
+        return PortfolioReturns(empty, pd.DataFrame(), held, None)
+
+    sub = sub.loc[start:].ffill()
+    w = np.array([float(weights[c]) for c in held], dtype=float)
+    total = w.sum()
+    if total > 0:
+        w = w / total
+
+    asset_returns = sub.pct_change().fillna(0.0)
+    portfolio = asset_returns.dot(pd.Series(w, index=held))
+    return PortfolioReturns(portfolio, asset_returns, held, start)
+
+
+def annual_return_estimates(weekly, lookback=ANNUAL_LOOKBACK_WEEKS):
+    """Mean trailing annual return per asset, plus how many observations
+    each estimate rests on.
+
+    An asset with barely over a year of history yields only a handful of
+    overlapping windows, so its mean is nearly meaningless -- yet it is
+    not NaN, so a NaN-only guard lets it reach the optimiser, which then
+    chases the noise.
+    """
+    changes = weekly.pct_change(lookback)
+    return changes.mean(), changes.notna().sum()
+
+
+def unreliable_assets(observation_counts, minimum=MIN_ANNUAL_OBSERVATIONS):
+    """Assets whose expected return rests on too few observations."""
+    return {
+        asset: int(count)
+        for asset, count in observation_counts.items()
+        if int(count) < minimum
+    }

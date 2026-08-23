@@ -13,6 +13,31 @@ import metrics
 import thai_mf
 
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
+
+# Random portfolios are sampled at n_samples but only PLOT_SAMPLE of
+# them are drawn, which is what keeps the frontier tab responsive.
+PLOT_SAMPLE = 6_000
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_yf_close(symbols, start, end):
+    """Adjusted closes from Yahoo, cached so that re-running with the
+    same symbols and dates does not re-download."""
+    df = yf.download(
+        tickers=list(symbols),
+        start=start,
+        end=end,
+        interval="1d",
+        auto_adjust=True,
+    )
+    if df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        close = df["Close"].ffill()
+    else:
+        close = df[["Close"]].rename(columns={"Close": symbols[0]}).ffill()
+    close = close.dropna(how="all")
+    return close.dropna(axis=1, how="all")
 st.title("Portfolio Optimizer & Backtesting")
 
 # ─── Sidebar: Inputs ───
@@ -77,6 +102,17 @@ with st.sidebar:
 # ─── Parse symbols ───
 stock_list = [s.strip().upper() for s in symbols_input.split(",") if s.strip()]
 
+# Identifies the inputs a displayed result was produced from, so edits
+# made without pressing Calculate can be flagged as stale.
+input_signature = (
+    tuple(stock_list),
+    str(start_date),
+    str(end_date),
+    float(risk_free_rate),
+    float(total_cash),
+    tuple(sorted(f.name for f in uploaded_price_files)),
+)
+
 if run_btn:
     if start_date >= end_date:
         st.error(
@@ -128,21 +164,9 @@ if run_btn:
 
     with st.spinner("Downloading data..."):
         if yf_symbols:
-            df = yf.download(
-                tickers=yf_symbols,
-                start=str(start_date),
-                end=str(end_date),
-                interval="1d",
-                auto_adjust=True,
+            data_close = download_yf_close(
+                tuple(yf_symbols), str(start_date), str(end_date)
             )
-            if df.empty:
-                data_close = pd.DataFrame()
-            elif isinstance(df.columns, pd.MultiIndex):
-                data_close = df["Close"].ffill()
-            else:
-                data_close = df[["Close"]].rename(columns={"Close": yf_symbols[0]}).ffill()
-            data_close.dropna(how="all", inplace=True)
-            data_close.dropna(axis=1, how="all", inplace=True)
         else:
             data_close = pd.DataFrame()
 
@@ -219,23 +243,27 @@ if run_btn:
     # ─── Calculations ───
     with st.spinner("Computing efficient frontier..."):
         weekly = data_close.resample("W-FRI").last()
-        ar = weekly.pct_change(52).mean()
+        ar, ar_observations = metrics.annual_return_estimates(weekly)
 
-        # An asset with less than a year of real history in the selected
-        # date range has no valid 52-week trailing return, so ar is NaN
-        # for it. Passing NaN into the optimizer breaks the solver, so
-        # exclude those assets here (rather than silently backfilling a
-        # fake flat price for them) and tell the user why.
-        insufficient_history = list(ar[ar.isna()].index)
-        if insufficient_history:
-            st.warning(
-                f"⚠️ ข้อมูลไม่พอสำหรับคำนวณ (ต้องมีข้อมูลอย่างน้อย 1 ปีในช่วงวันที่ที่เลือก): "
-                f"**{', '.join(insufficient_history)}** — ไม่รวมในการคำนวณพอร์ต "
-                "(ลองขยาย End Date ให้ไกลขึ้น หรือปรับ Start Date ให้อยู่หลังวันที่กองทุนจดทะเบียน)"
+        # An expected return built from a handful of overlapping 52-week
+        # windows is noise, and the optimiser will happily chase it into
+        # a near-100% allocation. Require a real sample, not merely a
+        # non-NaN value, and say how short each excluded asset was.
+        insufficient = metrics.unreliable_assets(ar_observations)
+        if insufficient:
+            detail = ", ".join(
+                f"**{sym}** ({count} สัปดาห์)" for sym, count in insufficient.items()
             )
-            data_close = data_close.drop(columns=insufficient_history)
-            weekly = weekly.drop(columns=insufficient_history)
-            ar = ar.drop(index=insufficient_history)
+            st.warning(
+                f"⚠️ ข้อมูลไม่พอสำหรับประมาณผลตอบแทนที่เชื่อถือได้ — ต้องมีอย่างน้อย "
+                f"{metrics.MIN_ANNUAL_OBSERVATIONS} สัปดาห์ (ประมาณ 2 ปี) ในช่วงวันที่ที่เลือก: "
+                f"{detail} — ไม่รวมในการคำนวณพอร์ต "
+                "(ลองขยายช่วงวันที่ หรือปรับ Start Date ให้อยู่หลังวันที่กองทุนจดทะเบียน)"
+            )
+            drop = list(insufficient)
+            data_close = data_close.drop(columns=drop)
+            weekly = weekly.drop(columns=drop)
+            ar = ar.drop(index=drop)
 
         if len(ar) < 2:
             st.error(
@@ -253,6 +281,12 @@ if run_btn:
         rets = w.dot(ar)
         stds = np.sqrt((w.T * (covr.values @ w.T)).sum(axis=0))
         sharpes = (rets - risk_free_rate) / stds
+
+        # Plot a subsample: 200k markers is what makes this tab crawl,
+        # and the cloud looks identical at a few thousand points.
+        plot_n = min(PLOT_SAMPLE, n_samples)
+        pick = rng.choice(n_samples, plot_n, replace=False)
+        stds, rets, sharpes = stds[pick], rets[pick], sharpes[pick]
 
         # Max Sharpe weights
         ef = EfficientFrontier(ar, covr)
@@ -300,6 +334,7 @@ if run_btn:
     st.session_state["total_cash"] = total_cash
     st.session_state["risk_free_rate"] = risk_free_rate
     st.session_state["calculated"] = True
+    st.session_state["input_signature"] = input_signature
 
 # ─── Display results ───
 if st.session_state.get("calculated"):
@@ -315,6 +350,12 @@ if st.session_state.get("calculated"):
     stock_list = st.session_state["stock_list"]
     total_cash = st.session_state["total_cash"]
     risk_free_rate = st.session_state["risk_free_rate"]
+
+    if st.session_state.get("input_signature") != input_signature:
+        st.warning(
+            "⚠️ การตั้งค่าในแถบด้านซ้ายถูกแก้ไขหลังจากคำนวณครั้งล่าสุด — "
+            "ผลลัพธ์ด้านล่างยังเป็นของค่าเดิม กด **Calculate** เพื่อคำนวณใหม่"
+        )
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "Efficient Frontier",
@@ -437,16 +478,30 @@ if st.session_state.get("calculated"):
     with tab3:
         # Use custom weights if available, else optimal
         active_w = st.session_state.get("active_weights", cleaned)
-        weights_s = pd.Series(active_w)
 
         st.info(f"Backtesting with weights: {', '.join(f'{k}={v:.1%}' for k, v in active_w.items())}")
 
-        daily_returns = data_close.pct_change().fillna(0)
-        port_daily = daily_returns.dot(weights_s.reindex(daily_returns.columns, fill_value=0))
+        result = metrics.portfolio_daily_returns(data_close, active_w)
+        port_daily = result.portfolio
+        daily_returns = result.assets
 
-        # Remove leading zeros
-        first_valid = port_daily.ne(0).idxmax()
-        port_daily = port_daily.loc[first_valid:]
+        if port_daily.empty:
+            st.error(
+                "⚠️ ช่วงเวลาของสินทรัพย์ในพอร์ตไม่ทับซ้อนกันเลย จึง backtest ไม่ได้ "
+                "— ลองเอาสินทรัพย์ที่เพิ่งเริ่มมีข้อมูลออก หรือขยายช่วงวันที่"
+            )
+            st.stop()
+
+        # The backtest can only begin once every holding actually exists.
+        requested_start = pd.Timestamp(data_close.index[0])
+        if result.start > requested_start:
+            firsts = metrics.first_valid_dates(data_close[result.held])
+            limiter = firsts.idxmax()
+            st.warning(
+                f"⚠️ Backtest เริ่มจริงที่ **{result.start.date()}** ไม่ใช่ "
+                f"{requested_start.date()} เพราะ **{limiter}** เพิ่งมีข้อมูลวันแรกตอนนั้น "
+                "— พอร์ตจะถือครบทุกตัวได้ก็ต่อเมื่อทุกตัวมีอยู่จริงแล้ว"
+            )
 
         cumulative = (1 + port_daily).cumprod()
         # Derive both scalings from the index itself: merging a Thai fund
@@ -574,10 +629,16 @@ if st.session_state.get("calculated"):
     # ════════════════════════════════════════
     with tab4:
         active_w = st.session_state.get("active_weights", cleaned)
-        weights_s = pd.Series(active_w)
 
-        daily_returns = data_close.pct_change().fillna(0)
-        port_daily = daily_returns.dot(weights_s.reindex(daily_returns.columns, fill_value=0))
+        # Share the backtest's exact series so both tabs start on the
+        # same date and report the same growth.
+        result = metrics.portfolio_daily_returns(data_close, active_w)
+        port_daily = result.portfolio
+        daily_returns = result.assets
+
+        if port_daily.empty:
+            st.error("⚠️ ช่วงเวลาของสินทรัพย์ในพอร์ตไม่ทับซ้อนกันเลย จึงคำนวณ NAV ไม่ได้")
+            st.stop()
 
         nav_total = total_cash * (1 + port_daily).cumprod()
 
@@ -588,16 +649,16 @@ if st.session_state.get("calculated"):
             line=dict(color="#4CAF50", width=2),
         ))
 
-        # Each stock NAV (rebalanced)
-        for sym in sorted(active_w.keys()):
-            if active_w[sym] > 0 and sym in daily_returns.columns:
-                stock_nav = total_cash * active_w[sym] * (1 + daily_returns[sym]).cumprod()
-                fig_nav.add_trace(go.Scatter(
-                    x=stock_nav.index, y=stock_nav.values,
-                    mode="lines", name=sym,
-                    line=dict(width=1),
-                    opacity=0.7,
-                ))
+        # Each sleeve held on its own, for comparison against the
+        # rebalanced portfolio line above.
+        for sym in sorted(result.held):
+            stock_nav = total_cash * active_w[sym] * (1 + daily_returns[sym]).cumprod()
+            fig_nav.add_trace(go.Scatter(
+                x=stock_nav.index, y=stock_nav.values,
+                mode="lines", name=f"{sym} (ถือเดี่ยว)",
+                line=dict(width=1),
+                opacity=0.7,
+            ))
 
         fig_nav.update_layout(
             title=f"NAV (Starting ${total_cash:,.0f})",
@@ -606,6 +667,12 @@ if st.session_state.get("calculated"):
             height=600,
         )
         st.plotly_chart(fig_nav, use_container_width=True)
+
+        st.caption(
+            f"เริ่มนับตั้งแต่ **{result.start.date()}** ซึ่งเป็นวันแรกที่ทุกตัวในพอร์ตมีข้อมูลครบ "
+            "(ตรงกับแท็บ Backtesting) — เส้น Portfolio NAV ปรับสัดส่วนกลับทุกวันทำการ "
+            "ส่วนเส้นรายตัวคือถือเดี่ยวไม่ปรับสัดส่วน จึงบวกกันแล้วไม่เท่ากับเส้นรวม"
+        )
 
         st.metric("Final NAV", f"${nav_total.iloc[-1]:,.0f}")
         st.metric("Total P&L", f"${nav_total.iloc[-1] - total_cash:,.0f}")
