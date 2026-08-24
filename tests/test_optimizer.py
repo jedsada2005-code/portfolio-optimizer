@@ -538,3 +538,139 @@ class TestDegenerateProblems:
             index=idx,
         )
         assert optimizer.fit_weights(prices, 0.02, "Max Sharpe", 1.0, 0.2) is None
+
+
+class TestObjectiveCatalogue:
+    def test_the_catalogue_splits_into_two_families(self):
+        assert optimizer.OBJECTIVES == optimizer.MPT_OBJECTIVES + optimizer.ALTERNATIVE_OBJECTIVES
+        assert "Max Sharpe" in optimizer.MPT_OBJECTIVES
+        assert optimizer.HRP_OBJECTIVE in optimizer.ALTERNATIVE_OBJECTIVES
+
+    def test_objectives_needing_a_target_are_declared(self):
+        assert optimizer.TARGET_VOLATILITY in optimizer.NEEDS_TARGET
+        assert optimizer.TARGET_RETURN in optimizer.NEEDS_TARGET
+        assert "Max Sharpe" not in optimizer.NEEDS_TARGET
+
+    def test_objectives_needing_return_history_are_declared(self):
+        for name in (optimizer.HRP_OBJECTIVE, optimizer.MIN_CVAR, optimizer.MIN_SEMIVARIANCE):
+            assert name in optimizer.NEEDS_HISTORY
+
+
+class TestTargetObjectives:
+    @pytest.fixture
+    def inputs(self):
+        weekly = _weekly_prices()
+        expected = optimizer.estimate_returns(weekly, optimizer.DEFAULT_RETURN_METHOD)
+        cov = optimizer.shrink_covariance(weekly.pct_change().cov() * 52, 0.2)
+        return expected, cov, weekly
+
+    def test_a_volatility_target_is_met(self, inputs):
+        expected, cov, _ = inputs
+        low, _, _ = optimizer.achievable_range(expected, cov, 1.0, 0.0)
+        target = low + 0.03
+        w = optimizer.optimize_weights(
+            expected, cov, optimizer.TARGET_VOLATILITY, 0.02, 1.0, target=target
+        )
+        _, vol, _ = optimizer.portfolio_performance(expected, cov, w, 0.02)
+        assert vol == pytest.approx(target, abs=1e-3)
+
+    def test_a_return_target_is_met(self, inputs):
+        expected, cov, _ = inputs
+        low, min_ret, max_ret = optimizer.achievable_range(expected, cov, 1.0, 0.0)
+        target = (min_ret + max_ret) / 2
+        w = optimizer.optimize_weights(
+            expected, cov, optimizer.TARGET_RETURN, 0.02, 1.0, target=target
+        )
+        ret, _, _ = optimizer.portfolio_performance(expected, cov, w, 0.02)
+        assert ret == pytest.approx(target, abs=1e-3)
+
+    def test_an_impossible_volatility_target_names_the_floor(self, inputs):
+        expected, cov, _ = inputs
+        low, _, _ = optimizer.achievable_range(expected, cov, 1.0, 0.0)
+        with pytest.raises(optimizer.SOLVER_ERRORS, match="ต่ำสุด"):
+            optimizer.optimize_weights(
+                expected, cov, optimizer.TARGET_VOLATILITY, 0.02, 1.0, target=low / 2
+            )
+
+    def test_an_impossible_return_target_names_the_ceiling(self, inputs):
+        expected, cov, _ = inputs
+        _, _, max_ret = optimizer.achievable_range(expected, cov, 1.0, 0.0)
+        with pytest.raises(optimizer.SOLVER_ERRORS, match="สูงสุด"):
+            optimizer.optimize_weights(
+                expected, cov, optimizer.TARGET_RETURN, 0.02, 1.0, target=max_ret * 2
+            )
+
+    def test_a_missing_target_is_rejected(self, inputs):
+        expected, cov, _ = inputs
+        with pytest.raises(ValueError, match="เป้าหมาย"):
+            optimizer.optimize_weights(expected, cov, optimizer.TARGET_VOLATILITY, 0.02, 1.0)
+
+    def test_targets_respect_the_weight_bounds(self, inputs):
+        expected, cov, _ = inputs
+        low, _, _ = optimizer.achievable_range(expected, cov, 0.5, 0.1)
+        w = optimizer.optimize_weights(
+            expected, cov, optimizer.TARGET_VOLATILITY, 0.02, 0.5, 0.1, target=low + 0.02
+        )
+        assert min(w.values()) >= 0.1 - 1e-6
+        assert max(w.values()) <= 0.5 + 1e-6
+
+    def test_the_achievable_range_is_ordered(self, inputs):
+        expected, cov, _ = inputs
+        min_vol, min_ret, max_ret = optimizer.achievable_range(expected, cov, 1.0, 0.0)
+        assert min_vol > 0
+        assert min_ret < max_ret
+
+
+class TestDownsideObjectives:
+    @pytest.fixture
+    def inputs(self):
+        weekly = _weekly_prices()
+        expected = optimizer.estimate_returns(weekly, optimizer.DEFAULT_RETURN_METHOD)
+        cov = optimizer.shrink_covariance(weekly.pct_change().cov() * 52, 0.2)
+        return expected, cov, weekly
+
+    @pytest.mark.parametrize("objective", ["Min CVaR", "Min Semivariance"])
+    def test_they_solve_and_fully_allocate(self, inputs, objective):
+        expected, cov, weekly = inputs
+        w = optimizer.optimize_weights(expected, cov, objective, 0.02, 1.0, weekly=weekly)
+        assert sum(w.values()) == pytest.approx(1.0, abs=1e-6)
+
+    @pytest.mark.parametrize("objective", ["Min CVaR", "Min Semivariance"])
+    def test_they_honour_the_weight_bounds(self, inputs, objective):
+        expected, cov, weekly = inputs
+        w = optimizer.optimize_weights(
+            expected, cov, objective, 0.02, 0.4, 0.1, weekly=weekly
+        )
+        assert min(w.values()) >= 0.1 - 1e-6
+        assert max(w.values()) <= 0.4 + 1e-6
+
+    @pytest.mark.parametrize("objective", ["Min CVaR", "Min Semivariance"])
+    def test_they_need_the_return_history(self, inputs, objective):
+        expected, cov, _ = inputs
+        with pytest.raises(ValueError):
+            optimizer.optimize_weights(expected, cov, objective, 0.02, 1.0)
+
+    def test_cvar_targets_the_tail_not_the_variance(self, inputs):
+        expected, cov, weekly = inputs
+        cvar = optimizer.optimize_weights(
+            expected, cov, "Min CVaR", 0.02, 1.0, weekly=weekly
+        )
+        minvol = optimizer.optimize_weights(expected, cov, "Min Volatility", 0.02, 1.0)
+        # Different risk definitions should not land on the same answer.
+        assert cvar != minvol
+
+
+class TestDownsideSolverBackend:
+    def test_the_backend_is_named_and_available(self):
+        import cvxpy
+        assert optimizer.DOWNSIDE_SOLVER in cvxpy.installed_solvers()
+
+    def test_tight_bounds_no_longer_hit_the_iteration_limit(self):
+        weekly = _weekly_prices()
+        expected = optimizer.estimate_returns(weekly, optimizer.DEFAULT_RETURN_METHOD)
+        cov = optimizer.shrink_covariance(weekly.pct_change().cov() * 52, 0.2)
+        w = optimizer.optimize_weights(
+            expected, cov, optimizer.MIN_SEMIVARIANCE, 0.02, 0.4, 0.1, weekly=weekly
+        )
+        assert min(w.values()) >= 0.1 - 1e-6
+        assert max(w.values()) <= 0.4 + 1e-6

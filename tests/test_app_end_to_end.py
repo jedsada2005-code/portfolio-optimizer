@@ -186,7 +186,7 @@ class TestWeightSourceSelection:
     """
 
     def _source_radio(self, at):
-        return _widget(at.radio, "น้ำหนักที่ใช้ backtest")
+        return _widget(at.selectbox, "น้ำหนักที่ใช้ backtest")
 
     def test_optimal_weights_are_the_default(self, app):
         at = _calculate(app)
@@ -244,11 +244,10 @@ class TestNavTabAgreesWithBacktest:
     def test_walk_forward_hides_the_custom_option(self, app):
         app.radio[0].set_value("Walk-Forward")
         at = _calculate(app)
-        labels = [r.label for r in at.radio]
+        labels = [w.label for w in at.selectbox]
         assert "น้ำหนักที่ใช้ backtest" not in labels
-        assert _widget(at.radio, "วัตถุประสงค์").options == [
-            "Max Sharpe", "Min Volatility", "HRP (Risk Parity)"
-        ]
+        import optimizer
+        assert _widget(at.selectbox, "วัตถุประสงค์").options == optimizer.OBJECTIVES
 
     def test_cash_sleeve_reaches_the_nav_tab(self, app):
         _widget(app.slider, "เงินสด").set_value(25)
@@ -334,7 +333,7 @@ class TestCustomWeightEditing:
     def test_edited_weights_reach_the_backtest(self, app):
         at = _calculate(app)
         _widget(at.button, "เท่ากันทุกตัว").click().run()
-        _widget(at.radio, "น้ำหนักที่ใช้ backtest").set_value("Custom (จากแท็บน้ำหนักพอร์ต)").run()
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value("Custom (จากแท็บน้ำหนักพอร์ต)").run()
         assert not at.exception, at.exception
         used = at.session_state["nav_view"]["weights"]
         for symbol in ["SPY", "QQQ", "GLD", "TLT"]:
@@ -344,7 +343,7 @@ class TestCustomWeightEditing:
         at = _calculate(app)
         for symbol in ["SPY", "QQQ", "GLD", "TLT"]:
             _widget(at.number_input, symbol).set_value(10.0)
-        _widget(at.radio, "น้ำหนักที่ใช้ backtest").set_value("Custom (จากแท็บน้ำหนักพอร์ต)").run()
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value("Custom (จากแท็บน้ำหนักพอร์ต)").run()
         assert not at.error
         used = at.session_state["nav_view"]["weights"]
         assert sum(used.values()) == pytest.approx(1.0)
@@ -466,7 +465,7 @@ class TestReturnMethodAndHRP:
 
     def test_hrp_is_selectable_as_a_backtest_source(self, app):
         at = _calculate(app)
-        _widget(at.radio, "น้ำหนักที่ใช้ backtest").set_value("HRP (Risk Parity)").run()
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value("HRP (Risk Parity)").run()
         assert not at.exception, at.exception
         assert at.session_state["nav_view"]["source"] == "HRP (Risk Parity)"
         used = {k: v for k, v in at.session_state["nav_view"]["weights"].items()}
@@ -482,7 +481,7 @@ class TestReturnMethodAndHRP:
     def test_walk_forward_can_refit_with_hrp(self, app):
         app.radio[0].set_value("Walk-Forward")
         at = _calculate(app)
-        _widget(at.radio, "วัตถุประสงค์").set_value("HRP (Risk Parity)").run()
+        _widget(at.selectbox, "วัตถุประสงค์").set_value("HRP (Risk Parity)").run()
         assert not at.exception, at.exception
         assert not at.error
 
@@ -578,7 +577,7 @@ class TestOrderPlan:
 
     def test_the_plan_follows_the_selected_weight_source(self, app):
         at = _calculate(app)
-        _widget(at.radio, "น้ำหนักที่ใช้ backtest").set_value("Min Volatility").run()
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value("Min Volatility").run()
         assert not at.exception, at.exception
         assert at.session_state["nav_view"]["source"] == "Min Volatility"
 
@@ -597,5 +596,82 @@ class TestRollingView:
     def test_a_short_test_window_says_so_instead_of_breaking(self, app):
         app.date_input[0].set_value(pd.Timestamp("2022-01-01").date())
         app.date_input[1].set_value(pd.Timestamp("2023-02-01").date())
+        at = _calculate(app)
+        assert not at.exception, at.exception
+
+
+class TestObjectiveCatalogueInApp:
+    """Seven objectives are solved on every run; the picker chooses
+    among ready answers rather than triggering a solve."""
+
+    def _picker(self, at):
+        return _widget(at.selectbox, "น้ำหนักที่ใช้ backtest")
+
+    def test_all_objectives_are_offered(self, app):
+        import optimizer
+        at = _calculate(app)
+        for name in optimizer.OBJECTIVES:
+            assert name in self._picker(at).options, name
+
+    @pytest.mark.parametrize("objective", [
+        "กำหนดความเสี่ยงเป้าหมาย", "กำหนดผลตอบแทนเป้าหมาย",
+        "Min CVaR", "Min Semivariance",
+    ])
+    def test_each_new_objective_backtests(self, app, objective):
+        at = _calculate(app)
+        self._picker(at).set_value(objective).run()
+        assert not at.exception, at.exception
+        assert at.session_state["nav_view"]["source"] == objective
+        assert sum(at.session_state["nav_view"]["weights"].values()) == pytest.approx(1.0, abs=1e-6)
+
+    def test_a_volatility_target_is_actually_hit(self, app):
+        import optimizer
+        _widget(app.number_input, "ความเสี่ยงเป้าหมาย").set_value(0.14)
+        at = _calculate(app)
+        weights = at.session_state["objective_weights"][optimizer.TARGET_VOLATILITY]
+        _, vol = at.session_state["objective_perf"][optimizer.TARGET_VOLATILITY]
+        assert vol == pytest.approx(0.14, abs=0.005)
+        assert sum(weights.values()) == pytest.approx(1.0, abs=1e-6)
+
+    def test_an_impossible_target_is_reported_not_crashed(self, app):
+        import optimizer
+        _widget(app.number_input, "ความเสี่ยงเป้าหมาย").set_value(0.01)
+        at = _calculate(app)
+        assert not at.exception, at.exception
+        assert optimizer.TARGET_VOLATILITY in at.session_state["objective_errors"]
+        assert optimizer.TARGET_VOLATILITY not in self._picker(at).options
+
+    def test_downside_objectives_respect_the_weight_floor(self, app):
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(10)
+        at = _calculate(app)
+        for name in ("Min CVaR", "Min Semivariance"):
+            weights = at.session_state["objective_weights"][name]
+            assert min(weights.values()) >= 0.10 - 1e-6, name
+
+    def test_targets_are_saved_in_the_url(self, app):
+        _widget(app.number_input, "ความเสี่ยงเป้าหมาย").set_value(0.15)
+        at = _calculate(app)
+        assert _one(at.query_params["tvol"]) == "0.15"
+
+
+class TestWalkForwardUsesEverySetting:
+    """A settings pass-through was silently dropped by a mis-indented
+    edit, so walk-forward kept using the default estimator and history
+    floor while the sidebar said otherwise."""
+
+    def test_the_return_method_reaches_every_refit(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        at = _calculate(app)
+        baseline = [dict(w) for _, w in at.session_state["walk_weight_history"]]
+        assert baseline
+
+        _widget(at.selectbox, "วิธีประมาณผลตอบแทน").set_value("CAPM (อิงความเสี่ยงเทียบตลาด)")
+        at = _calculate(at)
+        changed = [dict(w) for _, w in at.session_state["walk_weight_history"]]
+        assert changed != baseline
+
+    def test_a_strict_history_floor_reaches_walk_forward(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        _widget(app.slider, "ประวัติขั้นต่ำที่ยอมรับ").set_value(6)
         at = _calculate(app)
         assert not at.exception, at.exception

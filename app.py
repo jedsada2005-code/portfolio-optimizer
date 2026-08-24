@@ -21,7 +21,7 @@ PLOT_SAMPLE = 6_000
 
 
 MODES = ["Train / Test Split", "Walk-Forward", "In-sample (ทั้งช่วง)"]
-OBJECTIVES = ["Max Sharpe", "Min Volatility", optimizer.HRP_OBJECTIVE]
+OBJECTIVES = optimizer.OBJECTIVES
 CUSTOM_SOURCE = "Custom (จากแท็บน้ำหนักพอร์ต)"
 DEFAULT_SYMBOLS = "AMZN, META, LLY, SPY, NVDA, GOOGL"
 
@@ -276,6 +276,16 @@ with st.sidebar:
                 "สินทรัพย์เสี่ยงที่เหลือคงสัดส่วนภายในเดิม (two-fund separation)"
             ),
         ) / 100
+        target_volatility = st.number_input(
+            "ความเสี่ยงเป้าหมายต่อปี", min_value=0.01, max_value=1.0,
+            value=qp_number("tvol", 0.12), step=0.01, format="%.2f",
+            help=f"ใช้เมื่อเลือกวิธี “{optimizer.TARGET_VOLATILITY}”",
+        )
+        target_return = st.number_input(
+            "ผลตอบแทนเป้าหมายต่อปี", min_value=-0.5, max_value=2.0,
+            value=qp_number("tret", 0.10), step=0.01, format="%.2f",
+            help=f"ใช้เมื่อเลือกวิธี “{optimizer.TARGET_RETURN}”",
+        )
         min_history_years = st.slider(
             "ประวัติขั้นต่ำที่ยอมรับ (ปี)", 1, 6,
             qp_number("minyrs", metrics.DEFAULT_MIN_HISTORY_YEARS, int),
@@ -375,6 +385,8 @@ input_signature = (
     float(shrinkage),
     return_method,
     int(min_history_years),
+    float(target_volatility),
+    float(target_return),
 )
 
 if run_btn:
@@ -716,13 +728,38 @@ if run_btn:
             mv_ret, mv_vol, risk_free_rate, cash_fraction
         )
 
-        hrp_cleaned = optimizer.hrp_weights(weekly_usable)
-        hrp_ret, hrp_vol, hrp_sharpe = optimizer.portfolio_performance(
-            ar, covr, hrp_cleaned, risk_free_rate
-        )
-        hrp_ret, hrp_vol = metrics.blend_performance(
-            hrp_ret, hrp_vol, risk_free_rate, cash_fraction
-        )
+        # Every objective is solved once here -- the slowest takes
+        # hundredths of a second -- so the weight-source picker can stay
+        # a plain choice among ready answers.
+        objective_weights, objective_errors = {}, {}
+        for name in optimizer.OBJECTIVES:
+            if name == "Max Sharpe":
+                objective_weights[name] = cleaned
+                continue
+            if name == "Min Volatility":
+                objective_weights[name] = mv_cleaned
+                continue
+            try:
+                objective_weights[name] = optimizer.optimize_weights(
+                    ar, covr, name, risk_free_rate, max_weight, min_weight,
+                    weekly=weekly_usable,
+                    target=(
+                        target_volatility if name == optimizer.TARGET_VOLATILITY
+                        else target_return if name == optimizer.TARGET_RETURN
+                        else None
+                    ),
+                )
+            except optimizer.SOLVER_ERRORS as exc:
+                objective_errors[name] = str(exc)
+
+        objective_perf = {
+            name: metrics.blend_performance(
+                *optimizer.portfolio_performance(ar, covr, weights, risk_free_rate)[:2],
+                risk_free_rate, cash_fraction,
+            )
+            for name, weights in objective_weights.items()
+        }
+        hrp_cleaned = objective_weights.get(optimizer.HRP_OBJECTIVE, {})
 
         # Efficient frontier curve, solved directly instead of read back
         # out of a throwaway matplotlib figure.
@@ -758,7 +795,12 @@ if run_btn:
     st.session_state["mv_cleaned"] = mv_cleaned
     st.session_state["mv_perf"] = (mv_ret, mv_vol, mv_sharpe)
     st.session_state["hrp_cleaned"] = hrp_cleaned
-    st.session_state["hrp_perf"] = (hrp_ret, hrp_vol, hrp_sharpe)
+    st.session_state["objective_weights"] = objective_weights
+    st.session_state["objective_errors"] = objective_errors
+    st.session_state["objective_perf"] = objective_perf
+    st.session_state["required_observations"] = required_observations
+    st.session_state["target_volatility"] = target_volatility
+    st.session_state["target_return"] = target_return
     st.session_state["return_method"] = return_method
     st.session_state["weekly_usable"] = weekly_usable
     st.session_state["random"] = (stds, rets, sharpes)
@@ -780,6 +822,7 @@ if run_btn:
         "cost": str(cost_bps), "maxw": str(max_weight), "minw": str(min_weight),
         "cashpct": str(cash_fraction), "retm": return_method,
         "minyrs": str(min_history_years),
+        "tvol": str(target_volatility), "tret": str(target_return),
         "shrink": str(shrinkage),
     })
 
@@ -793,7 +836,12 @@ if st.session_state.get("calculated"):
     mv_cleaned = st.session_state["mv_cleaned"]
     mv_ret, mv_vol, mv_sharpe = st.session_state["mv_perf"]
     hrp_cleaned = st.session_state["hrp_cleaned"]
-    hrp_ret, hrp_vol, hrp_sharpe = st.session_state["hrp_perf"]
+    objective_weights = st.session_state["objective_weights"]
+    objective_errors = st.session_state["objective_errors"]
+    objective_perf = st.session_state["objective_perf"]
+    required_observations = st.session_state["required_observations"]
+    target_volatility = st.session_state["target_volatility"]
+    target_return = st.session_state["target_return"]
     return_method = st.session_state["return_method"]
     weekly_usable = st.session_state["weekly_usable"]
     stds, rets, sharpes = st.session_state["random"]
@@ -855,20 +903,17 @@ if st.session_state.get("calculated"):
     # from the backtest by recomputing its own version.
     custom_w_available = read_custom_weights(sorted(ar.index))
     if backtest_mode == "Walk-Forward":
-        walk_objective = st.radio(
+        walk_objective = st.selectbox(
             "วัตถุประสงค์ที่ใช้คำนวณน้ำหนักใหม่ทุกงวด",
-            OBJECTIVES, horizontal=True,
+            [n for n in OBJECTIVES if n in objective_weights],
         )
         weight_source = walk_objective
-        active_w = {
-            "Max Sharpe": cleaned,
-            "Min Volatility": mv_cleaned,
-            optimizer.HRP_OBJECTIVE: hrp_cleaned,
-        }[walk_objective]
+        active_w = objective_weights[walk_objective]
     else:
-        sources = OBJECTIVES + ([CUSTOM_SOURCE] if custom_w_available else [])
-        weight_source = st.radio(
-            "น้ำหนักที่ใช้ backtest", sources, horizontal=True,
+        sources = [n for n in OBJECTIVES if n in objective_weights]
+        sources += [CUSTOM_SOURCE] if custom_w_available else []
+        weight_source = st.selectbox(
+            "น้ำหนักที่ใช้ backtest", sources,
             help=(
                 "Max Sharpe และ Min Volatility ใช้น้ำหนักที่ optimizer คำนวณแบบเป๊ะๆ "
                 "ส่วน Custom ใช้ค่าจาก slider ในแท็บน้ำหนักพอร์ต ซึ่งปัดเศษทีละ 1%"
@@ -877,14 +922,7 @@ if st.session_state.get("calculated"):
         walk_objective = (
             weight_source if weight_source in OBJECTIVES else "Max Sharpe"
         )
-        if weight_source == "Max Sharpe":
-            active_w = cleaned
-        elif weight_source == "Min Volatility":
-            active_w = mv_cleaned
-        elif weight_source == optimizer.HRP_OBJECTIVE:
-            active_w = hrp_cleaned
-        else:
-            active_w = custom_w_available
+        active_w = objective_weights.get(weight_source, custom_w_available)
     
     if backtest_mode == "Walk-Forward":
         st.info(
@@ -923,7 +961,13 @@ if st.session_state.get("calculated"):
                 test_close, risk_free_rate, walk_objective, max_weight,
                 shrinkage, refit_freq, cost_bps,
                 cash_fraction=cash_fraction, rebalance_freq=rebalance_freq,
-                min_weight=min_weight,
+                min_weight=min_weight, return_method=return_method,
+                min_observations=required_observations,
+                target=(
+                    target_volatility if walk_objective == optimizer.TARGET_VOLATILITY
+                    else target_return if walk_objective == optimizer.TARGET_RETURN
+                    else None
+                ),
             )
         if walk_result.returns.empty:
             st.error(
@@ -1052,6 +1096,9 @@ if st.session_state.get("calculated"):
         "source": weight_source,
         "is_walk_forward": walk_result is not None,
     }
+    st.session_state["walk_weight_history"] = (
+        walk_result.weight_history if walk_result is not None else []
+    )
 
     tab1, tab2, tab3, tab4 = st.tabs([
         "📈 เส้นขอบประสิทธิภาพ",
@@ -1096,12 +1143,23 @@ if st.session_state.get("calculated"):
                         line=dict(width=1, color="black")),
             name=f"Min Volatility (SR={mv_sharpe:.2f})",
         ))
-        fig.add_trace(go.Scatter(
-            x=[hrp_vol], y=[hrp_ret], mode="markers",
-            marker=dict(size=13, color="#7E57C2", symbol="square",
-                        line=dict(width=1, color="black")),
-            name=f"HRP (SR={hrp_sharpe:.2f})",
-        ))
+        markers = {
+            optimizer.TARGET_VOLATILITY: ("#00897B", "triangle-up"),
+            optimizer.TARGET_RETURN: ("#00897B", "triangle-down"),
+            optimizer.HRP_OBJECTIVE: ("#7E57C2", "square"),
+            optimizer.MIN_CVAR: ("#EF6C00", "x"),
+            optimizer.MIN_SEMIVARIANCE: ("#C2185B", "cross"),
+        }
+        for name, (colour, symbol) in markers.items():
+            if name not in objective_perf:
+                continue
+            point_ret, point_vol = objective_perf[name]
+            fig.add_trace(go.Scatter(
+                x=[point_vol], y=[point_ret], mode="markers",
+                marker=dict(size=12, color=colour, symbol=symbol,
+                            line=dict(width=1, color="black")),
+                name=name,
+            ))
         fig.update_layout(
             title="Efficient Frontier with Random Portfolios",
             xaxis_title="Annual Volatility",
@@ -1157,24 +1215,32 @@ if st.session_state.get("calculated"):
         # Display only. Which weights actually get backtested is chosen
         # on the Backtesting tab, so that choice cannot depend on a bare
         # local defined over here.
-        display_strategy = st.radio(
-            "Optimization Strategy",
-            OBJECTIVES,
-            horizontal=True,
+        available = [name for name in OBJECTIVES if name in objective_weights]
+        display_strategy = st.selectbox(
+            "วิธีจัดพอร์ตที่ต้องการดู", available,
+            help=(
+                "สี่วิธีแรกอยู่บนเส้น efficient frontier แบบคลาสสิก "
+                "สามวิธีหลังใช้นิยามความเสี่ยงคนละแบบ หรือไม่ใช้ผลตอบแทนคาดหวังเลย"
+            ),
         )
+        if objective_errors:
+            st.caption(
+                "⚠️ วิธีที่แก้ไม่ได้ในรอบนี้: "
+                + " · ".join(f"**{k}** — {v}" for k, v in objective_errors.items())
+            )
 
-        if display_strategy == "Max Sharpe":
-            sel_weights = cleaned
-            sel_ret, sel_vol, sel_sharpe = opt_ret, opt_vol, opt_sharpe
-        elif display_strategy == "Min Volatility":
-            sel_weights = mv_cleaned
-            sel_ret, sel_vol, sel_sharpe = mv_ret, mv_vol, mv_sharpe
-        else:
-            sel_weights = hrp_cleaned
-            sel_ret, sel_vol, sel_sharpe = hrp_ret, hrp_vol, hrp_sharpe
+        sel_weights = objective_weights[display_strategy]
+        sel_ret, sel_vol = objective_perf[display_strategy]
+        sel_sharpe = (sel_ret - risk_free_rate) / sel_vol if sel_vol > 0 else 0.0
+        if display_strategy == optimizer.HRP_OBJECTIVE:
             st.caption(
                 "HRP จัดสรรจากโครงสร้างความเสี่ยงอย่างเดียว ไม่ใช้ผลตอบแทนคาดหวังเลย "
                 "จึงไม่ได้รับผลจากวิธีประมาณผลตอบแทน และไม่อยู่ใต้เพดาน/ขั้นต่ำน้ำหนัก"
+            )
+        elif display_strategy in (optimizer.MIN_CVAR, optimizer.MIN_SEMIVARIANCE):
+            st.caption(
+                "วิธีนี้ลดความเสี่ยงขาลงโดยตรง (ไม่ใช่ variance ซึ่งลงโทษการขึ้นแรงเท่ากับลงแรง) "
+                "จุดที่ได้จึงอยู่ใต้เส้น frontier บนแกนความผันผวน ซึ่งเป็นเรื่องปกติ"
             )
 
         st.subheader(f"{display_strategy} Optimal Weights")
@@ -1361,9 +1427,10 @@ if st.session_state.get("calculated"):
                 "สินทรัพย์": assets,
                 "ที่กรอก (%)": [f"{st.session_state[f'cw_{a}']:.1f}" for a in assets],
                 "หลัง normalize": [f"{custom_w_norm[a]:.1%}" for a in assets],
-                "Max Sharpe": [f"{cleaned.get(a, 0.0):.1%}" for a in assets],
-                "Min Volatility": [f"{mv_cleaned.get(a, 0.0):.1%}" for a in assets],
-                "HRP": [f"{hrp_cleaned.get(a, 0.0):.1%}" for a in assets],
+                **{
+                    name: [f"{weights.get(a, 0.0):.1%}" for a in assets]
+                    for name, weights in objective_weights.items()
+                },
             }),
             use_container_width=True, hide_index=True,
         )

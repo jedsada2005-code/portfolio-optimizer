@@ -8,8 +8,16 @@ from collections import namedtuple
 
 import numpy as np
 import pandas as pd
-from pypfopt import EfficientFrontier, HRPOpt, expected_returns as pypfopt_returns
+from pypfopt import (
+    EfficientCVaR,
+    EfficientFrontier,
+    EfficientSemivariance,
+    HRPOpt,
+    expected_returns as pypfopt_returns,
+)
 from pypfopt.exceptions import OptimizationError
+
+import cvxpy
 
 try:  # cvxpy raises this straight through pypfopt on a degenerate problem
     from cvxpy.error import SolverError
@@ -40,7 +48,23 @@ RETURN_METHODS = {
 }
 DEFAULT_RETURN_METHOD = "ค่าเฉลี่ยผลตอบแทน 1 ปี (ทับซ้อน)"
 
+# Two families. The first works on the mean-variance frontier and
+# answers "given this much risk"; the second changes what risk means, or
+# stops estimating returns altogether.
+TARGET_VOLATILITY = "กำหนดความเสี่ยงเป้าหมาย"
+TARGET_RETURN = "กำหนดผลตอบแทนเป้าหมาย"
 HRP_OBJECTIVE = "HRP (Risk Parity)"
+MIN_CVAR = "Min CVaR"
+MIN_SEMIVARIANCE = "Min Semivariance"
+
+MPT_OBJECTIVES = ["Max Sharpe", "Min Volatility", TARGET_VOLATILITY, TARGET_RETURN]
+ALTERNATIVE_OBJECTIVES = [HRP_OBJECTIVE, MIN_CVAR, MIN_SEMIVARIANCE]
+OBJECTIVES = MPT_OBJECTIVES + ALTERNATIVE_OBJECTIVES
+
+DOWNSIDE_SOLVER = "CLARABEL"
+
+NEEDS_TARGET = {TARGET_VOLATILITY, TARGET_RETURN}
+NEEDS_HISTORY = {HRP_OBJECTIVE, MIN_CVAR, MIN_SEMIVARIANCE}
 
 
 def estimate_returns(weekly_prices, method):
@@ -191,24 +215,87 @@ def _frontier(expected_returns, cov, max_weight, min_weight=0.0):
     )
 
 
+def achievable_range(expected_returns, cov, max_weight=1.0, min_weight=0.0):
+    """(lowest volatility, its return, highest return) under the bounds.
+
+    Used to tell someone asking for an impossible target what they could
+    have asked for instead.
+    """
+    ef = _frontier(expected_returns, cov, max_weight, min_weight)
+    ef.min_volatility()
+    min_return, min_volatility, _ = ef.portfolio_performance()
+    return min_volatility, min_return, max_achievable_return(
+        expected_returns, max_weight, min_weight
+    )
+
+
+def _downside_optimizer(objective, expected_returns, weekly, max_weight, min_weight):
+    returns = weekly.pct_change().dropna(how="all")
+    bounds = (min_weight, max_weight)
+    # These build one variable per observation, which the default OSQP
+    # backend abandons at its iteration limit once weight bounds tighten.
+    # CLARABEL solves the same problems in hundredths of a second.
+    backend = DOWNSIDE_SOLVER if DOWNSIDE_SOLVER in cvxpy.installed_solvers() else None
+    options = {"solver": backend} if backend else {}
+    if objective == MIN_CVAR:
+        solver = EfficientCVaR(expected_returns, returns, weight_bounds=bounds, **options)
+        solver.min_cvar()
+    else:
+        solver = EfficientSemivariance(
+            expected_returns, returns, frequency=WEEKS_PER_YEAR,
+            weight_bounds=bounds, **options,
+        )
+        solver.min_semivariance()
+    weights = dict(solver.clean_weights())
+    total = sum(weights.values())
+    return {a: w / total for a, w in weights.items()} if total > 0 else weights
+
+
 def optimize_weights(expected_returns, cov, objective, risk_free_rate,
-                     max_weight=1.0, min_weight=0.0, weekly=None):
+                     max_weight=1.0, min_weight=0.0, weekly=None, target=None):
     """Solve for one objective, raising ValueError with a readable message."""
+    if objective in NEEDS_HISTORY and weekly is None:
+        raise ValueError(f"{objective} ต้องใช้ประวัติผลตอบแทน ไม่ใช่แค่ค่าคาดหวัง")
     if objective == HRP_OBJECTIVE:
-        if weekly is None:
-            raise ValueError("HRP ต้องใช้ประวัติผลตอบแทน ไม่ใช่แค่ค่าคาดหวัง")
         return hrp_weights(weekly)
+
     validate_bounds(len(expected_returns), max_weight, min_weight)
+    if objective in (MIN_CVAR, MIN_SEMIVARIANCE):
+        return _downside_optimizer(
+            objective, expected_returns, weekly, max_weight, min_weight
+        )
+
+    if objective in NEEDS_TARGET and target is None:
+        raise ValueError(f"{objective} ต้องระบุค่าเป้าหมาย")
+
     ef = _frontier(expected_returns, cov, max_weight, min_weight)
     try:
         if objective == "Min Volatility":
             ef.min_volatility()
+        elif objective == TARGET_VOLATILITY:
+            ef.efficient_risk(target)
+        elif objective == TARGET_RETURN:
+            ef.efficient_return(target)
         else:
             ef.max_sharpe(risk_free_rate=risk_free_rate)
-    except SolverError as exc:
-        raise OptimizationError(
-            "solver แก้ปัญหานี้ไม่ได้ — ข้อมูลอาจสั้นเกินไปจนเมทริกซ์ความแปรปรวนร่วมผิดรูป "
-            f"({exc})"
+    except SOLVER_ERRORS as exc:
+        if objective in NEEDS_TARGET:
+            low_vol, low_ret, high_ret = achievable_range(
+                expected_returns, cov, max_weight, min_weight
+            )
+            # pypfopt's OptimizationError prepends its own generic
+            # sentence, which would bury the useful half in a tuple.
+            if objective == TARGET_VOLATILITY:
+                raise ValueError(
+                    f"ความเสี่ยงเป้าหมาย {target:.2%} อยู่นอกช่วงที่ทำได้ "
+                    f"— ต่ำสุดที่เป็นไปได้คือ {low_vol:.2%}"
+                ) from exc
+            raise ValueError(
+                f"ผลตอบแทนเป้าหมาย {target:.2%} อยู่นอกช่วงที่ทำได้ "
+                f"— ต่ำสุด {low_ret:.2%} สูงสุด {high_ret:.2%}"
+            ) from exc
+        raise ValueError(
+            "solver แก้ปัญหานี้ไม่ได้ — ข้อมูลอาจสั้นเกินไปจนเมทริกซ์ความแปรปรวนร่วมผิดรูป"
         ) from exc
     # clean_weights rounds to five places, which can leave the set
     # summing to 1.00002 -- harmless to the simulator, which normalises
@@ -302,7 +389,7 @@ WalkForwardResult = namedtuple("WalkForwardResult", "returns weight_history turn
 
 def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage,
                 min_weight=0.0, return_method=DEFAULT_RETURN_METHOD,
-                min_observations=None):
+                min_observations=None, target=None):
     """Expected returns and covariance from a price window, then solve."""
     weekly = prices.resample("W-FRI").last()
     expected, observations = estimate_returns_with_counts(weekly, return_method)
@@ -317,7 +404,7 @@ def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage,
     try:
         return optimize_weights(
             expected, cov, objective, risk_free_rate, max_weight, min_weight,
-            weekly=weekly[usable],
+            weekly=weekly[usable], target=target,
         )
     except SOLVER_ERRORS:
         return None
@@ -327,7 +414,7 @@ def walk_forward(
     prices, risk_free_rate, objective, max_weight, shrinkage,
     refit_freq="Y", cost_bps=0.0, min_train_years=2.0,
     cash_fraction=0.0, rebalance_freq=None, min_weight=0.0,
-    return_method=DEFAULT_RETURN_METHOD, min_observations=None,
+    return_method=DEFAULT_RETURN_METHOD, min_observations=None, target=None,
 ):
     """Re-fit on a schedule using only data available at that moment.
 
@@ -360,7 +447,7 @@ def walk_forward(
     for position, refit_date in enumerate(refit_dates):
         weights = fit_weights(
             prices.loc[:refit_date], risk_free_rate, objective, max_weight,
-            shrinkage, min_weight, return_method, min_observations,
+            shrinkage, min_weight, return_method, min_observations, target,
         )
         if weights is None:
             continue
