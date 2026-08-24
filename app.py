@@ -374,6 +374,13 @@ if run_btn:
 
     yf_symbols, mf_symbols = thai_mf.split_symbols(stock_list)
 
+    if benchmark_symbol and benchmark_symbol in stock_list:
+        st.warning(
+            f"⚠️ **{benchmark_symbol}** ถูกใช้เป็นทั้งสินทรัพย์ในพอร์ตและ benchmark "
+            "— การเปรียบเทียบจะเป็นการเทียบพอร์ตกับส่วนหนึ่งของตัวเอง "
+            "Beta จะเข้าใกล้ 1 โดยไม่มีความหมาย เลือก benchmark ตัวอื่นจะได้ผลที่ตีความได้"
+        )
+
     if mf_symbols and (not sec_factsheet_key or not sec_daily_info_key):
         st.error(
             "⚠️ พบสัญลักษณ์กองทุนไทย (MF:) แต่ยังไม่ได้กรอก SEC API Key ให้ครบทั้ง 2 ช่อง "
@@ -621,6 +628,9 @@ if run_btn:
         opt_ret, opt_vol, opt_sharpe = optimizer.portfolio_performance(
             ar, covr, cleaned, risk_free_rate
         )
+        opt_ret, opt_vol = metrics.blend_performance(
+            opt_ret, opt_vol, risk_free_rate, cash_fraction
+        )
 
         # Min Volatility weights
         mv_cleaned = optimizer.optimize_weights(
@@ -628,6 +638,9 @@ if run_btn:
         )
         mv_ret, mv_vol, mv_sharpe = optimizer.portfolio_performance(
             ar, covr, mv_cleaned, risk_free_rate
+        )
+        mv_ret, mv_vol = metrics.blend_performance(
+            mv_ret, mv_vol, risk_free_rate, cash_fraction
         )
 
         # Efficient frontier curve, solved directly instead of read back
@@ -797,8 +810,9 @@ if st.session_state.get("calculated"):
     if backtest_mode == "Walk-Forward":
         with st.spinner("Running walk-forward..."):
             walk_result = optimizer.walk_forward(
-                test_prices, risk_free_rate, walk_objective, max_weight,
+                test_close, risk_free_rate, walk_objective, max_weight,
                 shrinkage, refit_freq, cost_bps,
+                cash_fraction=cash_fraction, rebalance_freq=rebalance_freq,
             )
         if walk_result.returns.empty:
             st.error(
@@ -1118,6 +1132,14 @@ if st.session_state.get("calculated"):
         custom_ret, custom_vol, custom_sharpe = optimizer.portfolio_performance(
             ar, covr, custom_w_norm, risk_free_rate
         )
+        custom_ret, custom_vol = metrics.blend_performance(
+            custom_ret, custom_vol, risk_free_rate, cash_fraction
+        )
+        if cash_fraction > 0:
+            st.caption(
+                f"ตัวเลขด้านล่างรวมเงินสด {cash_fraction:.0%} ไว้แล้ว "
+                "จึงตรงกับผลในแท็บทดสอบย้อนหลัง"
+            )
         st.markdown("**ผลลัพธ์คาดหวังของน้ำหนักที่กำหนดเอง (หลัง normalize):**")
         cc1, cc2, cc3 = st.columns(3)
         cc1.metric("ผลตอบแทนคาดหวังต่อปี", f"{custom_ret:.2%}")
@@ -1291,8 +1313,11 @@ if st.session_state.get("calculated"):
         r1, r2, r3 = st.columns(3)
         r1.metric("ความถี่", rebalance_label)
         r2.metric("จำนวนครั้ง", f"{len(result.rebalances):,}")
+        turnover_series = (
+            walk_result.turnover if walk_result is not None else result.turnover
+        )
         r3.metric(
-            "Turnover รวม", f"{result.turnover.sum():.0%}",
+            "Turnover รวม", f"{turnover_series.sum():.0%}",
             help="มูลค่าที่ซื้อขายรวมทั้งช่วง คิดเป็นสัดส่วนของมูลค่าพอร์ต",
         )
         if cost_bps > 0:

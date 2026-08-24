@@ -104,7 +104,14 @@ def optimize_weights(expected_returns, cov, objective, risk_free_rate, max_weigh
         ef.min_volatility()
     else:
         ef.max_sharpe(risk_free_rate=risk_free_rate)
-    return dict(ef.clean_weights())
+    # clean_weights rounds to five places, which can leave the set
+    # summing to 1.00002 -- harmless to the simulator, which normalises
+    # anyway, but it shows up in the weights table and the workbook.
+    cleaned = dict(ef.clean_weights())
+    total = sum(cleaned.values())
+    if total > 0:
+        cleaned = {asset: weight / total for asset, weight in cleaned.items()}
+    return cleaned
 
 
 def portfolio_performance(expected_returns, cov, weights, risk_free_rate):
@@ -199,6 +206,7 @@ def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage):
 def walk_forward(
     prices, risk_free_rate, objective, max_weight, shrinkage,
     refit_freq="Y", cost_bps=0.0, min_train_years=2.0,
+    cash_fraction=0.0, rebalance_freq=None,
 ):
     """Re-fit on a schedule using only data available at that moment.
 
@@ -206,6 +214,12 @@ def walk_forward(
     re-solves at every refit date from history up to that date and holds
     the result until the next one, so the whole tested period is out of
     sample and the weights never see their own future.
+
+    ``prices`` must hold the risky assets only. The cash sleeve is added
+    here, after each fit, so it stays the fixed allocation the user
+    asked for rather than becoming another asset the optimiser is free
+    to decline -- and so a near-zero-variance column never reaches the
+    covariance matrix.
     """
     empty = pd.Series(dtype=float)
     refit_dates = metrics.rebalance_dates(prices.index, refit_freq)
@@ -213,6 +227,12 @@ def walk_forward(
     refit_dates = [d for d in refit_dates if d >= earliest]
     if not refit_dates:
         return WalkForwardResult(empty, [], empty)
+
+    sim_prices = prices
+    if cash_fraction > 0:
+        sim_prices = prices.assign(**{
+            metrics.CASH_SYMBOL: metrics.cash_price_series(prices.index, risk_free_rate)
+        })
 
     segments, history, turnovers = [], [], []
     previous_weights = {}
@@ -222,16 +242,17 @@ def walk_forward(
         )
         if weights is None:
             continue
+        weights = metrics.blend_with_cash(weights, cash_fraction)
         history.append((refit_date, weights))
 
         end = refit_dates[position + 1] if position + 1 < len(refit_dates) else prices.index[-1]
-        window = prices.loc[refit_date:end]
+        window = sim_prices.loc[refit_date:end]
         if len(window) < 2:
             continue
 
-        # Hold the new weights untouched until the next refit; the refit
-        # itself is the only trade.
-        segment = metrics.simulate_portfolio(window, weights, None, 0.0)
+        # Between refits the portfolio follows the user's own rebalance
+        # schedule; the refit itself is charged separately below.
+        segment = metrics.simulate_portfolio(window, weights, rebalance_freq, cost_bps)
         if segment.returns.empty:
             continue
 
@@ -247,10 +268,16 @@ def walk_forward(
         traded = sum(
             abs(weights.get(a, 0.0) - previous_weights.get(a, 0.0)) for a in assets
         ) if previous_weights else 0.0
-        turnovers.append(traded)
         if cost_bps and traded:
             returns = returns.copy()
             returns.iloc[0] -= traded * cost_bps / 10_000.0
+
+        # Turnover has two sources now: the refit itself, and whatever
+        # the rebalance schedule traded inside the segment.
+        segment_turnover = segment.turnover.reindex(returns.index).fillna(0.0)
+        if traded:
+            segment_turnover.iloc[0] += traded
+        turnovers.append(segment_turnover)
 
         segments.append(returns)
         previous_weights = segment.final_weights or weights
@@ -260,5 +287,6 @@ def walk_forward(
 
     chained = pd.concat(segments)
     chained = chained[~chained.index.duplicated(keep="first")].sort_index()
-    turnover = pd.Series(turnovers, index=[d for d, _ in history][: len(turnovers)])
+    turnover = pd.concat(turnovers) if turnovers else empty
+    turnover = turnover[~turnover.index.duplicated(keep="first")].sort_index()
     return WalkForwardResult(chained, history, turnover)

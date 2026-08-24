@@ -424,3 +424,16 @@ class TestBlendWithCash:
         blended = metrics.blend_with_cash({"A": 1.0}, 1.0)
         assert blended[metrics.CASH_SYMBOL] == pytest.approx(1.0)
         assert blended["A"] == pytest.approx(0.0)
+
+
+class TestBlendPerformance:
+    def test_cash_scales_return_and_volatility_together(self):
+        ret, vol = metrics.blend_performance(0.12, 0.20, 0.02, 0.25)
+        assert ret == pytest.approx(0.75 * 0.12 + 0.25 * 0.02)
+        assert vol == pytest.approx(0.75 * 0.20)
+
+    def test_no_cash_leaves_the_figures_alone(self):
+        assert metrics.blend_performance(0.12, 0.20, 0.02, 0.0) == (0.12, 0.20)
+
+    def test_all_cash_gives_the_risk_free_rate_and_no_risk(self):
+        assert metrics.blend_performance(0.12, 0.20, 0.02, 1.0) == pytest.approx((0.02, 0.0))

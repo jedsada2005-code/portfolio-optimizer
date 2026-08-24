@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+import metrics
 import optimizer
 
 
@@ -199,3 +200,83 @@ class TestWalkForward:
         result = optimizer.walk_forward(short, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0)
         assert result.returns.empty
         assert result.weight_history == []
+
+
+class TestWalkForwardRespectsSettings:
+    """Walk-forward silently ignored two settings the user had chosen.
+
+    The cash sleeve was appended to the price frame handed to the
+    optimiser, so cash became just another asset it could decline to
+    hold -- a 40% cash setting produced 0% cash. And every segment was
+    simulated buy-and-hold at zero cost regardless of the chosen
+    rebalance frequency.
+    """
+
+    def _prices(self, days=2200, seed=5):
+        rng = np.random.default_rng(seed)
+        idx = pd.bdate_range("2014-01-01", periods=days)
+        return pd.DataFrame(
+            {"A": 100 * np.cumprod(1 + rng.normal(0.0006, 0.012, days)),
+             "B": 100 * np.cumprod(1 + rng.normal(0.0003, 0.008, days)),
+             "C": 100 * np.cumprod(1 + rng.normal(0.0004, 0.020, days))},
+            index=idx,
+        )
+
+    @pytest.mark.parametrize("cash", [0.0, 0.25, 0.60])
+    def test_the_cash_sleeve_is_held_exactly(self, cash):
+        result = optimizer.walk_forward(
+            self._prices(), 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0, cash_fraction=cash,
+        )
+        assert result.weight_history
+        for _, weights in result.weight_history:
+            held = weights.get(metrics.CASH_SYMBOL, 0.0)
+            assert held == pytest.approx(cash, abs=1e-9)
+            assert sum(weights.values()) == pytest.approx(1.0)
+
+    def test_cash_never_enters_the_optimised_universe(self):
+        result = optimizer.walk_forward(
+            self._prices(), 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0, cash_fraction=0.30,
+        )
+        # The risky sleeve keeps its internal proportions; cash is not
+        # something the optimiser chose.
+        for _, weights in result.weight_history:
+            risky = {k: v for k, v in weights.items() if k != metrics.CASH_SYMBOL}
+            assert sum(risky.values()) == pytest.approx(0.70)
+
+    def test_rebalance_frequency_changes_the_result(self):
+        prices = self._prices()
+        outcomes = {}
+        for freq in ("D", "M", "Q", None):
+            result = optimizer.walk_forward(
+                prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0, rebalance_freq=freq,
+            )
+            outcomes[freq] = float((1 + result.returns).prod())
+        assert len(set(round(v, 8) for v in outcomes.values())) > 1, outcomes
+
+    def test_buy_and_hold_matches_the_previous_hardcoded_behaviour(self):
+        prices = self._prices()
+        explicit = optimizer.walk_forward(
+            prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0, rebalance_freq=None,
+        )
+        assert not explicit.returns.empty
+
+    def test_turnover_counts_both_refits_and_rebalances(self):
+        prices = self._prices()
+        held = optimizer.walk_forward(
+            prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0, rebalance_freq=None,
+        )
+        traded = optimizer.walk_forward(
+            prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0, rebalance_freq="M",
+        )
+        assert traded.turnover.sum() > held.turnover.sum()
+        assert traded.turnover.index.is_monotonic_increasing
+
+    def test_trading_costs_apply_inside_segments_too(self):
+        prices = self._prices()
+        free = optimizer.walk_forward(
+            prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0, rebalance_freq="M",
+        )
+        charged = optimizer.walk_forward(
+            prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 200.0, rebalance_freq="M",
+        )
+        assert (1 + charged.returns).prod() < (1 + free.returns).prod()

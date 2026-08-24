@@ -344,7 +344,25 @@ def blend_with_cash(weights, cash_fraction):
     """
     if cash_fraction <= 0:
         return dict(weights)
-    risky = 1.0 - cash_fraction
-    blended = {asset: weight * risky for asset, weight in weights.items()}
+    # clean_weights rounds to five places, so the risky sleeve can sum
+    # to 1.00002; renormalise it or the blended total inherits the drift.
+    total = sum(weights.values())
+    scale = (1.0 - cash_fraction) / total if total > 0 else 0.0
+    blended = {asset: weight * scale for asset, weight in weights.items()}
     blended[CASH_SYMBOL] = cash_fraction
     return blended
+
+
+def blend_performance(annual_return, annual_volatility, risk_free_rate, cash_fraction):
+    """Expected return and volatility once a cash sleeve is held.
+
+    Two-fund separation again: cash contributes the risk-free rate and
+    no variance, so both figures scale by the risky share. Reporting the
+    risky sleeve's own numbers while backtesting the blended portfolio
+    made the weights tab disagree with the backtest.
+    """
+    risky = 1.0 - cash_fraction
+    return (
+        risky * annual_return + cash_fraction * risk_free_rate,
+        risky * annual_volatility,
+    )
