@@ -282,14 +282,15 @@ WalkForwardResult = namedtuple("WalkForwardResult", "returns weight_history turn
 
 
 def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage,
-                min_weight=0.0, return_method=DEFAULT_RETURN_METHOD):
+                min_weight=0.0, return_method=DEFAULT_RETURN_METHOD,
+                min_observations=None):
     """Expected returns and covariance from a price window, then solve."""
     weekly = prices.resample("W-FRI").last()
     expected, observations = estimate_returns_with_counts(weekly, return_method)
-    usable = [
-        asset for asset in expected.index
-        if int(observations[asset]) >= metrics.MIN_ANNUAL_OBSERVATIONS
-    ]
+    floor = (
+        metrics.MIN_ANNUAL_OBSERVATIONS if min_observations is None else min_observations
+    )
+    usable = [asset for asset in expected.index if int(observations[asset]) >= floor]
     if len(usable) < 2:
         return None
     expected = expected[usable]
@@ -307,7 +308,7 @@ def walk_forward(
     prices, risk_free_rate, objective, max_weight, shrinkage,
     refit_freq="Y", cost_bps=0.0, min_train_years=2.0,
     cash_fraction=0.0, rebalance_freq=None, min_weight=0.0,
-    return_method=DEFAULT_RETURN_METHOD,
+    return_method=DEFAULT_RETURN_METHOD, min_observations=None,
 ):
     """Re-fit on a schedule using only data available at that moment.
 
@@ -340,7 +341,7 @@ def walk_forward(
     for position, refit_date in enumerate(refit_dates):
         weights = fit_weights(
             prices.loc[:refit_date], risk_free_rate, objective, max_weight,
-            shrinkage, min_weight, return_method,
+            shrinkage, min_weight, return_method, min_observations,
         )
         if weights is None:
             continue

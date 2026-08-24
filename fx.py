@@ -11,6 +11,8 @@ import pandas as pd
 
 BASE_CURRENCIES = ["USD", "THB"]
 
+MF_PREFIX = "MF:"
+
 # Yahoo quotes "<CUR>=X" as units of that currency per one US dollar.
 FX_SYMBOL_TEMPLATE = "{currency}=X"
 
@@ -29,7 +31,7 @@ class FXError(Exception):
 
 def currency_for_symbol(symbol, default="USD"):
     """Native currency of a symbol, inferred from its exchange suffix."""
-    if symbol.upper().startswith("MF:"):
+    if symbol.upper().startswith(MF_PREFIX):
         return "THB"
     _, _, suffix = symbol.rpartition(".")
     if suffix and suffix != symbol:
@@ -73,3 +75,41 @@ def convert_prices(prices, currencies, base, rates):
         else:
             out[column] = prices[column] / rate_for(native) * base_rate
     return pd.DataFrame(out, index=prices.index)[list(prices.columns)]
+
+
+def resolve_currencies(symbols, lookup=None, defaults=None):
+    """Native currency per symbol, preferring a live lookup.
+
+    The exchange suffix only names the venue, not the currency the
+    security trades in: IBTA.L is a dollar-denominated Treasury ETF
+    listed in London, and reading ".L" as sterling converts it twice.
+    Thai funds and uploaded columns carry their currency already, so
+    they never reach the lookup.
+    """
+    defaults = defaults or {}
+    resolved = {}
+    for symbol in symbols:
+        if symbol.upper().startswith(MF_PREFIX):
+            resolved[symbol] = "THB"
+            continue
+        if symbol in defaults:
+            resolved[symbol] = defaults[symbol]
+            continue
+        found = None
+        if lookup is not None:
+            try:
+                found = lookup(symbol)
+            except Exception:
+                found = None
+        resolved[symbol] = found.upper() if found else currency_for_symbol(symbol)
+    return resolved
+
+
+def corrected_guesses(resolved):
+    """Symbols whose resolved currency contradicts the suffix guess."""
+    corrections = {}
+    for symbol, currency in resolved.items():
+        guess = currency_for_symbol(symbol)
+        if guess != currency:
+            corrections[symbol] = (guess, currency)
+    return corrections

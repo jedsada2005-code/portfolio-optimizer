@@ -86,3 +86,59 @@ class TestConvertPrices:
         assert fx.required_currencies({"A": "USD", "B": "USD"}, "USD") == []
         # USD is the reference leg, so only the base rate is needed.
         assert fx.required_currencies({"A": "USD"}, "THB") == ["THB"]
+
+
+class TestResolveCurrencies:
+    """Guessing a currency from the exchange suffix is wrong for any
+    security that trades in a currency other than its venue's own.
+
+    IBTA.L, a dollar-denominated Treasury ETF listed in London, was read
+    as sterling and converted twice.
+    """
+
+    def test_a_live_lookup_overrides_the_suffix_guess(self):
+        resolved = fx.resolve_currencies(["IBTA.L"], lookup=lambda s: "USD")
+        assert resolved["IBTA.L"] == "USD"
+
+    def test_the_suffix_guess_stands_in_when_the_lookup_is_silent(self):
+        resolved = fx.resolve_currencies(["VOD.L", "SPY"], lookup=lambda s: None)
+        assert resolved == {"VOD.L": "GBP", "SPY": "USD"}
+
+    def test_a_failing_lookup_does_not_break_resolution(self):
+        def explode(symbol):
+            raise RuntimeError("network down")
+        assert fx.resolve_currencies(["VOD.L"], lookup=explode) == {"VOD.L": "GBP"}
+
+    def test_thai_funds_never_hit_the_lookup(self):
+        seen = []
+        def spy(symbol):
+            seen.append(symbol)
+            return "USD"
+        resolved = fx.resolve_currencies(["MF:K-GOLD-A(A)"], lookup=spy)
+        assert resolved["MF:K-GOLD-A(A)"] == "THB"
+        assert seen == []
+
+    def test_declared_defaults_win_for_uploaded_columns(self):
+        resolved = fx.resolve_currencies(
+            ["MYFUND"], lookup=lambda s: None, defaults={"MYFUND": "EUR"}
+        )
+        assert resolved["MYFUND"] == "EUR"
+
+    def test_a_declared_default_also_skips_the_lookup(self):
+        seen = []
+        fx.resolve_currencies(
+            ["MYFUND"], lookup=lambda s: seen.append(s) or "USD", defaults={"MYFUND": "EUR"}
+        )
+        assert seen == []
+
+    def test_lowercase_lookups_are_normalised(self):
+        assert fx.resolve_currencies(["X.L"], lookup=lambda s: "usd")["X.L"] == "USD"
+
+    def test_no_lookup_falls_back_to_guessing(self):
+        assert fx.resolve_currencies(["VOD.L"]) == {"VOD.L": "GBP"}
+
+    def test_mismatches_are_reported_for_display(self):
+        corrected = fx.corrected_guesses(
+            {"IBTA.L": "USD", "VOD.L": "GBP", "SPY": "USD"}
+        )
+        assert corrected == {"IBTA.L": ("GBP", "USD")}

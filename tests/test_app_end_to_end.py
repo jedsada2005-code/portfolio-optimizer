@@ -490,3 +490,62 @@ class TestReturnMethodAndHRP:
         self._method(app).set_value("CAPM (อิงความเสี่ยงเทียบตลาด)")
         at = _calculate(app)
         assert _one(at.query_params["retm"]) == "CAPM (อิงความเสี่ยงเทียบตลาด)"
+
+
+class TestCurrencyDetection:
+    def test_currencies_are_resolved_not_guessed(self, app):
+        at = _calculate(app)
+        assert not at.error
+
+    def test_a_london_listed_dollar_etf_is_treated_as_dollars(self, app):
+        _widget(app.text_input, "สินทรัพย์ในพอร์ต").set_value("SPY, GLD, IBTA.L")
+        app.date_input[0].set_value(pd.Timestamp("2018-01-01").date())
+        at = _calculate(app)
+        assert not at.error
+        # The suffix says London, the security trades in dollars; a
+        # caption reports the correction rather than silently converting
+        # the series twice.
+        assert any("IBTA.L" in c.value and "GBP→USD" in c.value for c in at.caption), \
+            [c.value for c in at.caption]
+
+
+class TestHistoryFloorControl:
+    def _slider(self, at):
+        return _widget(at.slider, "ประวัติขั้นต่ำที่ยอมรับ")
+
+    def test_the_default_is_three_years(self, app):
+        assert self._slider(app).value == 3
+
+    @pytest.mark.parametrize("years", [1, 3, 6])
+    def test_every_setting_runs(self, app, years):
+        self._slider(app).set_value(years)
+        at = _calculate(app)
+        assert not at.exception, at.exception
+
+    def test_a_lax_setting_is_flagged(self, app):
+        self._slider(app).set_value(2)
+        at = _calculate(app)
+        assert any("ต่ำกว่าค่าแนะนำ" in c.value for c in at.caption)
+
+    def test_no_warning_at_the_recommended_setting(self, app):
+        at = _calculate(app)
+        assert not any("ต่ำกว่าค่าแนะนำ" in c.value for c in at.caption)
+
+    def test_the_setting_is_saved_in_the_url(self, app):
+        self._slider(app).set_value(5)
+        at = _calculate(app)
+        assert _one(at.query_params["minyrs"]) == "5"
+
+
+class TestCorrelationWindow:
+    def test_correlation_matches_the_optimisation_window(self, app):
+        at = _calculate(app)
+        weekly = at.session_state["weekly_usable"]
+        train = at.session_state["train_close"]
+        # The frontier tab describes the training window, so the
+        # correlation shown beside it must come from that data alone.
+        # W-FRI labels each bucket by its Friday, which can fall a few
+        # days past the last training date without carrying test data.
+        expected = train[list(weekly.columns)].resample("W-FRI").last()
+        pd.testing.assert_frame_equal(weekly, expected)
+        assert list(weekly.columns) == list(at.session_state["ar"].index)

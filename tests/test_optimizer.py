@@ -462,3 +462,39 @@ class TestHierarchicalRiskParity:
         cov = optimizer.shrink_covariance(weekly.pct_change().cov() * 52, 0.2)
         with pytest.raises(ValueError, match="HRP"):
             optimizer.optimize_weights(expected, cov, optimizer.HRP_OBJECTIVE, 0.02, 1.0)
+
+
+class TestHistoryFloorFlowsThrough:
+    def _prices_with_a_newcomer(self):
+        rng = np.random.default_rng(12)
+        idx = pd.bdate_range("2014-01-01", periods=2400)
+        frame = pd.DataFrame(
+            {c: 100 * np.cumprod(1 + rng.normal(m, s, 2400))
+             for c, m, s in [("OLD1", 0.0006, 0.012), ("OLD2", 0.0004, 0.010),
+                             ("OLD3", 0.0005, 0.015), ("NEW", 0.0009, 0.020)]},
+            index=idx,
+        )
+        frame.loc[frame.index[:-620], "NEW"] = np.nan   # ~2.4 years of history
+        return frame
+
+    def test_a_strict_floor_excludes_the_newcomer(self):
+        weights = optimizer.fit_weights(
+            self._prices_with_a_newcomer(), 0.02, "Max Sharpe", 1.0, 0.2,
+            min_observations=metrics.observations_for_years(4),
+        )
+        assert "NEW" not in weights
+
+    def test_a_relaxed_floor_admits_it(self):
+        weights = optimizer.fit_weights(
+            self._prices_with_a_newcomer(), 0.02, "Max Sharpe", 1.0, 0.2,
+            min_observations=metrics.observations_for_years(2),
+        )
+        assert "NEW" in weights
+
+    def test_walk_forward_passes_the_floor_to_every_refit(self):
+        result = optimizer.walk_forward(
+            self._prices_with_a_newcomer(), 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0,
+            min_observations=metrics.observations_for_years(5),
+        )
+        for _, weights in result.weight_history:
+            assert "NEW" not in weights

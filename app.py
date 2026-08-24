@@ -95,6 +95,20 @@ def qp_choice(key, options, default_index=0):
     return options.index(value) if value in options else default_index
 
 
+@st.cache_data(show_spinner=False, ttl=86_400)
+def lookup_currency(symbol):
+    """The currency a symbol actually trades in, per Yahoo.
+
+    Cached for a day: this is one HTTP round trip per symbol and the
+    answer effectively never changes.
+    """
+    try:
+        currency = (yf.Ticker(symbol).info or {}).get("currency")
+    except Exception:
+        return None
+    return currency.upper() if currency else None
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def download_fx_rates(currencies, start, end):
     """Units of each currency per one US dollar, from Yahoo."""
@@ -262,6 +276,15 @@ with st.sidebar:
                 "สินทรัพย์เสี่ยงที่เหลือคงสัดส่วนภายในเดิม (two-fund separation)"
             ),
         ) / 100
+        min_history_years = st.slider(
+            "ประวัติขั้นต่ำที่ยอมรับ (ปี)", 1, 6,
+            qp_number("minyrs", metrics.DEFAULT_MIN_HISTORY_YEARS, int),
+            help=(
+                "สินทรัพย์ที่มีข้อมูลสั้นกว่านี้จะไม่ถูกนำมาคำนวณ "
+                "หน้าต่างผลตอบแทน 1 ปีทับซ้อนกันเกือบทั้งหมด ข้อมูล 3 ปีจึงให้ "
+                "ตัวอย่างอิสระจริงแค่ 3 ชุด — ต่ำกว่านี้ค่าประมาณจะแกว่งมาก"
+            ),
+        )
         return_method = st.selectbox(
             "วิธีประมาณผลตอบแทนคาดหวัง",
             list(optimizer.RETURN_METHODS),
@@ -351,6 +374,7 @@ input_signature = (
     float(min_weight),
     float(shrinkage),
     return_method,
+    int(min_history_years),
 )
 
 if run_btn:
@@ -463,13 +487,20 @@ if run_btn:
         st.error("No data downloaded. Check symbols and date range.")
         st.stop()
 
-    asset_currencies = {
-        column: fx.currency_for_symbol(
-            column,
-            default=upload_currency if column in uploaded_prices.columns else "USD",
+    with st.spinner("Checking asset currencies..."):
+        asset_currencies = fx.resolve_currencies(
+            list(data_close.columns),
+            lookup=lookup_currency,
+            defaults={c: upload_currency for c in uploaded_prices.columns},
         )
-        for column in data_close.columns
-    }
+    corrections = fx.corrected_guesses(asset_currencies)
+    if corrections:
+        st.caption(
+            "💱 สกุลเงินที่ตรวจพบจริงต่างจากที่เดาจากตลาดที่จดทะเบียน: "
+            + ", ".join(
+                f"**{sym}** {guessed}→{actual}" for sym, (guessed, actual) in corrections.items()
+            )
+        )
     needed = fx.required_currencies(asset_currencies, base_currency)
     if needed:
         with st.spinner("Downloading exchange rates..."):
@@ -501,7 +532,9 @@ if run_btn:
             )
         else:
             benchmark_close = bench_df.iloc[:, 0].rename(benchmark_symbol)
-            bench_currency = fx.currency_for_symbol(benchmark_symbol)
+            bench_currency = fx.resolve_currencies(
+                [benchmark_symbol], lookup=lookup_currency
+            )[benchmark_symbol]
             if bench_currency != base_currency:
                 bench_needed = fx.required_currencies(
                     {benchmark_symbol: bench_currency}, base_currency
@@ -580,16 +613,24 @@ if run_btn:
         # windows is noise, and the optimiser will happily chase it into
         # a near-100% allocation. Require a real sample, not merely a
         # non-NaN value, and say how short each excluded asset was.
-        insufficient = metrics.unreliable_assets(ar_observations)
+        required_observations = metrics.observations_for_years(min_history_years)
+        insufficient = metrics.unreliable_assets(ar_observations, required_observations)
         if insufficient:
             detail = ", ".join(
-                f"**{sym}** ({count} สัปดาห์)" for sym, count in insufficient.items()
+                f"**{sym}** (มี {metrics.independent_years(count)} ปี)"
+                for sym, count in insufficient.items()
             )
             st.warning(
                 f"⚠️ ข้อมูลไม่พอสำหรับประมาณผลตอบแทนที่เชื่อถือได้ — ต้องมีอย่างน้อย "
-                f"{metrics.MIN_ANNUAL_OBSERVATIONS} สัปดาห์ (ประมาณ 2 ปี) ในช่วงวันที่ที่เลือก: "
-                f"{detail} — ไม่รวมในการคำนวณพอร์ต "
-                "(ลองขยายช่วงวันที่ หรือปรับ Start Date ให้อยู่หลังวันที่กองทุนจดทะเบียน)"
+                f"**{min_history_years} ปี** ในช่วงวันที่ที่เลือก: {detail} "
+                "— ไม่รวมในการคำนวณพอร์ต "
+                "(ลองขยายช่วงวันที่ หรือลดเกณฑ์ในการตั้งค่าขั้นสูง)"
+            )
+        if min_history_years < 3:
+            st.caption(
+                f"ℹ️ เกณฑ์ประวัติขั้นต่ำตั้งไว้ {min_history_years} ปี ซึ่งต่ำกว่าค่าแนะนำ "
+                "หน้าต่างผลตอบแทน 1 ปีทับซ้อนกันเกือบทั้งหมด (autocorrelation ~0.96) "
+                "ข้อมูลสั้นจึงให้ตัวอย่างอิสระน้อยมากและค่าประมาณจะแกว่งแรง"
             )
             drop = list(insufficient)
             data_close = data_close.drop(columns=drop)
@@ -712,6 +753,7 @@ if run_btn:
     st.session_state["hrp_cleaned"] = hrp_cleaned
     st.session_state["hrp_perf"] = (hrp_ret, hrp_vol, hrp_sharpe)
     st.session_state["return_method"] = return_method
+    st.session_state["weekly_usable"] = weekly_usable
     st.session_state["random"] = (stds, rets, sharpes)
     st.session_state["ef_curve"] = (ef_x, ef_y)
     st.session_state["ef_curve_free"] = (free_x, free_y)
@@ -730,6 +772,7 @@ if run_btn:
         "mode": backtest_mode, "reb": rebalance_label, "bench": benchmark_symbol,
         "cost": str(cost_bps), "maxw": str(max_weight), "minw": str(min_weight),
         "cashpct": str(cash_fraction), "retm": return_method,
+        "minyrs": str(min_history_years),
         "shrink": str(shrinkage),
     })
 
@@ -745,6 +788,7 @@ if st.session_state.get("calculated"):
     hrp_cleaned = st.session_state["hrp_cleaned"]
     hrp_ret, hrp_vol, hrp_sharpe = st.session_state["hrp_perf"]
     return_method = st.session_state["return_method"]
+    weekly_usable = st.session_state["weekly_usable"]
     stds, rets, sharpes = st.session_state["random"]
     ef_x, ef_y = st.session_state["ef_curve"]
     free_x, free_y = st.session_state["ef_curve_free"]
@@ -979,7 +1023,11 @@ if st.session_state.get("calculated"):
                 "Date": port_daily.index, "Daily Return": port_daily.values,
                 "Cumulative": cumulative.values, "Drawdown": drawdown.values,
             }).to_excel(writer, sheet_name="Backtest", index=False)
-            data_close.to_excel(writer, sheet_name="Prices")
+            if split_date is not None:
+                train_close.to_excel(writer, sheet_name="Prices (Train)")
+                test_close.to_excel(writer, sheet_name="Prices (Test)")
+            else:
+                data_close.to_excel(writer, sheet_name="Prices")
             if walk_result is not None:
                 pd.DataFrame(
                     [w for _, w in walk_result.weight_history],
@@ -1070,7 +1118,8 @@ if st.session_state.get("calculated"):
             )
 
         st.subheader("ค่าสหสัมพันธ์ระหว่างสินทรัพย์")
-        correlation = data_close.resample("W-FRI").last().pct_change().corr()
+        st.caption("คำนวณจากข้อมูลชุดเดียวกับที่ใช้หาน้ำหนัก (ช่วง Train)")
+        correlation = weekly_usable.pct_change().corr()
         fig_corr = px.imshow(
             correlation.values,
             x=correlation.columns.tolist(), y=correlation.index.tolist(),

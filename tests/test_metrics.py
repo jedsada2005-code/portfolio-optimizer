@@ -437,3 +437,34 @@ class TestBlendPerformance:
 
     def test_all_cash_gives_the_risk_free_rate_and_no_risk(self):
         assert metrics.blend_performance(0.12, 0.20, 0.02, 1.0) == pytest.approx((0.02, 0.0))
+
+
+class TestHistoryRequirement:
+    """52 overlapping trailing-year windows sounds like 52 observations,
+    but consecutive windows share 51 of their 52 weeks -- autocorrelation
+    runs above 0.96 -- so the real sample is the number of independent
+    years, which is far smaller."""
+
+    def test_observations_needed_grows_with_the_years_asked_for(self):
+        assert metrics.observations_for_years(2) == 52
+        assert metrics.observations_for_years(3) == 104
+        assert metrics.observations_for_years(5) == 208
+
+    def test_one_year_needs_a_single_window(self):
+        assert metrics.observations_for_years(1) == 1
+
+    def test_independent_years_ignores_the_overlap(self):
+        # 104 overlapping windows come from three years of weekly data,
+        # which is three independent annual observations.
+        assert metrics.independent_years(104) == 3
+        assert metrics.independent_years(52) == 2
+        assert metrics.independent_years(0) == 1
+
+    def test_the_floor_is_expressed_in_years(self):
+        counts = pd.Series({"OLD": 400, "NEW": 60})
+        flagged = metrics.unreliable_assets(counts, metrics.observations_for_years(3))
+        assert flagged == {"NEW": 60}
+
+    def test_a_two_year_floor_still_admits_shorter_history(self):
+        counts = pd.Series({"NEW": 60})
+        assert metrics.unreliable_assets(counts, metrics.observations_for_years(2)) == {}

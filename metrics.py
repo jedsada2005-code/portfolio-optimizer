@@ -89,8 +89,26 @@ def month_labels(month_numbers):
     return [_MONTH_ABBR[int(m)] for m in month_numbers]
 
 
-MIN_ANNUAL_OBSERVATIONS = 52
 ANNUAL_LOOKBACK_WEEKS = 52
+
+# Trailing-year windows overlap by 51 of their 52 weeks, so consecutive
+# observations correlate above 0.96 and the count badly overstates the
+# real sample. Express the requirement in years of history instead, and
+# report how many independent years that actually amounts to.
+DEFAULT_MIN_HISTORY_YEARS = 3
+
+
+def observations_for_years(years):
+    """Trailing-year windows produced by ``years`` of weekly data."""
+    return max(1, int(round((years - 1) * ANNUAL_LOOKBACK_WEEKS)))
+
+
+def independent_years(observation_count):
+    """Non-overlapping annual observations behind a window count."""
+    return int(observation_count // ANNUAL_LOOKBACK_WEEKS) + 1
+
+
+MIN_ANNUAL_OBSERVATIONS = observations_for_years(DEFAULT_MIN_HISTORY_YEARS)
 
 
 PortfolioReturns = namedtuple("PortfolioReturns", "portfolio assets held start")
