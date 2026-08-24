@@ -8,13 +8,71 @@ from collections import namedtuple
 
 import numpy as np
 import pandas as pd
-from pypfopt import EfficientFrontier
+from pypfopt import EfficientFrontier, HRPOpt, expected_returns as pypfopt_returns
 from pypfopt.exceptions import OptimizationError
 
 import metrics
 
 
 DEFAULT_SHRINKAGE = 0.2
+
+WEEKS_PER_YEAR = 52
+
+# How to estimate what each asset will return. This is the single
+# largest influence on the resulting weights -- swapping the method can
+# move an allocation from 88% in one asset to 26% in another -- so it
+# belongs in the user's hands rather than hardcoded.
+RETURN_METHODS = {
+    "ค่าเฉลี่ยผลตอบแทน 1 ปี (ทับซ้อน)": "rolling_annual",
+    "ค่าเฉลี่ยตลอดช่วง": "mean_historical",
+    "ถ่วงน้ำหนักข้อมูลล่าสุด (EMA)": "ema_historical",
+    "CAPM (อิงความเสี่ยงเทียบตลาด)": "capm",
+}
+DEFAULT_RETURN_METHOD = "ค่าเฉลี่ยผลตอบแทน 1 ปี (ทับซ้อน)"
+
+HRP_OBJECTIVE = "HRP (Risk Parity)"
+
+
+def estimate_returns(weekly_prices, method):
+    """Annualised expected returns from weekly prices."""
+    key = RETURN_METHODS.get(method)
+    if key is None:
+        raise ValueError(f"ไม่รู้จักวิธีประมาณผลตอบแทน: {method}")
+    if key == "rolling_annual":
+        return metrics.annual_return_estimates(weekly_prices)[0]
+    if key == "mean_historical":
+        return pypfopt_returns.mean_historical_return(
+            weekly_prices, frequency=WEEKS_PER_YEAR
+        )
+    if key == "ema_historical":
+        return pypfopt_returns.ema_historical_return(
+            weekly_prices, frequency=WEEKS_PER_YEAR, span=2 * WEEKS_PER_YEAR
+        )
+    return pypfopt_returns.capm_return(weekly_prices, frequency=WEEKS_PER_YEAR)
+
+
+def estimate_returns_with_counts(weekly_prices, method):
+    """Expected returns plus how many observations back each one.
+
+    The count always comes from the trailing-year windows, whatever the
+    estimator, because that is what the history floor is expressed in.
+    """
+    _, counts = metrics.annual_return_estimates(weekly_prices)
+    return estimate_returns(weekly_prices, method), counts
+
+
+def hrp_weights(weekly_prices):
+    """Hierarchical risk parity: allocation from the covariance alone.
+
+    Needs no expected returns at all, which sidesteps the noisiest input
+    in the whole exercise and never leaves an asset at zero.
+    """
+    returns = weekly_prices.pct_change().dropna(how="all")
+    optimiser = HRPOpt(returns)
+    optimiser.optimize()
+    weights = dict(optimiser.clean_weights())
+    total = sum(weights.values())
+    return {a: w / total for a, w in weights.items()} if total > 0 else weights
 
 
 def average_correlation(cov):
@@ -124,8 +182,12 @@ def _frontier(expected_returns, cov, max_weight, min_weight=0.0):
 
 
 def optimize_weights(expected_returns, cov, objective, risk_free_rate,
-                     max_weight=1.0, min_weight=0.0):
+                     max_weight=1.0, min_weight=0.0, weekly=None):
     """Solve for one objective, raising ValueError with a readable message."""
+    if objective == HRP_OBJECTIVE:
+        if weekly is None:
+            raise ValueError("HRP ต้องใช้ประวัติผลตอบแทน ไม่ใช่แค่ค่าคาดหวัง")
+        return hrp_weights(weekly)
     validate_bounds(len(expected_returns), max_weight, min_weight)
     ef = _frontier(expected_returns, cov, max_weight, min_weight)
     if objective == "Min Volatility":
@@ -219,10 +281,11 @@ def sample_weights(rng, n_assets, n_samples, max_weight=1.0, max_passes=12, min_
 WalkForwardResult = namedtuple("WalkForwardResult", "returns weight_history turnover")
 
 
-def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage, min_weight=0.0):
+def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage,
+                min_weight=0.0, return_method=DEFAULT_RETURN_METHOD):
     """Expected returns and covariance from a price window, then solve."""
     weekly = prices.resample("W-FRI").last()
-    expected, observations = metrics.annual_return_estimates(weekly)
+    expected, observations = estimate_returns_with_counts(weekly, return_method)
     usable = [
         asset for asset in expected.index
         if int(observations[asset]) >= metrics.MIN_ANNUAL_OBSERVATIONS
@@ -233,7 +296,8 @@ def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage, min_we
     cov = shrink_covariance(weekly[usable].pct_change().cov() * 52, shrinkage)
     try:
         return optimize_weights(
-            expected, cov, objective, risk_free_rate, max_weight, min_weight
+            expected, cov, objective, risk_free_rate, max_weight, min_weight,
+            weekly=weekly[usable],
         )
     except (ValueError, OptimizationError):
         return None
@@ -243,6 +307,7 @@ def walk_forward(
     prices, risk_free_rate, objective, max_weight, shrinkage,
     refit_freq="Y", cost_bps=0.0, min_train_years=2.0,
     cash_fraction=0.0, rebalance_freq=None, min_weight=0.0,
+    return_method=DEFAULT_RETURN_METHOD,
 ):
     """Re-fit on a schedule using only data available at that moment.
 
@@ -275,7 +340,7 @@ def walk_forward(
     for position, refit_date in enumerate(refit_dates):
         weights = fit_weights(
             prices.loc[:refit_date], risk_free_rate, objective, max_weight,
-            shrinkage, min_weight,
+            shrinkage, min_weight, return_method,
         )
         if weights is None:
             continue

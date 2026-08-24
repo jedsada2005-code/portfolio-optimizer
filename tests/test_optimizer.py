@@ -382,3 +382,83 @@ class TestMinimumWeight:
         assert result.weight_history
         for _, weights in result.weight_history:
             assert min(weights.values()) >= 0.20 - 1e-6
+
+
+def _weekly_prices(days=800, seed=9):
+    rng = np.random.default_rng(seed)
+    idx = pd.date_range("2012-01-06", periods=days, freq="W-FRI")
+    return pd.DataFrame(
+        {c: 100 * np.cumprod(1 + rng.normal(m, s, days))
+         for c, m, s in [("A", 0.0025, 0.02), ("B", 0.0012, 0.012),
+                         ("C", 0.0018, 0.030), ("D", 0.0006, 0.008)]},
+        index=idx,
+    )
+
+
+class TestReturnEstimators:
+    """The expected-return method is the single biggest driver of the
+    resulting portfolio, and it used to be hardcoded."""
+
+    def test_every_advertised_method_produces_a_full_estimate(self):
+        weekly = _weekly_prices()
+        for method in optimizer.RETURN_METHODS:
+            estimate = optimizer.estimate_returns(weekly, method)
+            assert list(estimate.index) == list(weekly.columns)
+            assert estimate.notna().all(), method
+
+    def test_the_default_matches_the_previous_hardcoded_estimator(self):
+        weekly = _weekly_prices()
+        pd.testing.assert_series_equal(
+            optimizer.estimate_returns(weekly, optimizer.DEFAULT_RETURN_METHOD),
+            metrics.annual_return_estimates(weekly)[0],
+            check_names=False,
+        )
+
+    def test_methods_actually_disagree(self):
+        weekly = _weekly_prices()
+        estimates = {m: optimizer.estimate_returns(weekly, m) for m in optimizer.RETURN_METHODS}
+        spread = pd.DataFrame(estimates).max(axis=1) - pd.DataFrame(estimates).min(axis=1)
+        assert spread.max() > 0.01
+
+    def test_an_unknown_method_is_rejected(self):
+        with pytest.raises(ValueError, match="วิธีประมาณ"):
+            optimizer.estimate_returns(_weekly_prices(), "ไม่มีวิธีนี้")
+
+    def test_observation_counts_come_back_with_the_estimate(self):
+        weekly = _weekly_prices()
+        weekly.loc[weekly.index[:600], "D"] = np.nan
+        _, counts = optimizer.estimate_returns_with_counts(weekly, optimizer.DEFAULT_RETURN_METHOD)
+        assert counts["A"] > counts["D"]
+
+
+class TestHierarchicalRiskParity:
+    def test_hrp_allocates_to_everything(self):
+        weekly = _weekly_prices()
+        w = optimizer.hrp_weights(weekly)
+        assert set(w) == set(weekly.columns)
+        assert sum(w.values()) == pytest.approx(1.0)
+        assert min(w.values()) > 0
+
+    def test_hrp_ignores_expected_returns_entirely(self):
+        weekly = _weekly_prices()
+        first = optimizer.hrp_weights(weekly)
+        scaled = optimizer.hrp_weights(weekly * 3.0)   # same returns, different levels
+        for asset in first:
+            assert first[asset] == pytest.approx(scaled[asset], abs=1e-9)
+
+    def test_hrp_is_reachable_through_the_common_entry_point(self):
+        weekly = _weekly_prices()
+        expected = optimizer.estimate_returns(weekly, optimizer.DEFAULT_RETURN_METHOD)
+        cov = optimizer.shrink_covariance(weekly.pct_change().cov() * 52, 0.2)
+        w = optimizer.optimize_weights(
+            expected, cov, optimizer.HRP_OBJECTIVE, 0.02, 1.0, weekly=weekly
+        )
+        assert sum(w.values()) == pytest.approx(1.0)
+        assert min(w.values()) > 0
+
+    def test_hrp_needs_the_return_history(self):
+        weekly = _weekly_prices()
+        expected = optimizer.estimate_returns(weekly, optimizer.DEFAULT_RETURN_METHOD)
+        cov = optimizer.shrink_covariance(weekly.pct_change().cov() * 52, 0.2)
+        with pytest.raises(ValueError, match="HRP"):
+            optimizer.optimize_weights(expected, cov, optimizer.HRP_OBJECTIVE, 0.02, 1.0)

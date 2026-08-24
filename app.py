@@ -21,7 +21,7 @@ PLOT_SAMPLE = 6_000
 
 
 MODES = ["Train / Test Split", "Walk-Forward", "In-sample (ทั้งช่วง)"]
-OBJECTIVES = ["Max Sharpe", "Min Volatility"]
+OBJECTIVES = ["Max Sharpe", "Min Volatility", optimizer.HRP_OBJECTIVE]
 CUSTOM_SOURCE = "Custom (จากแท็บน้ำหนักพอร์ต)"
 DEFAULT_SYMBOLS = "AMZN, META, LLY, SPY, NVDA, GOOGL"
 
@@ -262,6 +262,16 @@ with st.sidebar:
                 "สินทรัพย์เสี่ยงที่เหลือคงสัดส่วนภายในเดิม (two-fund separation)"
             ),
         ) / 100
+        return_method = st.selectbox(
+            "วิธีประมาณผลตอบแทนคาดหวัง",
+            list(optimizer.RETURN_METHODS),
+            index=qp_choice("retm", list(optimizer.RETURN_METHODS)),
+            help=(
+                "ตัวแปรที่มีผลต่อน้ำหนักมากที่สุด — เปลี่ยนวิธีอาจย้ายน้ำหนักจาก 88% "
+                "ในตัวหนึ่ง ไปเป็น 26% ในอีกตัวได้ CAPM มักให้พอร์ตที่กระจายตัวกว่า "
+                "ส่วน HRP ไม่ใช้ค่านี้เลย"
+            ),
+        )
         shrinkage = st.slider(
             "Covariance Shrinkage", 0.0, 1.0,
             qp_number("shrink", optimizer.DEFAULT_SHRINKAGE), step=0.05,
@@ -340,6 +350,7 @@ input_signature = (
     float(max_weight),
     float(min_weight),
     float(shrinkage),
+    return_method,
 )
 
 if run_btn:
@@ -563,7 +574,7 @@ if run_btn:
             test_close = data_close
 
         weekly = train_close.resample("W-FRI").last()
-        ar, ar_observations = metrics.annual_return_estimates(weekly)
+        ar, ar_observations = optimizer.estimate_returns_with_counts(weekly, return_method)
 
         # An expected return built from a handful of overlapping 52-week
         # windows is noise, and the optimiser will happily chase it into
@@ -594,6 +605,7 @@ if run_btn:
             )
             st.stop()
 
+        weekly_usable = weekly[list(ar.index)]
         try:
             optimizer.validate_bounds(len(ar), max_weight, min_weight)
         except ValueError as exc:
@@ -627,7 +639,8 @@ if run_btn:
         # Max Sharpe weights
         try:
             cleaned = optimizer.optimize_weights(
-                ar, covr, "Max Sharpe", risk_free_rate, max_weight, min_weight
+                ar, covr, "Max Sharpe", risk_free_rate, max_weight, min_weight,
+                weekly=weekly_usable,
             )
         except (ValueError, OptimizationError):
             st.error(
@@ -645,13 +658,22 @@ if run_btn:
 
         # Min Volatility weights
         mv_cleaned = optimizer.optimize_weights(
-            ar, covr, "Min Volatility", risk_free_rate, max_weight, min_weight
+            ar, covr, "Min Volatility", risk_free_rate, max_weight, min_weight,
+            weekly=weekly_usable,
         )
         mv_ret, mv_vol, mv_sharpe = optimizer.portfolio_performance(
             ar, covr, mv_cleaned, risk_free_rate
         )
         mv_ret, mv_vol = metrics.blend_performance(
             mv_ret, mv_vol, risk_free_rate, cash_fraction
+        )
+
+        hrp_cleaned = optimizer.hrp_weights(weekly_usable)
+        hrp_ret, hrp_vol, hrp_sharpe = optimizer.portfolio_performance(
+            ar, covr, hrp_cleaned, risk_free_rate
+        )
+        hrp_ret, hrp_vol = metrics.blend_performance(
+            hrp_ret, hrp_vol, risk_free_rate, cash_fraction
         )
 
         # Efficient frontier curve, solved directly instead of read back
@@ -687,6 +709,9 @@ if run_btn:
     st.session_state["opt_perf"] = (opt_ret, opt_vol, opt_sharpe)
     st.session_state["mv_cleaned"] = mv_cleaned
     st.session_state["mv_perf"] = (mv_ret, mv_vol, mv_sharpe)
+    st.session_state["hrp_cleaned"] = hrp_cleaned
+    st.session_state["hrp_perf"] = (hrp_ret, hrp_vol, hrp_sharpe)
+    st.session_state["return_method"] = return_method
     st.session_state["random"] = (stds, rets, sharpes)
     st.session_state["ef_curve"] = (ef_x, ef_y)
     st.session_state["ef_curve_free"] = (free_x, free_y)
@@ -704,7 +729,7 @@ if run_btn:
         "base": base_currency, "cash": str(total_cash), "rf": str(risk_free_rate),
         "mode": backtest_mode, "reb": rebalance_label, "bench": benchmark_symbol,
         "cost": str(cost_bps), "maxw": str(max_weight), "minw": str(min_weight),
-        "cashpct": str(cash_fraction),
+        "cashpct": str(cash_fraction), "retm": return_method,
         "shrink": str(shrinkage),
     })
 
@@ -717,6 +742,9 @@ if st.session_state.get("calculated"):
     opt_ret, opt_vol, opt_sharpe = st.session_state["opt_perf"]
     mv_cleaned = st.session_state["mv_cleaned"]
     mv_ret, mv_vol, mv_sharpe = st.session_state["mv_perf"]
+    hrp_cleaned = st.session_state["hrp_cleaned"]
+    hrp_ret, hrp_vol, hrp_sharpe = st.session_state["hrp_perf"]
+    return_method = st.session_state["return_method"]
     stds, rets, sharpes = st.session_state["random"]
     ef_x, ef_y = st.session_state["ef_curve"]
     free_x, free_y = st.session_state["ef_curve_free"]
@@ -764,6 +792,7 @@ if st.session_state.get("calculated"):
         status.append(f"⚖️ ขั้นต่ำ {min_weight:.0%}/ตัว")
     if benchmark_symbol:
         status.append(f"📊 เทียบ {benchmark_symbol}")
+    status.append(f"📐 {return_method}")
     st.caption(" · ".join(status))
 
     with st.expander("🔗 บันทึกหรือแชร์พอร์ตนี้"):
@@ -780,7 +809,11 @@ if st.session_state.get("calculated"):
             OBJECTIVES, horizontal=True,
         )
         weight_source = walk_objective
-        active_w = cleaned if walk_objective == "Max Sharpe" else mv_cleaned
+        active_w = {
+            "Max Sharpe": cleaned,
+            "Min Volatility": mv_cleaned,
+            optimizer.HRP_OBJECTIVE: hrp_cleaned,
+        }[walk_objective]
     else:
         sources = OBJECTIVES + ([CUSTOM_SOURCE] if custom_w_available else [])
         weight_source = st.radio(
@@ -797,6 +830,8 @@ if st.session_state.get("calculated"):
             active_w = cleaned
         elif weight_source == "Min Volatility":
             active_w = mv_cleaned
+        elif weight_source == optimizer.HRP_OBJECTIVE:
+            active_w = hrp_cleaned
         else:
             active_w = custom_w_available
     
@@ -1006,6 +1041,12 @@ if st.session_state.get("calculated"):
                         line=dict(width=1, color="black")),
             name=f"Min Volatility (SR={mv_sharpe:.2f})",
         ))
+        fig.add_trace(go.Scatter(
+            x=[hrp_vol], y=[hrp_ret], mode="markers",
+            marker=dict(size=13, color="#7E57C2", symbol="square",
+                        line=dict(width=1, color="black")),
+            name=f"HRP (SR={hrp_sharpe:.2f})",
+        ))
         fig.update_layout(
             title="Efficient Frontier with Random Portfolios",
             xaxis_title="Annual Volatility",
@@ -1069,9 +1110,16 @@ if st.session_state.get("calculated"):
         if display_strategy == "Max Sharpe":
             sel_weights = cleaned
             sel_ret, sel_vol, sel_sharpe = opt_ret, opt_vol, opt_sharpe
-        else:
+        elif display_strategy == "Min Volatility":
             sel_weights = mv_cleaned
             sel_ret, sel_vol, sel_sharpe = mv_ret, mv_vol, mv_sharpe
+        else:
+            sel_weights = hrp_cleaned
+            sel_ret, sel_vol, sel_sharpe = hrp_ret, hrp_vol, hrp_sharpe
+            st.caption(
+                "HRP จัดสรรจากโครงสร้างความเสี่ยงอย่างเดียว ไม่ใช้ผลตอบแทนคาดหวังเลย "
+                "จึงไม่ได้รับผลจากวิธีประมาณผลตอบแทน และไม่อยู่ใต้เพดาน/ขั้นต่ำน้ำหนัก"
+            )
 
         st.subheader(f"{display_strategy} Optimal Weights")
         col_m1, col_m2, col_m3 = st.columns(3)
@@ -1150,9 +1198,9 @@ if st.session_state.get("calculated"):
             for sym in assets:
                 st.session_state[f"cw_{sym}"] = round(cleaned.get(sym, 0.0) * 100, 1)
             st.rerun()
-        if preset_cols[2].button("↩️ กลับไปใช้ Min Volatility", use_container_width=True):
+        if preset_cols[2].button("↩️ กลับไปใช้ HRP", use_container_width=True):
             for sym in assets:
-                st.session_state[f"cw_{sym}"] = round(mv_cleaned.get(sym, 0.0) * 100, 1)
+                st.session_state[f"cw_{sym}"] = round(hrp_cleaned.get(sym, 0.0) * 100, 1)
             st.rerun()
 
         # A fixed four-column grid of sliders became unreadable past a
@@ -1203,6 +1251,7 @@ if st.session_state.get("calculated"):
                 "หลัง normalize": [f"{custom_w_norm[a]:.1%}" for a in assets],
                 "Max Sharpe": [f"{cleaned.get(a, 0.0):.1%}" for a in assets],
                 "Min Volatility": [f"{mv_cleaned.get(a, 0.0):.1%}" for a in assets],
+                "HRP": [f"{hrp_cleaned.get(a, 0.0):.1%}" for a in assets],
             }),
             use_container_width=True, hide_index=True,
         )

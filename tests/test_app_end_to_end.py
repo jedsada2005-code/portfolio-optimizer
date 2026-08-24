@@ -246,7 +246,9 @@ class TestNavTabAgreesWithBacktest:
         at = _calculate(app)
         labels = [r.label for r in at.radio]
         assert "น้ำหนักที่ใช้ backtest" not in labels
-        assert _widget(at.radio, "วัตถุประสงค์").options == ["Max Sharpe", "Min Volatility"]
+        assert _widget(at.radio, "วัตถุประสงค์").options == [
+            "Max Sharpe", "Min Volatility", "HRP (Risk Parity)"
+        ]
 
     def test_cash_sleeve_reaches_the_nav_tab(self, app):
         _widget(app.slider, "เงินสด").set_value(25)
@@ -426,3 +428,65 @@ class TestMinimumWeightControl:
         _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(15)
         at = _calculate(app)
         assert _one(at.query_params["minw"]) == "0.15"
+
+
+class TestReturnMethodAndHRP:
+    """The expected-return estimator was hardcoded, and HRP -- which
+    needs no return estimate at all -- was not offered."""
+
+    def _method(self, at):
+        return _widget(at.selectbox, "วิธีประมาณผลตอบแทน")
+
+    def test_the_default_method_is_the_previous_behaviour(self, app):
+        at = _calculate(app)
+        assert at.session_state["return_method"] == "ค่าเฉลี่ยผลตอบแทน 1 ปี (ทับซ้อน)"
+
+    @pytest.mark.parametrize("method", [
+        "ค่าเฉลี่ยผลตอบแทน 1 ปี (ทับซ้อน)", "ค่าเฉลี่ยตลอดช่วง",
+        "ถ่วงน้ำหนักข้อมูลล่าสุด (EMA)", "CAPM (อิงความเสี่ยงเทียบตลาด)",
+    ])
+    def test_every_method_runs(self, app, method):
+        self._method(app).set_value(method)
+        at = _calculate(app)
+        assert not at.error
+        assert at.session_state["return_method"] == method
+
+    def test_changing_the_method_changes_the_weights(self, app):
+        at = _calculate(app)
+        first = dict(at.session_state["cleaned"])
+        self._method(at).set_value("CAPM (อิงความเสี่ยงเทียบตลาด)")
+        at = _calculate(at)
+        assert dict(at.session_state["cleaned"]) != first
+
+    def test_hrp_holds_every_asset(self, app):
+        at = _calculate(app)
+        hrp = at.session_state["hrp_cleaned"]
+        assert min(hrp.values()) > 0
+        assert sum(hrp.values()) == pytest.approx(1.0)
+
+    def test_hrp_is_selectable_as_a_backtest_source(self, app):
+        at = _calculate(app)
+        _widget(at.radio, "น้ำหนักที่ใช้ backtest").set_value("HRP (Risk Parity)").run()
+        assert not at.exception, at.exception
+        assert at.session_state["nav_view"]["source"] == "HRP (Risk Parity)"
+        used = {k: v for k, v in at.session_state["nav_view"]["weights"].items()}
+        assert min(used.values()) > 0
+
+    def test_hrp_does_not_depend_on_the_return_method(self, app):
+        at = _calculate(app)
+        baseline = dict(at.session_state["hrp_cleaned"])
+        self._method(at).set_value("CAPM (อิงความเสี่ยงเทียบตลาด)")
+        at = _calculate(at)
+        assert dict(at.session_state["hrp_cleaned"]) == baseline
+
+    def test_walk_forward_can_refit_with_hrp(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        at = _calculate(app)
+        _widget(at.radio, "วัตถุประสงค์").set_value("HRP (Risk Parity)").run()
+        assert not at.exception, at.exception
+        assert not at.error
+
+    def test_the_method_is_saved_in_the_url(self, app):
+        self._method(app).set_value("CAPM (อิงความเสี่ยงเทียบตลาด)")
+        at = _calculate(app)
+        assert _one(at.query_params["retm"]) == "CAPM (อิงความเสี่ยงเทียบตลาด)"
