@@ -549,3 +549,53 @@ class TestCorrelationWindow:
         expected = train[list(weekly.columns)].resample("W-FRI").last()
         pd.testing.assert_frame_equal(weekly, expected)
         assert list(weekly.columns) == list(at.session_state["ar"].index)
+
+
+class TestOrderPlan:
+    """The app could say "hold 45.9% SPY" but not "buy 29 units"."""
+
+    def test_an_order_table_is_produced(self, app):
+        at = _calculate(app)
+        assert "แปลงเป็นคำสั่งซื้อจริง" in [h.value for h in at.subheader]
+        assert not at.error
+
+    def test_the_change_left_over_is_small(self, app):
+        at = _calculate(app)
+        leftover = next(m for m in at.metric if "เศษเงินเหลือ" in m.label)
+        digits = leftover.value.replace(",", "").split()[0]
+        assert float(digits) < 1_000_000 * 0.01
+
+    def test_a_tiny_budget_is_flagged_rather_than_silently_wrong(self, app):
+        _widget(app.number_input, "เงินลงทุนตั้งต้น").set_value(100)
+        at = _calculate(app)
+        assert any("เงินไม่พอซื้อ" in w.value for w in at.warning), [w.value for w in at.warning]
+
+    def test_a_cash_sleeve_appears_as_cash_not_units(self, app):
+        _widget(app.slider, "เงินสด").set_value(30)
+        at = _calculate(app)
+        assert not at.error
+        assert at.session_state["nav_view"]["weights"][metrics.CASH_SYMBOL] == pytest.approx(0.30)
+
+    def test_the_plan_follows_the_selected_weight_source(self, app):
+        at = _calculate(app)
+        _widget(at.radio, "น้ำหนักที่ใช้ backtest").set_value("Min Volatility").run()
+        assert not at.exception, at.exception
+        assert at.session_state["nav_view"]["source"] == "Min Volatility"
+
+
+class TestRollingView:
+    def test_rolling_performance_is_available(self, app):
+        at = _calculate(app)
+        assert any("เลื่อนหน้าต่าง 1 ปี" in (e.label or "") for e in at.expander)
+
+    def test_it_reports_the_best_and_worst_year(self, app):
+        at = _calculate(app)
+        labels = [m.label for m in at.metric]
+        assert "ปีที่ดีที่สุด" in labels
+        assert "ปีที่แย่ที่สุด" in labels
+
+    def test_a_short_test_window_says_so_instead_of_breaking(self, app):
+        app.date_input[0].set_value(pd.Timestamp("2022-01-01").date())
+        app.date_input[1].set_value(pd.Timestamp("2023-02-01").date())
+        at = _calculate(app)
+        assert not at.exception, at.exception

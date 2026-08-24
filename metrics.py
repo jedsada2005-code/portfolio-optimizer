@@ -384,3 +384,35 @@ def blend_performance(annual_return, annual_volatility, risk_free_rate, cash_fra
         risky * annual_return + cash_fraction * risk_free_rate,
         risky * annual_volatility,
     )
+
+
+def rolling_performance(returns, risk_free_rate, window_years=1.0):
+    """Trailing-window return, volatility and Sharpe through time.
+
+    A single Sharpe for the whole backtest cannot distinguish a
+    portfolio that performed steadily from one that was carried by a
+    single good year.
+    """
+    r = pd.Series(returns).dropna()
+    columns = ["annual_return", "annual_volatility", "sharpe"]
+    if r.empty:
+        return pd.DataFrame(columns=columns)
+
+    ppy = periods_per_year(r.index)
+    window = int(round(ppy * window_years))
+    if window < 2 or len(r) <= window:
+        return pd.DataFrame(columns=columns)
+
+    # Summing log returns is the same as compounding, and far cheaper
+    # than a rolling apply over the whole series.
+    growth = np.expm1(np.log1p(r).rolling(window).sum())
+    annual_return = (1.0 + growth) ** (1.0 / window_years) - 1.0
+    annual_volatility = r.rolling(window).std() * np.sqrt(ppy)
+    sharpe = (annual_return - risk_free_rate) / annual_volatility.replace(0.0, np.nan)
+
+    frame = pd.DataFrame({
+        "annual_return": annual_return,
+        "annual_volatility": annual_volatility,
+        "sharpe": sharpe.fillna(0.0),
+    }).dropna(subset=["annual_return", "annual_volatility"])
+    return frame[columns]

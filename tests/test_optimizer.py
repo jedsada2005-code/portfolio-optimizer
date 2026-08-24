@@ -498,3 +498,43 @@ class TestHistoryFloorFlowsThrough:
         )
         for _, weights in result.weight_history:
             assert "NEW" not in weights
+
+
+class TestDegenerateProblems:
+    """cvxpy's SolverError inherits from neither ValueError nor
+    OptimizationError, so every handler in the app let it through to the
+    page as a raw traceback."""
+
+    def _too_short(self):
+        idx = pd.date_range("2022-01-07", periods=30, freq="W-FRI")
+        rng = np.random.default_rng(2)
+        weekly = pd.DataFrame(
+            {c: 100 * np.cumprod(1 + rng.normal(0.001, 0.02, 30))
+             for c in ("A", "B", "C", "D")},
+            index=idx,
+        )
+        expected, _ = metrics.annual_return_estimates(weekly)
+        cov = optimizer.shrink_covariance(weekly.pct_change().cov() * 52, 0.2)
+        return expected, cov
+
+    def test_solver_errors_are_included_in_the_handled_set(self):
+        assert optimizer.SolverError in optimizer.SOLVER_ERRORS
+
+    def test_a_degenerate_solve_raises_something_callers_catch(self):
+        expected, cov = self._too_short()
+        with pytest.raises(optimizer.SOLVER_ERRORS):
+            optimizer.optimize_weights(expected, cov, "Max Sharpe", 0.02, 1.0)
+
+    def test_the_frontier_returns_empty_rather_than_exploding(self):
+        expected, cov = self._too_short()
+        vols, rets = optimizer.frontier_curve(expected, cov)
+        assert len(vols) == len(rets) == 0
+
+    def test_fit_weights_declines_instead_of_raising(self):
+        idx = pd.bdate_range("2022-01-03", periods=150)
+        rng = np.random.default_rng(2)
+        prices = pd.DataFrame(
+            {c: 100 * np.cumprod(1 + rng.normal(0.001, 0.02, 150)) for c in ("A", "B")},
+            index=idx,
+        )
+        assert optimizer.fit_weights(prices, 0.02, "Max Sharpe", 1.0, 0.2) is None

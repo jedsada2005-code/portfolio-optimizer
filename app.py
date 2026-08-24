@@ -5,8 +5,8 @@ import numpy as np
 import plotly.graph_objs as go
 import plotly.express as px
 import io
-from pypfopt.exceptions import OptimizationError
 
+import allocation
 import custom_data
 import fx
 import metrics
@@ -683,7 +683,7 @@ if run_btn:
                 ar, covr, "Max Sharpe", risk_free_rate, max_weight, min_weight,
                 weekly=weekly_usable,
             )
-        except (ValueError, OptimizationError):
+        except optimizer.SOLVER_ERRORS:
             st.error(
                 "⚠️ หาพอร์ต Max Sharpe ไม่ได้ — สินทรัพย์ที่เลือกมีผลตอบแทนคาดหวังใกล้เคียงหรือต่ำกว่า "
                 f"Risk-Free Rate ที่ตั้งไว้ ({risk_free_rate:.2%}) เกินไป "
@@ -698,10 +698,17 @@ if run_btn:
         )
 
         # Min Volatility weights
-        mv_cleaned = optimizer.optimize_weights(
-            ar, covr, "Min Volatility", risk_free_rate, max_weight, min_weight,
-            weekly=weekly_usable,
-        )
+        try:
+            mv_cleaned = optimizer.optimize_weights(
+                ar, covr, "Min Volatility", risk_free_rate, max_weight, min_weight,
+                weekly=weekly_usable,
+            )
+        except optimizer.SOLVER_ERRORS as exc:
+            st.error(
+                f"⚠️ หาพอร์ต Min Volatility ไม่ได้ — {exc} "
+                "ลองขยายช่วงวันที่ หรือลดจำนวนสินทรัพย์ลง"
+            )
+            st.stop()
         mv_ret, mv_vol, mv_sharpe = optimizer.portfolio_performance(
             ar, covr, mv_cleaned, risk_free_rate
         )
@@ -1231,6 +1238,62 @@ if st.session_state.get("calculated"):
                     )
 
         st.divider()
+        st.subheader("แปลงเป็นคำสั่งซื้อจริง")
+        st.caption(
+            f"อิงราคาล่าสุด ณ {data_close.index[-1].date()} และเงินลงทุนตั้งต้น "
+            f"{total_cash:,.0f} {base_currency} — ใช้น้ำหนักชุดเดียวกับที่เลือกไว้ "
+            f"ในแท็บทดสอบย้อนหลัง (**{weight_source}**)"
+        )
+
+        plan = allocation.allocate_units(
+            weights_in_force, data_close.iloc[-1], total_cash
+        )
+        if plan.unpriced:
+            st.warning(
+                "⚠️ ไม่มีราคาล่าสุดสำหรับ: **" + ", ".join(plan.unpriced) + "** จึงคำนวณไม่ได้"
+            )
+        if plan.unaffordable:
+            st.warning(
+                "⚠️ เงินไม่พอซื้อแม้แต่ 1 หน่วยของ: **" + ", ".join(plan.unaffordable)
+                + "** — เพิ่มเงินลงทุนตั้งต้น หรือเอาตัวนั้นออกจากพอร์ต"
+            )
+
+        order = pd.DataFrame([
+            {
+                "สินทรัพย์": row["asset"],
+                "ราคาล่าสุด": "—" if row["price"] is None else f"{row['price']:,.2f}",
+                "จำนวนที่ซื้อ": (
+                    "ถือเป็นเงินสด" if row["units"] is None
+                    else f"{row['units']:,.4f}" if row["asset"].upper().startswith("MF:")
+                    else f"{row['units']:,.0f}"
+                ),
+                "เป็นเงิน": f"{row['value']:,.0f}",
+                "น้ำหนักเป้าหมาย": f"{row['target_weight']:.2%}",
+                "น้ำหนักที่ซื้อได้จริง": f"{row['actual_weight']:.2%}",
+            }
+            for row in plan.rows
+        ])
+        st.dataframe(order, use_container_width=True, hide_index=True)
+
+        drift = max(
+            (abs(r["actual_weight"] - r["target_weight"]) for r in plan.rows), default=0.0
+        )
+        a1, a2, a3 = st.columns(3)
+        a1.metric("เงินที่ลงจริง", f"{total_cash - plan.leftover:,.0f} {base_currency}")
+        a2.metric(
+            "เศษเงินเหลือ", f"{plan.leftover:,.0f} {base_currency}",
+            help="ซื้อหน่วยเต็มไม่ลงตัว จึงเหลือเศษไว้",
+        )
+        a3.metric(
+            "คลาดเคลื่อนจากเป้าหมายสูงสุด", f"{drift:.2%}",
+            help="ผลจากการปัดเป็นหน่วยเต็ม ยิ่งเงินตั้งต้นมาก ยิ่งคลาดเคลื่อนน้อย",
+        )
+        st.caption(
+            "กองทุนรวมไทย (`MF:`) ซื้อเป็นจำนวนเงินและได้หน่วยเป็นทศนิยม "
+            "ส่วนหุ้นและ ETF คำนวณเป็นหน่วยเต็ม"
+        )
+
+        st.divider()
         st.subheader("น้ำหนักที่กำหนดเอง")
         st.caption(
             "ปรับน้ำหนักเองได้ ระบบจะ normalize ให้รวมเป็น 100% — "
@@ -1499,6 +1562,56 @@ if st.session_state.get("calculated"):
             height=400,
         )
         st.plotly_chart(fig_cum, use_container_width=True)
+
+        # ── Rolling Performance ──
+        rolling = metrics.rolling_performance(port_daily, risk_free_rate, 1.0)
+        with st.expander("ผลงานแบบเลื่อนหน้าต่าง 1 ปี"):
+            if rolling.empty:
+                st.info("ช่วงที่ทดสอบสั้นกว่า 1 ปี จึงยังไม่มีหน้าต่างให้คำนวณ")
+            else:
+                fig_roll = go.Figure()
+                fig_roll.add_trace(go.Scatter(
+                    x=rolling.index, y=rolling["annual_return"], mode="lines",
+                    name="ผลตอบแทน 1 ปีย้อนหลัง", line=dict(color="#2196F3"),
+                ))
+                if not bench_daily.empty:
+                    bench_roll = metrics.rolling_performance(bench_daily, risk_free_rate, 1.0)
+                    if not bench_roll.empty:
+                        fig_roll.add_trace(go.Scatter(
+                            x=bench_roll.index, y=bench_roll["annual_return"], mode="lines",
+                            name=benchmark_symbol,
+                            line=dict(color="#9E9E9E", width=1.5, dash="dash"),
+                        ))
+                fig_roll.add_hline(y=0, line_dash="dot", line_color="#BDBDBD")
+                fig_roll.update_layout(
+                    yaxis_title="ผลตอบแทน 1 ปีย้อนหลัง", yaxis_tickformat=".0%", height=330,
+                )
+                st.plotly_chart(fig_roll, use_container_width=True)
+
+                fig_sharpe = go.Figure()
+                fig_sharpe.add_trace(go.Scatter(
+                    x=rolling.index, y=rolling["sharpe"], mode="lines",
+                    name="Sharpe 1 ปีย้อนหลัง", line=dict(color="#7E57C2"),
+                ))
+                fig_sharpe.add_hline(y=0, line_dash="dot", line_color="#BDBDBD")
+                fig_sharpe.update_layout(yaxis_title="Sharpe 1 ปีย้อนหลัง", height=300)
+                st.plotly_chart(fig_sharpe, use_container_width=True)
+
+                worst = rolling["annual_return"].min()
+                best = rolling["annual_return"].max()
+                losing = float((rolling["annual_return"] < 0).mean())
+                q1, q2, q3 = st.columns(3)
+                q1.metric("ปีที่ดีที่สุด", f"{best:.2%}")
+                q2.metric("ปีที่แย่ที่สุด", f"{worst:.2%}")
+                q3.metric(
+                    "สัดส่วนช่วงที่ขาดทุน", f"{losing:.0%}",
+                    help="สัดส่วนของหน้าต่าง 1 ปีที่ให้ผลตอบแทนติดลบ",
+                )
+                st.caption(
+                    f"Sharpe รวมทั้งช่วงคือ {sharpe:.2f} แต่รายปีแกว่งระหว่าง "
+                    f"{rolling['sharpe'].min():.2f} ถึง {rolling['sharpe'].max():.2f} "
+                    "— ตัวเลขเดียวบอกไม่ได้ว่าผลงานสม่ำเสมอหรือมาจากช่วงสั้นๆ"
+                )
 
         # ── Drawdown Chart ──
         st.subheader("การขาดทุนจากจุดสูงสุด")

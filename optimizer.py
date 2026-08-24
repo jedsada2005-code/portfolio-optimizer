@@ -11,6 +11,16 @@ import pandas as pd
 from pypfopt import EfficientFrontier, HRPOpt, expected_returns as pypfopt_returns
 from pypfopt.exceptions import OptimizationError
 
+try:  # cvxpy raises this straight through pypfopt on a degenerate problem
+    from cvxpy.error import SolverError
+except ImportError:  # pragma: no cover - cvxpy ships with pypfopt
+    class SolverError(Exception):
+        pass
+
+# SolverError descends from neither ValueError nor OptimizationError, so
+# handlers catching those let it escape all the way to the page.
+SOLVER_ERRORS = (ValueError, OptimizationError, SolverError)
+
 import metrics
 
 
@@ -190,10 +200,16 @@ def optimize_weights(expected_returns, cov, objective, risk_free_rate,
         return hrp_weights(weekly)
     validate_bounds(len(expected_returns), max_weight, min_weight)
     ef = _frontier(expected_returns, cov, max_weight, min_weight)
-    if objective == "Min Volatility":
-        ef.min_volatility()
-    else:
-        ef.max_sharpe(risk_free_rate=risk_free_rate)
+    try:
+        if objective == "Min Volatility":
+            ef.min_volatility()
+        else:
+            ef.max_sharpe(risk_free_rate=risk_free_rate)
+    except SolverError as exc:
+        raise OptimizationError(
+            "solver แก้ปัญหานี้ไม่ได้ — ข้อมูลอาจสั้นเกินไปจนเมทริกซ์ความแปรปรวนร่วมผิดรูป "
+            f"({exc})"
+        ) from exc
     # clean_weights rounds to five places, which can leave the set
     # summing to 1.00002 -- harmless to the simulator, which normalises
     # anyway, but it shows up in the weights table and the workbook.
@@ -220,7 +236,10 @@ def frontier_curve(expected_returns, cov, max_weight=1.0, n_points=60, min_weigh
     figure, which depended on pypfopt's internal plot ordering.
     """
     ef = _frontier(expected_returns, cov, max_weight, min_weight)
-    ef.min_volatility()
+    try:
+        ef.min_volatility()
+    except SOLVER_ERRORS:
+        return np.array([]), np.array([])
     low = ef.portfolio_performance()[0]
     high = max_achievable_return(expected_returns, max_weight, min_weight)
     if high - low <= 1e-9:
@@ -233,7 +252,7 @@ def frontier_curve(expected_returns, cov, max_weight=1.0, n_points=60, min_weigh
             point = _frontier(expected_returns, cov, max_weight, min_weight)
             point.efficient_return(target)
             ret, vol, _ = point.portfolio_performance()
-        except (ValueError, OptimizationError):
+        except SOLVER_ERRORS:
             continue
         vols.append(vol)
         rets.append(ret)
@@ -300,7 +319,7 @@ def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage,
             expected, cov, objective, risk_free_rate, max_weight, min_weight,
             weekly=weekly[usable],
         )
-    except (ValueError, OptimizationError):
+    except SOLVER_ERRORS:
         return None
 
 
