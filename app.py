@@ -237,6 +237,15 @@ with st.sidebar:
         ).strip().upper()
 
     with st.expander("⚙️ การตั้งค่าขั้นสูง"):
+        min_weight = st.slider(
+            "น้ำหนักขั้นต่ำต่อสินทรัพย์", 0, 50,
+            int(round(qp_number("minw", 0.0) * 100)), step=1, format="%d%%",
+            help=(
+                "บังคับให้ทุกตัวได้อย่างน้อยเท่านี้ กันไม่ให้ optimizer ตัดบางตัวเหลือ 0% "
+                "ตั้งได้ไม่เกิน 100% ÷ จำนวนสินทรัพย์ และคิดจากส่วนที่เป็นสินทรัพย์เสี่ยง "
+                "(ไม่รวมสัดส่วนเงินสด)"
+            ),
+        ) / 100
         max_weight = st.slider(
             "น้ำหนักสูงสุดต่อสินทรัพย์", 5, 100,
             int(round(qp_number("maxw", 1.0) * 100)), step=5, format="%d%%",
@@ -329,6 +338,7 @@ input_signature = (
     refit_label,
     float(cash_fraction),
     float(max_weight),
+    float(min_weight),
     float(shrinkage),
 )
 
@@ -584,11 +594,10 @@ if run_btn:
             )
             st.stop()
 
-        if max_weight * len(ar) < 1.0:
-            st.error(
-                f"⚠️ น้ำหนักสูงสุดต่อสินทรัพย์ {max_weight:.0%} × {len(ar)} ตัว ไม่ถึง 100% "
-                f"— ต้องตั้งเพดานอย่างน้อย {1 / len(ar):.0%} หรือเพิ่มสินทรัพย์"
-            )
+        try:
+            optimizer.validate_bounds(len(ar), max_weight, min_weight)
+        except ValueError as exc:
+            st.error(f"⚠️ {exc}")
             st.stop()
 
         sample_cov = weekly.pct_change().cov() * 52
@@ -597,7 +606,9 @@ if run_btn:
         # Random portfolios
         n_samples = 200_000
         rng = np.random.default_rng(42)
-        w = optimizer.sample_weights(rng, len(ar), n_samples, max_weight)
+        w = optimizer.sample_weights(
+            rng, len(ar), n_samples, max_weight, min_weight=min_weight
+        )
         n_samples = len(w)
         rets = w.dot(ar)
         # NumPy's BLAS kernels raise spurious divide/overflow warnings on
@@ -616,7 +627,7 @@ if run_btn:
         # Max Sharpe weights
         try:
             cleaned = optimizer.optimize_weights(
-                ar, covr, "Max Sharpe", risk_free_rate, max_weight
+                ar, covr, "Max Sharpe", risk_free_rate, max_weight, min_weight
             )
         except (ValueError, OptimizationError):
             st.error(
@@ -634,7 +645,7 @@ if run_btn:
 
         # Min Volatility weights
         mv_cleaned = optimizer.optimize_weights(
-            ar, covr, "Min Volatility", risk_free_rate, max_weight
+            ar, covr, "Min Volatility", risk_free_rate, max_weight, min_weight
         )
         mv_ret, mv_vol, mv_sharpe = optimizer.portfolio_performance(
             ar, covr, mv_cleaned, risk_free_rate
@@ -645,7 +656,13 @@ if run_btn:
 
         # Efficient frontier curve, solved directly instead of read back
         # out of a throwaway matplotlib figure.
-        ef_x, ef_y = optimizer.frontier_curve(ar, covr, max_weight)
+        ef_x, ef_y = optimizer.frontier_curve(ar, covr, max_weight, min_weight=min_weight)
+        # Draw the unconstrained frontier alongside it so the cost of the
+        # bounds is visible rather than merely asserted.
+        if max_weight < 1.0 or min_weight > 0.0:
+            free_x, free_y = optimizer.frontier_curve(ar, covr)
+        else:
+            free_x, free_y = np.array([]), np.array([])
 
     # Store in session for tabs
     st.session_state["data_close"] = data_close
@@ -672,6 +689,8 @@ if run_btn:
     st.session_state["mv_perf"] = (mv_ret, mv_vol, mv_sharpe)
     st.session_state["random"] = (stds, rets, sharpes)
     st.session_state["ef_curve"] = (ef_x, ef_y)
+    st.session_state["ef_curve_free"] = (free_x, free_y)
+    st.session_state["min_weight"] = min_weight
     st.session_state["stock_list"] = list(data_close.columns)
     st.session_state["total_cash"] = total_cash
     st.session_state["risk_free_rate"] = risk_free_rate
@@ -684,7 +703,8 @@ if run_btn:
         "symbols": symbols_input, "start": str(start_date), "end": str(end_date),
         "base": base_currency, "cash": str(total_cash), "rf": str(risk_free_rate),
         "mode": backtest_mode, "reb": rebalance_label, "bench": benchmark_symbol,
-        "cost": str(cost_bps), "maxw": str(max_weight), "cashpct": str(cash_fraction),
+        "cost": str(cost_bps), "maxw": str(max_weight), "minw": str(min_weight),
+        "cashpct": str(cash_fraction),
         "shrink": str(shrinkage),
     })
 
@@ -699,6 +719,8 @@ if st.session_state.get("calculated"):
     mv_ret, mv_vol, mv_sharpe = st.session_state["mv_perf"]
     stds, rets, sharpes = st.session_state["random"]
     ef_x, ef_y = st.session_state["ef_curve"]
+    free_x, free_y = st.session_state["ef_curve_free"]
+    min_weight = st.session_state["min_weight"]
     stock_list = st.session_state["stock_list"]
     total_cash = st.session_state["total_cash"]
     risk_free_rate = st.session_state["risk_free_rate"]
@@ -738,6 +760,8 @@ if st.session_state.get("calculated"):
         status.append(f"💵 เงินสด {cash_fraction:.0%}")
     if max_weight < 1.0:
         status.append(f"⚖️ สูงสุด {max_weight:.0%}/ตัว")
+    if min_weight > 0:
+        status.append(f"⚖️ ขั้นต่ำ {min_weight:.0%}/ตัว")
     if benchmark_symbol:
         status.append(f"📊 เทียบ {benchmark_symbol}")
     st.caption(" · ".join(status))
@@ -813,6 +837,7 @@ if st.session_state.get("calculated"):
                 test_close, risk_free_rate, walk_objective, max_weight,
                 shrinkage, refit_freq, cost_bps,
                 cash_fraction=cash_fraction, rebalance_freq=rebalance_freq,
+                min_weight=min_weight,
             )
         if walk_result.returns.empty:
             st.error(
@@ -956,9 +981,17 @@ if st.session_state.get("calculated"):
                         colorbar=dict(title="Sharpe"), opacity=0.6),
             name="Random Portfolios",
         ))
+        if len(free_x):
+            fig.add_trace(go.Scatter(
+                x=free_x, y=free_y, mode="lines",
+                line=dict(color="#9E9E9E", width=1.5, dash="dash"),
+                name="ไม่มีข้อจำกัดน้ำหนัก",
+            ))
         fig.add_trace(go.Scatter(
-            x=ef_x, y=ef_y, mode="lines",
+            x=ef_x, y=ef_y,
+            mode="lines" if len(ef_x) > 1 else "markers",
             line=dict(color="red", width=2),
+            marker=dict(color="red", size=12),
             name="Efficient Frontier",
         ))
         fig.add_trace(go.Scatter(
@@ -980,6 +1013,20 @@ if st.session_state.get("calculated"):
             height=600,
         )
         st.plotly_chart(fig, use_container_width=True)
+
+        if len(ef_x) <= 1:
+            st.warning(
+                f"⚠️ น้ำหนักขั้นต่ำ {min_weight:.0%} × {len(stock_list)} ตัว = 100% พอดี "
+                "จึงเหลือพอร์ตที่เป็นไปได้เพียงแบบเดียว คือลงเท่ากันทุกตัว "
+                "— เส้น frontier จึงยุบเหลือจุดเดียว ลดขั้นต่ำลงเพื่อให้มีทางเลือก"
+            )
+        elif len(free_x):
+            gap = np.interp(ef_x, free_x, free_y) - ef_y
+            st.caption(
+                f"เส้นประ = ไม่มีข้อจำกัดน้ำหนัก · ที่ระดับความเสี่ยงเท่ากัน ข้อจำกัดที่ตั้งไว้ "
+                f"ทำให้ผลตอบแทนคาดหวังลดลงเฉลี่ย **{gap.mean():.2%}** ต่อปี "
+                "(แลกกับพอร์ตที่กระจายตัวกว่าและมักทนทานกว่าเมื่อเจอข้อมูลจริง)"
+            )
 
         st.subheader("ค่าสหสัมพันธ์ระหว่างสินทรัพย์")
         correlation = data_close.resample("W-FRI").last().pct_change().corr()

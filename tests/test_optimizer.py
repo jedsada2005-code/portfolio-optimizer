@@ -280,3 +280,105 @@ class TestWalkForwardRespectsSettings:
             prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 200.0, rebalance_freq="M",
         )
         assert (1 + charged.returns).prod() < (1 + free.returns).prod()
+
+
+class TestMinimumWeight:
+    @pytest.fixture
+    def ar(self):
+        return pd.Series({"A": 0.12, "B": 0.20, "C": 0.05, "D": 0.09})
+
+    @pytest.fixture
+    def cov(self):
+        return _cov(
+            [[0.0400, 0.0180, 0.0020, 0.0050],
+             [0.0180, 0.0900, 0.0045, 0.0060],
+             [0.0020, 0.0045, 0.0100, 0.0015],
+             [0.0050, 0.0060, 0.0015, 0.0250]],
+            list("ABCD"),
+        )
+
+    def test_no_holding_falls_below_the_floor(self, ar, cov):
+        for objective in ("Max Sharpe", "Min Volatility"):
+            w = optimizer.optimize_weights(ar, cov, objective, 0.02, 1.0, min_weight=0.10)
+            assert min(w.values()) >= 0.10 - 1e-6, (objective, w)
+            assert sum(w.values()) == pytest.approx(1.0)
+
+    def test_a_floor_removes_the_zero_allocations(self):
+        # D is dominated: the lowest return and the highest variance, so
+        # an unconstrained solve refuses to hold it at all.
+        ar = pd.Series({"A": 0.12, "B": 0.20, "C": 0.09, "D": 0.01})
+        cov = _cov(
+            [[0.040, 0.018, 0.005, 0.010],
+             [0.018, 0.090, 0.006, 0.012],
+             [0.005, 0.006, 0.025, 0.008],
+             [0.010, 0.012, 0.008, 0.160]],
+            list("ABCD"),
+        )
+        unbounded = optimizer.optimize_weights(ar, cov, "Max Sharpe", 0.02, 1.0)
+        assert unbounded["D"] < 1e-6
+
+        floored = optimizer.optimize_weights(ar, cov, "Max Sharpe", 0.02, 1.0, min_weight=0.05)
+        assert all(v >= 0.05 - 1e-6 for v in floored.values())
+
+    def test_floor_and_cap_hold_at_once(self, ar, cov):
+        w = optimizer.optimize_weights(ar, cov, "Max Sharpe", 0.02, 0.40, min_weight=0.15)
+        assert min(w.values()) >= 0.15 - 1e-6
+        assert max(w.values()) <= 0.40 + 1e-6
+
+    def test_a_floor_at_equal_weight_leaves_one_portfolio(self, ar, cov):
+        w = optimizer.optimize_weights(ar, cov, "Max Sharpe", 0.02, 1.0, min_weight=0.25)
+        assert all(v == pytest.approx(0.25, abs=1e-4) for v in w.values())
+
+    def test_a_floor_that_cannot_be_funded_is_rejected(self, ar, cov):
+        with pytest.raises(ValueError, match="ขั้นต่ำ"):
+            optimizer.optimize_weights(ar, cov, "Max Sharpe", 0.02, 1.0, min_weight=0.30)
+
+    def test_a_floor_above_the_cap_is_rejected(self, ar, cov):
+        with pytest.raises(ValueError, match="ขั้นต่ำ"):
+            optimizer.optimize_weights(ar, cov, "Max Sharpe", 0.02, 0.10, min_weight=0.20)
+
+    def test_max_achievable_return_accounts_for_the_floor(self):
+        ar = pd.Series({"A": 0.10, "B": 0.30, "C": 0.20, "D": 0.05})
+        # every asset takes 10% first, then the best ones fill the rest
+        expected = 0.10 * (0.10 + 0.30 + 0.20 + 0.05) + 0.30 * 0.30 + 0.30 * 0.20
+        assert optimizer.max_achievable_return(ar, 0.40, 0.10) == pytest.approx(expected)
+
+    def test_floor_shrinks_the_reachable_return_range(self):
+        ar = pd.Series({"A": 0.10, "B": 0.30, "C": 0.20, "D": 0.05})
+        assert optimizer.max_achievable_return(ar, 1.0, 0.10) < optimizer.max_achievable_return(ar, 1.0)
+
+    def test_frontier_curve_respects_the_floor(self, ar, cov):
+        vols, rets = optimizer.frontier_curve(ar, cov, 1.0, n_points=20, min_weight=0.10)
+        assert len(vols) >= 1
+        assert max(rets) <= optimizer.max_achievable_return(ar, 1.0, 0.10) + 1e-6
+
+    def test_frontier_collapses_to_a_point_at_equal_weight(self, ar, cov):
+        vols, rets = optimizer.frontier_curve(ar, cov, 1.0, n_points=20, min_weight=0.25)
+        assert len(set(np.round(rets, 8))) == 1
+
+    def test_sampled_clouds_respect_the_floor(self):
+        rng = np.random.default_rng(0)
+        w = optimizer.sample_weights(rng, 6, 5000, max_weight=0.40, min_weight=0.10)
+        assert len(w) > 0
+        assert w.min() >= 0.10 - 1e-9
+        assert w.max() <= 0.40 + 1e-9
+        assert np.allclose(w.sum(axis=1), 1.0)
+
+    def test_an_unfundable_floor_samples_nothing(self):
+        rng = np.random.default_rng(0)
+        assert len(optimizer.sample_weights(rng, 6, 100, min_weight=0.25)) == 0
+
+    def test_walk_forward_applies_the_floor_every_period(self):
+        rng = np.random.default_rng(6)
+        idx = pd.bdate_range("2014-01-01", periods=2200)
+        prices = pd.DataFrame(
+            {c: 100 * np.cumprod(1 + rng.normal(m, s, 2200))
+             for c, m, s in [("A", 0.0006, 0.012), ("B", 0.0003, 0.008), ("C", 0.0004, 0.02)]},
+            index=idx,
+        )
+        result = optimizer.walk_forward(
+            prices, 0.02, "Max Sharpe", 1.0, 0.2, "Y", 0.0, min_weight=0.20,
+        )
+        assert result.weight_history
+        for _, weights in result.weight_history:
+            assert min(weights.values()) >= 0.20 - 1e-6

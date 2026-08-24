@@ -164,7 +164,7 @@ class TestPercentSliders:
         # Four holdings need at least 25% each to reach a full allocation.
         _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(20)
         at = _calculate(app)
-        assert any("25%" in e.value for e in at.error)
+        assert any("25.0%" in e.value for e in at.error), [e.value for e in at.error]
 
     def test_a_saved_link_restores_the_percent_position(self):
         at = AppTest.from_file("app.py", default_timeout=300)
@@ -379,3 +379,50 @@ class TestResetButton:
         assert not at.exception, at.exception
         assert "calculated" not in at.session_state
         assert _widget(at.text_input, "สินทรัพย์ในพอร์ต").value == "AMZN, META, LLY, SPY, NVDA, GOOGL"
+
+
+class TestMinimumWeightControl:
+    def test_a_floor_removes_every_zero_allocation(self, app):
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(10)
+        at = _calculate(app)
+        assert not at.error
+        weights = at.session_state["cleaned"]
+        assert min(weights.values()) >= 0.10 - 1e-6
+
+    def test_zero_floor_keeps_the_previous_behaviour(self, app):
+        at = _calculate(app)
+        assert at.session_state["min_weight"] == 0.0
+        assert not at.error
+
+    def test_an_unfundable_floor_is_refused_with_the_limit(self, app):
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(30)
+        at = _calculate(app)
+        assert any("25.0%" in e.value for e in at.error), [e.value for e in at.error]
+
+    def test_a_floor_above_the_cap_is_refused(self, app):
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(25)
+        _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(20)
+        at = _calculate(app)
+        assert any("มากกว่าน้ำหนักสูงสุด" in e.value for e in at.error)
+
+    def test_the_random_cloud_respects_the_floor(self, app):
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(10)
+        at = _calculate(app)
+        stds, rets, sharpes = at.session_state["random"]
+        assert len(stds) > 0
+
+    def test_a_comparison_frontier_is_kept_when_bounds_are_set(self, app):
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(10)
+        at = _calculate(app)
+        free_x, free_y = at.session_state["ef_curve_free"]
+        assert len(free_x) > 1
+
+    def test_no_comparison_frontier_without_bounds(self, app):
+        at = _calculate(app)
+        free_x, _ = at.session_state["ef_curve_free"]
+        assert len(free_x) == 0
+
+    def test_the_floor_is_saved_in_the_url(self, app):
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(15)
+        at = _calculate(app)
+        assert _one(at.query_params["minw"]) == "0.15"
