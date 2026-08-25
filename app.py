@@ -638,18 +638,22 @@ if run_btn:
                 "— ไม่รวมในการคำนวณพอร์ต "
                 "(ลองขยายช่วงวันที่ หรือลดเกณฑ์ในการตั้งค่าขั้นสูง)"
             )
-        if min_history_years < 3:
-            st.caption(
-                f"ℹ️ เกณฑ์ประวัติขั้นต่ำตั้งไว้ {min_history_years} ปี ซึ่งต่ำกว่าค่าแนะนำ "
-                "หน้าต่างผลตอบแทน 1 ปีทับซ้อนกันเกือบทั้งหมด (autocorrelation ~0.96) "
-                "ข้อมูลสั้นจึงให้ตัวอย่างอิสระน้อยมากและค่าประมาณจะแกว่งแรง"
-            )
+            # The warning above promises these are excluded, so exclude
+            # them here rather than under the reminder below -- nesting
+            # the two together meant tightening the floor switched the
+            # exclusion off.
             drop = list(insufficient)
             data_close = data_close.drop(columns=drop)
             train_close = train_close.drop(columns=drop)
             test_close = test_close.drop(columns=drop)
             weekly = weekly.drop(columns=drop)
             ar = ar.drop(index=drop)
+        if min_history_years < 3:
+            st.caption(
+                f"ℹ️ เกณฑ์ประวัติขั้นต่ำตั้งไว้ {min_history_years} ปี ซึ่งต่ำกว่าค่าแนะนำ "
+                "หน้าต่างผลตอบแทน 1 ปีทับซ้อนกันเกือบทั้งหมด (autocorrelation ~0.96) "
+                "ข้อมูลสั้นจึงให้ตัวอย่างอิสระน้อยมากและค่าประมาณจะแกว่งแรง"
+            )
 
         if len(ar) < 2:
             st.error(
@@ -955,19 +959,25 @@ if st.session_state.get("calculated"):
         )
     
     walk_result = None
+    # The same backtest with costs switched off. Comparing against
+    # anything else -- a fixed in-sample portfolio, say -- charges the
+    # whole in-sample/out-of-sample gap to trading fees.
+    gross_daily = None
     if backtest_mode == "Walk-Forward":
+        walk_kwargs = dict(
+            cash_fraction=cash_fraction, rebalance_freq=rebalance_freq,
+            min_weight=min_weight, return_method=return_method,
+            min_observations=required_observations,
+            target=(
+                target_volatility if walk_objective == optimizer.TARGET_VOLATILITY
+                else target_return if walk_objective == optimizer.TARGET_RETURN
+                else None
+            ),
+        )
         with st.spinner("Running walk-forward..."):
             walk_result = optimizer.walk_forward(
                 test_close, risk_free_rate, walk_objective, max_weight,
-                shrinkage, refit_freq, cost_bps,
-                cash_fraction=cash_fraction, rebalance_freq=rebalance_freq,
-                min_weight=min_weight, return_method=return_method,
-                min_observations=required_observations,
-                target=(
-                    target_volatility if walk_objective == optimizer.TARGET_VOLATILITY
-                    else target_return if walk_objective == optimizer.TARGET_RETURN
-                    else None
-                ),
+                shrinkage, refit_freq, cost_bps, **walk_kwargs,
             )
         if walk_result.returns.empty:
             st.error(
@@ -981,6 +991,12 @@ if st.session_state.get("calculated"):
         )
         port_daily = walk_result.returns
         daily_returns = result.assets
+        if cost_bps > 0:
+            with st.spinner("Measuring what the trading cost..."):
+                gross_daily = optimizer.walk_forward(
+                    test_close, risk_free_rate, walk_objective, max_weight,
+                    shrinkage, refit_freq, 0.0, **walk_kwargs,
+                ).returns
     else:
         weights_in_force = backtest_w
         # In split mode the weights were fitted on train_close only,
@@ -990,6 +1006,10 @@ if st.session_state.get("calculated"):
         )
         port_daily = result.returns
         daily_returns = result.assets
+        if cost_bps > 0:
+            gross_daily = metrics.simulate_portfolio(
+                test_prices, backtest_w, rebalance_freq, 0.0
+            ).returns
     
     if port_daily.empty:
         st.error(
@@ -1556,33 +1576,6 @@ if st.session_state.get("calculated"):
                     "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
                 )
 
-        if bench_stats is not None:
-            st.subheader(f"เทียบกับ Benchmark: {benchmark_symbol}")
-            versus = pd.DataFrame({
-                "": ["Annual Return", "Annual Volatility", "Sharpe Ratio", "Max Drawdown"],
-                "Portfolio": [
-                    f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}", f"{max_dd:.2%}",
-                ],
-                benchmark_symbol: [
-                    f"{bench_stats['annual_return']:.2%}",
-                    f"{bench_stats['annual_volatility']:.2%}",
-                    f"{bench_stats['sharpe']:.2f}",
-                    f"{bench_stats['max_drawdown']:.2%}",
-                ],
-            })
-            st.dataframe(versus, use_container_width=True, hide_index=True)
-
-            b1, b2, b3 = st.columns(3)
-            b1.metric("Beta", f"{beta:.2f}", help="ความอ่อนไหวต่อ benchmark — 1.0 คือเคลื่อนไหวตามกัน")
-            b2.metric("Alpha (ต่อปี)", f"{alpha:.2%}", help="ผลตอบแทนส่วนเกินหลังปรับความเสี่ยงตาม beta")
-            b3.metric("ชนะ Benchmark", f"{ann_ret - bench_stats['annual_return']:+.2%}")
-
-            if ann_ret <= bench_stats["annual_return"]:
-                st.info(
-                    f"ℹ️ พอร์ตนี้ให้ผลตอบแทนไม่ชนะการถือ **{benchmark_symbol}** เฉยๆ "
-                    "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"
-                )
-
         # ── Rebalancing ──
         st.subheader("การ Rebalance")
         r1, r2, r3 = st.columns(3)
@@ -1595,9 +1588,8 @@ if st.session_state.get("calculated"):
             "Turnover รวม", f"{turnover_series.sum():.0%}",
             help="มูลค่าที่ซื้อขายรวมทั้งช่วง คิดเป็นสัดส่วนของมูลค่าพอร์ต",
         )
-        if cost_bps > 0:
-            gross = metrics.simulate_portfolio(test_prices, backtest_w, rebalance_freq, 0.0)
-            gross_stats = metrics.backtest_stats(gross.returns, risk_free_rate)
+        if cost_bps > 0 and gross_daily is not None and not gross_daily.empty:
+            gross_stats = metrics.backtest_stats(gross_daily, risk_free_rate)
             st.caption(
                 f"ค่าธรรมเนียม {cost_bps:.0f} bps กินผลตอบแทนต่อปีไป "
                 f"**{gross_stats['annual_return'] - ann_ret:.2%}** "
