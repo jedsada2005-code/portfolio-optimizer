@@ -7,12 +7,15 @@ mode and read in another -- which py_compile and pytest cannot see.
 Marked slow because each case downloads real prices from Yahoo.
 """
 
+import re
+
 import pandas as pd
 import pytest
 
 from streamlit.testing.v1 import AppTest
 
 import metrics
+import optimizer
 
 
 pytestmark = pytest.mark.slow
@@ -675,3 +678,111 @@ class TestWalkForwardUsesEverySetting:
         _widget(app.slider, "ประวัติขั้นต่ำที่ยอมรับ").set_value(6)
         at = _calculate(app)
         assert not at.exception, at.exception
+
+
+class TestHistoryFloorActuallyExcludes:
+    """The warning said "ไม่รวมในการคำนวณพอร์ต" while the exclusion sat
+    inside `if min_history_years < 3`, so it ran only when the floor was
+    set BELOW the default -- tightening the control turned it off."""
+
+    def test_an_asset_short_of_the_floor_never_reaches_the_optimiser(self, app):
+        # META listed May 2012, so in the train half of this window it
+        # backs its estimate with 75 trailing-year windows against the
+        # 104 the default floor demands, while SPY/QQQ/GLD each have 146.
+        _widget(app.text_input, "สินทรัพย์ในพอร์ต").set_value("SPY, QQQ, GLD, META")
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2011-01-01"))
+        _widget(app.date_input, "End Date").set_value(pd.Timestamp("2016-06-01"))
+        at = _calculate(app)
+
+        assert "META" not in list(at.session_state["ar"].index)
+        assert "META" not in at.session_state["covr"].columns
+        for name, weights in at.session_state["objective_weights"].items():
+            assert "META" not in weights, name
+
+    def test_a_floor_nothing_can_clear_stops_the_run(self, app):
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2021-06-01"))
+        _widget(app.slider, "ประวัติขั้นต่ำที่ยอมรับ").set_value(6)
+        _widget(app.button, "Calculate").click().run()
+
+        assert not app.exception, app.exception
+        assert app.error, "no asset clears a 6-year floor in a 4-year window"
+
+    def test_a_listing_younger_than_the_split_does_not_crash_the_page(self, app):
+        # ARM listed Sep 2023, after this window's train/test boundary, so
+        # it contributes an all-NaN covariance row. Keeping it reached
+        # np.linalg.eigh, which failed to converge and took the whole page
+        # down rather than merely mis-weighting it.
+        _widget(app.text_input, "สินทรัพย์ในพอร์ต").set_value("SPY, TLT, GLD, QQQ, ARM")
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2015-01-01"))
+        at = _calculate(app)
+
+        assert not at.error
+        assert "ARM" not in list(at.session_state["ar"].index)
+
+    def test_a_floor_it_clears_still_lets_the_asset_through(self, app):
+        # Guard against over-correcting into "drop everything": the same
+        # holding the default floor rejects has to survive a floor it
+        # genuinely clears.
+        _widget(app.text_input, "สินทรัพย์ในพอร์ต").set_value("SPY, QQQ, GLD, META")
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2011-01-01"))
+        _widget(app.date_input, "End Date").set_value(pd.Timestamp("2016-06-01"))
+        _widget(app.slider, "ประวัติขั้นต่ำที่ยอมรับ").set_value(1)
+        at = _calculate(app)
+        assert "META" in list(at.session_state["ar"].index)
+
+
+class TestFeeDragComparesLikeWithLike:
+    """In walk-forward mode the "before fees" baseline was a fixed
+    in-sample portfolio, so the whole in-sample/out-of-sample gap was
+    reported as the cost of trading."""
+
+    def _reported_drag(self, at):
+        pattern = re.compile(r"กินผลตอบแทนต่อปีไป \*\*(-?[\d.]+)%\*\*")
+        for caption in at.caption:
+            found = pattern.search(caption.value or "")
+            if found:
+                return float(found.group(1)) / 100.0
+        raise LookupError("no fee-drag caption rendered")
+
+    def test_walk_forward_drag_matches_the_same_run_without_costs(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        _widget(app.selectbox, "Rebalance").set_value("รายไตรมาส")
+        _widget(app.number_input, "ค่าธรรมเนียม").set_value(100.0)
+        at = _calculate(app)
+
+        state = at.session_state
+        objective = _widget(at.selectbox, "วัตถุประสงค์ที่ใช้คำนวณ").value
+        common = dict(
+            cash_fraction=state["cash_fraction"],
+            rebalance_freq=metrics.REBALANCE_FREQUENCIES[state["rebalance_label"]],
+            min_weight=state["min_weight"],
+            return_method=state["return_method"],
+            min_observations=state["required_observations"],
+        )
+        net, gross = (
+            optimizer.walk_forward(
+                state["test_close"], state["risk_free_rate"], objective,
+                state["max_weight"], state["shrinkage"], state["refit_freq"],
+                bps, **common,
+            ).returns
+            for bps in (state["cost_bps"], 0.0)
+        )
+        truth = (
+            metrics.backtest_stats(gross, state["risk_free_rate"])["annual_return"]
+            - metrics.backtest_stats(net, state["risk_free_rate"])["annual_return"]
+        )
+        assert self._reported_drag(at) == pytest.approx(truth, abs=5e-4)
+
+    def test_split_mode_drag_still_matches(self, app):
+        _widget(app.selectbox, "Rebalance").set_value("รายไตรมาส")
+        _widget(app.number_input, "ค่าธรรมเนียม").set_value(100.0)
+        at = _calculate(app)
+        assert 0.0 <= self._reported_drag(at) < 0.05
+
+
+def test_the_benchmark_comparison_is_rendered_once(app):
+    at = _calculate(app)
+    headings = [
+        s.value for s in at.subheader if "เทียบกับ Benchmark" in (s.value or "")
+    ]
+    assert len(headings) == 1, headings
