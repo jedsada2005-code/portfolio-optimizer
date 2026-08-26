@@ -610,3 +610,158 @@ class TestEffectiveHoldings:
     def test_an_empty_portfolio_is_worth_nothing(self):
         assert metrics.effective_holdings({}) == 0.0
         assert metrics.effective_holdings({"A": 0.0}) == 0.0
+
+
+class TestRollingCorrelation:
+    """A single correlation matrix for the whole window hides the thing
+    diversification lives or dies by: SPY and TLT averaged -0.25 over
+    2007-2025 but ran at +0.12 through 2022, and the average pair went
+    from 0.20 in calm years to 0.51 in the first quarter of 2020."""
+
+    @staticmethod
+    def _weekly(periods=300):
+        return pd.date_range("2015-01-02", periods=periods, freq="W-FRI")
+
+    def test_two_identical_series_correlate_perfectly_throughout(self):
+        index = self._weekly()
+        rng = np.random.default_rng(1)
+        moves = rng.normal(0.001, 0.02, len(index))
+        returns = pd.DataFrame({"A": moves, "B": moves}, index=index)
+
+        rolling = metrics.rolling_correlation(returns, 52)
+        assert not rolling.empty
+        assert rolling.min() == pytest.approx(1.0)
+
+    def test_mirror_images_correlate_negatively(self):
+        index = self._weekly()
+        rng = np.random.default_rng(2)
+        moves = rng.normal(0.001, 0.02, len(index))
+        returns = pd.DataFrame({"A": moves, "B": -moves}, index=index)
+
+        assert metrics.rolling_correlation(returns, 52).max() == pytest.approx(-1.0)
+
+    def test_a_regime_change_shows_up_in_the_line(self):
+        index = self._weekly(400)
+        rng = np.random.default_rng(3)
+        independent = rng.normal(0, 0.02, len(index))
+        shared = rng.normal(0, 0.02, len(index))
+        # Second half: both assets are driven by the same shock.
+        a = independent.copy()
+        b = rng.normal(0, 0.02, len(index))
+        a[200:], b[200:] = shared[200:], shared[200:]
+        returns = pd.DataFrame({"A": a, "B": b}, index=index)
+
+        rolling = metrics.rolling_correlation(returns, 52)
+        assert abs(rolling.iloc[0]) < 0.4
+        assert rolling.iloc[-1] > 0.9
+
+    def test_every_pair_counts_equally(self):
+        index = self._weekly()
+        rng = np.random.default_rng(4)
+        moves = rng.normal(0.001, 0.02, len(index))
+        returns = pd.DataFrame(
+            {"A": moves, "B": moves, "C": -moves}, index=index
+        )
+        # AB is +1, AC and BC are -1, so the mean of the three is -1/3.
+        assert metrics.rolling_correlation(returns, 52).iloc[-1] == pytest.approx(-1 / 3)
+
+    def test_a_window_longer_than_the_data_gives_nothing(self):
+        index = self._weekly(30)
+        rng = np.random.default_rng(5)
+        returns = pd.DataFrame(
+            {"A": rng.normal(0, 0.02, 30), "B": rng.normal(0, 0.02, 30)}, index=index
+        )
+        assert metrics.rolling_correlation(returns, 52).empty
+
+    def test_one_holding_has_no_pairs_to_correlate(self):
+        index = self._weekly()
+        rng = np.random.default_rng(6)
+        returns = pd.DataFrame({"A": rng.normal(0, 0.02, len(index))}, index=index)
+        assert metrics.rolling_correlation(returns, 52).empty
+
+    def test_a_named_pair_can_be_followed_on_its_own(self):
+        index = self._weekly()
+        rng = np.random.default_rng(7)
+        moves = rng.normal(0.001, 0.02, len(index))
+        returns = pd.DataFrame(
+            {"A": moves, "B": -moves, "C": rng.normal(0, 0.02, len(index))}, index=index
+        )
+        pair = metrics.rolling_pair_correlation(returns, "A", "B", 52)
+        assert pair.max() == pytest.approx(-1.0)
+
+
+class TestIndependentAnnualReturns:
+    """Trailing-year windows overlap by 51 of their 52 weeks, so treating
+    them as a sample badly overstates how much evidence there is."""
+
+    @staticmethod
+    def _weekly(years):
+        index = pd.date_range("2005-01-07", periods=52 * years, freq="W-FRI")
+        return pd.DataFrame(
+            {"UP": 100.0 * 1.10 ** (np.arange(len(index)) / 52.0)}, index=index
+        )
+
+    def test_ten_years_of_weeks_yield_about_nine_annual_observations(self):
+        rows = metrics.independent_annual_returns(self._weekly(10))
+        assert 8 <= len(rows) <= 10
+
+    def test_the_windows_do_not_overlap(self):
+        rows = metrics.independent_annual_returns(self._weekly(10))
+        gaps = rows.index.to_series().diff().dropna().dt.days
+        assert (gaps >= 360).all(), gaps.tolist()
+
+    def test_a_steady_riser_reports_its_rate_each_year(self):
+        rows = metrics.independent_annual_returns(self._weekly(10))
+        assert rows["UP"].mean() == pytest.approx(0.10, abs=5e-3)
+
+    def test_less_than_a_year_yields_nothing(self):
+        assert metrics.independent_annual_returns(self._weekly(1)).empty
+
+
+class TestBootstrapReturnInterval:
+    """The optimiser reads an expected return as an exact number and
+    allocates to one decimal place off the back of it. On eighteen
+    independent years SPY's 11.6% carries a 90% interval of 5.0% to
+    18.6% -- which is why 1/N keeps beating the optimisers."""
+
+    @staticmethod
+    def _weekly(years, drift, vol, seed=0):
+        index = pd.date_range("2005-01-07", periods=52 * years, freq="W-FRI")
+        rng = np.random.default_rng(seed)
+        moves = rng.normal(drift, vol, len(index))
+        return pd.DataFrame({"X": 100.0 * np.cumprod(1 + moves)}, index=index)
+
+    def test_the_interval_brackets_the_estimate(self):
+        weekly = self._weekly(20, 0.002, 0.02)
+        row = metrics.bootstrap_return_interval(weekly).loc["X"]
+        middle = metrics.independent_annual_returns(weekly)["X"].mean()
+        assert row["low"] < middle < row["high"]
+
+    def test_more_confidence_needs_a_wider_interval(self):
+        weekly = self._weekly(20, 0.002, 0.02)
+        narrow = metrics.bootstrap_return_interval(weekly, level=0.50).loc["X"]
+        wide = metrics.bootstrap_return_interval(weekly, level=0.95).loc["X"]
+        assert (wide["high"] - wide["low"]) > (narrow["high"] - narrow["low"])
+
+    def test_a_noisier_asset_gets_a_wider_interval(self):
+        calm = metrics.bootstrap_return_interval(self._weekly(20, 0.002, 0.005)).loc["X"]
+        wild = metrics.bootstrap_return_interval(self._weekly(20, 0.002, 0.05)).loc["X"]
+        assert (wild["high"] - wild["low"]) > (calm["high"] - calm["low"])
+
+    def test_the_same_prices_give_the_same_interval_twice(self):
+        weekly = self._weekly(20, 0.002, 0.02)
+        first = metrics.bootstrap_return_interval(weekly).loc["X"]
+        second = metrics.bootstrap_return_interval(weekly).loc["X"]
+        assert first["low"] == second["low"] and first["high"] == second["high"]
+
+    def test_it_reports_how_many_independent_years_it_had(self):
+        row = metrics.bootstrap_return_interval(self._weekly(12, 0.002, 0.02)).loc["X"]
+        assert 10 <= row["samples"] <= 12
+
+    def test_an_asset_with_too_little_history_is_left_out(self):
+        weekly = self._weekly(20, 0.002, 0.02)
+        weekly["NEW"] = np.nan
+        weekly.iloc[-40:, weekly.columns.get_loc("NEW")] = 100.0
+        table = metrics.bootstrap_return_interval(weekly)
+        assert "X" in table.index
+        assert "NEW" not in table.index

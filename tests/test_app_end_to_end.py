@@ -1068,3 +1068,87 @@ class TestRebalancingReportsAreExact:
         for symbol, weight in held.items():
             if weight > 0:
                 assert f"{symbol} {weight:.0%}→" in drift[0], (symbol, drift[0])
+
+
+class TestCorrelationIsShownThroughTime:
+    """The heatmap is one matrix for the whole window, which hides the
+    only thing that matters about diversification: whether it survives
+    the quarter you need it in."""
+
+    def test_the_range_the_average_moved_through_is_reported(self, app):
+        at = _calculate(app)
+        truth = metrics.rolling_correlation(
+            at.session_state["weekly_usable"].pct_change(), 52
+        )
+        # not bare "แกว่งระหว่าง": the rolling-Sharpe caption uses it too.
+        said = [
+            c.value for c in at.caption
+            if "ค่าสหสัมพันธ์เฉลี่ยแกว่งระหว่าง" in (c.value or "")
+        ]
+        assert said, [c.value for c in at.caption]
+        assert f"{truth.min():.2f}" in said[0]
+        assert f"{truth.max():.2f}" in said[0]
+
+    def test_the_range_is_wider_than_the_single_headline_number(self, app):
+        at = _calculate(app)
+        rolling = metrics.rolling_correlation(
+            at.session_state["weekly_usable"].pct_change(), 52
+        )
+        assert rolling.max() - rolling.min() > 0.05, "no movement to show"
+
+    def test_one_pair_can_be_followed_on_its_own(self, app):
+        at = _calculate(app)
+        picker = _widget(at.selectbox, "ดูค่าสหสัมพันธ์รายคู่")
+        assert len(picker.options) > 1
+        picker.set_value(picker.options[1]).run()
+        assert not at.exception, at.exception
+
+    def test_too_little_history_says_so_instead_of_drawing_nothing(self, app):
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2023-06-01"))
+        _widget(app.slider, "ประวัติขั้นต่ำที่ยอมรับ").set_value(1)
+        at = _calculate(app)
+        assert not at.exception, at.exception
+
+
+class TestEstimatesCarryTheirUncertainty:
+    """The optimiser reads an expected return as exact and allocates to
+    one decimal place off it. On eighteen independent years SPY's 11.6%
+    carries a 90% interval from 5.0% to 18.6%."""
+
+    def _table(self, at):
+        for frame in at.dataframe:
+            table = frame.value
+            if "ช่วง 90%" in list(getattr(table, "columns", [])):
+                return table.set_index("สินทรัพย์")
+        raise LookupError("no interval column rendered")
+
+    def test_each_estimate_shows_the_interval_around_it(self, app):
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2007-01-01"))
+        at = _calculate(app)
+        truth = metrics.bootstrap_return_interval(at.session_state["weekly_usable"])
+        table = self._table(at)
+        for asset in truth.index:
+            cell = table.loc[asset, "ช่วง 90%"]
+            assert f"{truth.loc[asset, 'low']:.1%}" in cell, (asset, cell)
+            assert f"{truth.loc[asset, 'high']:.1%}" in cell, (asset, cell)
+
+    def test_the_independent_sample_size_is_stated(self, app):
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2007-01-01"))
+        at = _calculate(app)
+        truth = metrics.bootstrap_return_interval(at.session_state["weekly_usable"])
+        table = self._table(at)
+        for asset in truth.index:
+            assert str(int(truth.loc[asset, "samples"])) in table.loc[asset, "ปีอิสระ"]
+
+    def test_the_widest_interval_is_called_out(self, app):
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2007-01-01"))
+        at = _calculate(app)
+        assert any(
+            "ช่วงกว้างที่สุด" in (c.value or "") for c in at.caption
+        ), [c.value for c in at.caption]
+
+    def test_a_short_window_leaves_the_interval_out_rather_than_faking_it(self, app):
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2021-01-01"))
+        _widget(app.slider, "ประวัติขั้นต่ำที่ยอมรับ").set_value(1)
+        at = _calculate(app)
+        assert not at.exception, at.exception
