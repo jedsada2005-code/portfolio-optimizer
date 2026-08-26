@@ -788,6 +788,12 @@ if run_btn:
 
         # Efficient frontier curve, solved directly instead of read back
         # out of a throwaway matplotlib figure.
+        # Both are diagnostics over the fitting window, so they belong
+        # with the other precomputed results rather than being rebuilt
+        # every time a tab redraws.
+        rolling_corr = metrics.rolling_correlation(weekly_usable.pct_change())
+        return_intervals = metrics.bootstrap_return_interval(weekly_usable)
+
         ef_x, ef_y = optimizer.frontier_curve(ar, covr, max_weight, min_weight=min_weight)
         # Draw the unconstrained frontier alongside it so the cost of the
         # bounds is visible rather than merely asserted.
@@ -828,6 +834,8 @@ if run_btn:
     st.session_state["target_return"] = target_return
     st.session_state["return_method"] = return_method
     st.session_state["weekly_usable"] = weekly_usable
+    st.session_state["rolling_corr"] = rolling_corr
+    st.session_state["return_intervals"] = return_intervals
     st.session_state["random"] = (stds, rets, sharpes)
     st.session_state["ef_curve"] = (ef_x, ef_y)
     st.session_state["ef_curve_free"] = (free_x, free_y)
@@ -870,6 +878,8 @@ if st.session_state.get("calculated"):
     target_return = st.session_state["target_return"]
     return_method = st.session_state["return_method"]
     weekly_usable = st.session_state["weekly_usable"]
+    rolling_corr = st.session_state["rolling_corr"]
+    return_intervals = st.session_state["return_intervals"]
     stds, rets, sharpes = st.session_state["random"]
     ef_x, ef_y = st.session_state["ef_curve"]
     free_x, free_y = st.session_state["ef_curve_free"]
@@ -1341,6 +1351,53 @@ if st.session_state.get("calculated"):
             )
         )
 
+        st.markdown("**ค่าสหสัมพันธ์เปลี่ยนไปตามเวลา**")
+        if rolling_corr.empty:
+            st.info(
+                "ช่วงที่ใช้หาน้ำหนักสั้นกว่า 1 ปี จึงยังไม่มีหน้าต่างให้คำนวณ "
+                "— ขยายช่วงวันที่เพื่อดูว่าค่าสหสัมพันธ์นิ่งจริงหรือไม่"
+            )
+        else:
+            names = list(weekly_usable.columns)
+            pair_labels = {
+                f"{a} ↔ {b}": (a, b)
+                for i, a in enumerate(names) for b in names[i + 1:]
+            }
+            picked = st.selectbox(
+                "ดูค่าสหสัมพันธ์รายคู่", ["— ค่าเฉลี่ยอย่างเดียว —"] + list(pair_labels),
+                help=(
+                    "ค่าเฉลี่ยบอกภาพรวม แต่คู่ที่คุณพึ่งพาให้กระจายความเสี่ยง "
+                    "อาจเปลี่ยนพฤติกรรมคนละแบบกับค่าเฉลี่ย"
+                ),
+            )
+            fig_roll_corr = go.Figure()
+            fig_roll_corr.add_trace(go.Scatter(
+                x=rolling_corr.index, y=rolling_corr.values, mode="lines",
+                name="เฉลี่ยทุกคู่", line=dict(color="#2196F3", width=2),
+            ))
+            if picked in pair_labels:
+                first, second = pair_labels[picked]
+                pair_series = metrics.rolling_pair_correlation(
+                    weekly_usable.pct_change(), first, second
+                )
+                fig_roll_corr.add_trace(go.Scatter(
+                    x=pair_series.index, y=pair_series.values, mode="lines",
+                    name=picked, line=dict(color="#EF6C00", width=1.5),
+                ))
+            fig_roll_corr.add_hline(y=0, line_dash="dot", line_color="#BDBDBD")
+            fig_roll_corr.update_layout(
+                yaxis_title="ค่าสหสัมพันธ์ 1 ปีย้อนหลัง",
+                yaxis_range=[-1, 1], height=330,
+            )
+            st.plotly_chart(fig_roll_corr, use_container_width=True)
+            st.caption(
+                f"ค่าสหสัมพันธ์เฉลี่ยแกว่งระหว่าง **{rolling_corr.min():.2f}** "
+                f"({rolling_corr.idxmin().date()}) ถึง **{rolling_corr.max():.2f}** "
+                f"({rolling_corr.idxmax().date()}) — optimizer ใช้ค่าเดียวจากทั้งช่วง "
+                f"({average_corr:.2f}) ซึ่งไม่ใช่ค่าที่มีอยู่จริงตอนตลาดตก "
+                "ช่วงที่ค่าพุ่งขึ้นคือช่วงที่การกระจายความเสี่ยงหายไป"
+            )
+
     # ════════════════════════════════════════
     # Tab 2: Optimal Weights + Custom Sliders
     # ════════════════════════════════════════
@@ -1419,12 +1476,37 @@ if st.session_state.get("calculated"):
                     "น้ำหนักที่ได้จึงวิ่งตามค่าประมาณนี้ ลองเปลี่ยนวิธีประมาณแล้วดูว่า "
                     "น้ำหนักเปลี่ยนไปแค่ไหน"
                 )
+            # The optimiser reads each of these as an exact number and
+            # allocates to one decimal place off it. Resampling the
+            # independent years behind the estimate says how much of that
+            # decimal is real.
+            if not return_intervals.empty:
+                widest = (
+                    return_intervals["high"] - return_intervals["low"]
+                ).idxmax()
+                span = return_intervals.loc[widest]
+                st.caption(
+                    f"📏 ช่วงกว้างที่สุดคือ **{widest}**: ค่าที่ใช้ {ar[widest]:.1%} "
+                    f"ต่อปี แต่ข้อมูล {int(span['samples'])} ปีอิสระรองรับได้แค่ระดับ "
+                    f"**{span['low']:.1%} ถึง {span['high']:.1%}** (ความเชื่อมั่น 90%) "
+                    "— น้ำหนักที่ optimizer คำนวณละเอียดกว่าที่ข้อมูลบอกได้จริงมาก"
+                )
+
             with st.expander("ค่าคาดหวังเทียบกับที่เกิดขึ้นจริง (ช่วงที่ใช้หาน้ำหนัก)"):
                 st.dataframe(
                     pd.DataFrame([
                         {
                             "สินทรัพย์": a,
                             "คาดหวัง": f"{ar[a]:.2%}",
+                            "ช่วง 90%": (
+                                f"{return_intervals.loc[a, 'low']:.1%} – "
+                                f"{return_intervals.loc[a, 'high']:.1%}"
+                                if a in return_intervals.index else "—"
+                            ),
+                            "ปีอิสระ": (
+                                f"{int(return_intervals.loc[a, 'samples'])}"
+                                if a in return_intervals.index else "—"
+                            ),
                             "เกิดขึ้นจริง": f"{realised[a]:.2%}",
                             "ต่าง": f"{gaps[a]:+.2%}",
                         }
@@ -1436,6 +1518,12 @@ if st.session_state.get("calculated"):
                     "ค่าคาดหวังไม่จำเป็นต้องเท่ากับอดีต นั่นคือหน้าที่ของตัวประมาณ "
                     "แต่ถ้าห่างกันมากบนข้อมูลชุดเดียวกับที่มันเห็น ก็ควรตั้งคำถาม "
                     f"— เกณฑ์ที่ใช้เตือนคือห่างเกิน {ESTIMATE_GAP_LIMIT:.0%}"
+                )
+                st.caption(
+                    "ช่วง 90% มาจากการสุ่มซ้ำ (bootstrap) เฉพาะปีที่**ไม่ทับซ้อนกัน** "
+                    "เพราะหน้าต่าง 1 ปีแบบทับซ้อนมี autocorrelation ~0.96 ถ้านับรวม "
+                    "จะได้ช่วงที่แคบกว่าความจริงมาก · ตัวที่มีข้อมูลน้อยกว่า 4 ปีอิสระ "
+                    "จะไม่แสดงช่วง เพราะประมาณไม่ได้"
                 )
 
 
