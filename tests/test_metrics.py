@@ -875,3 +875,65 @@ class TestSimulationStopsWhenAHoldingDoes:
         invented = metrics.backtest_stats(stretched.returns, 0.02)
         assert honest["annual_volatility"] > invented["annual_volatility"]
         assert honest["years"] < invented["years"]
+
+
+class TestAnchoredGrowth:
+    """Two growth curves each based at 1.0 on different dates cannot be
+    compared by eye. A benchmark that listed later restarted at 1.00
+    while the portfolio was already at 4.84, so the chart showed the
+    portfolio winning 2.6x while the table -- correctly -- had it losing
+    by 9.85% a year."""
+
+    @staticmethod
+    def _pair():
+        index = pd.bdate_range("2010-01-01", "2025-01-01")
+        rng = np.random.default_rng(3)
+        port = pd.Series(rng.normal(0.0005, 0.010, len(index)), index=index)
+        bench = pd.Series(
+            100 * np.cumprod(1 + rng.normal(0.0009, 0.012, len(index))), index=index
+        )
+        bench.loc[:"2018-01-01"] = np.nan
+        return port, bench
+
+    def test_the_benchmark_starts_where_the_portfolio_stood(self):
+        port, bench_px = self._pair()
+        aligned = metrics.align_benchmark(port, bench_px)
+        port_curve = (1.0 + port).cumprod()
+
+        curve = metrics.anchored_growth(aligned.benchmark, port_curve)
+        assert curve.iloc[0] == pytest.approx(port_curve.loc[aligned.start])
+
+    def test_the_line_that_ends_higher_is_the_one_that_performed_better(self):
+        port, bench_px = self._pair()
+        aligned = metrics.align_benchmark(port, bench_px)
+        port_curve = (1.0 + port).cumprod()
+        bench_curve = metrics.anchored_growth(aligned.benchmark, port_curve)
+
+        port_cagr = metrics.backtest_stats(aligned.portfolio, 0.0)["annual_return"]
+        bench_cagr = metrics.backtest_stats(aligned.benchmark, 0.0)["annual_return"]
+
+        chart_says_bench_won = bench_curve.iloc[-1] > port_curve.iloc[-1]
+        stats_say_bench_won = bench_cagr > port_cagr
+        assert chart_says_bench_won == stats_say_bench_won
+
+    def test_a_benchmark_covering_the_whole_window_is_unchanged(self):
+        index = pd.bdate_range("2020-01-01", "2022-12-31")
+        rng = np.random.default_rng(8)
+        port = pd.Series(rng.normal(0.0004, 0.01, len(index)), index=index)
+        bench = pd.Series(rng.normal(0.0003, 0.01, len(index)), index=index)
+        bench.iloc[0] = 0.0
+        port_curve = (1.0 + port).cumprod()
+
+        curve = metrics.anchored_growth(bench, port_curve)
+        assert curve.iloc[0] == pytest.approx(port_curve.iloc[0])
+
+    def test_no_returns_gives_no_curve(self):
+        index = pd.bdate_range("2020-01-01", periods=5)
+        reference = pd.Series(1.0, index=index)
+        assert metrics.anchored_growth(pd.Series(dtype=float), reference).empty
+
+    def test_an_empty_reference_falls_back_to_one(self):
+        index = pd.bdate_range("2020-01-01", periods=5)
+        returns = pd.Series(0.01, index=index)
+        curve = metrics.anchored_growth(returns, pd.Series(dtype=float))
+        assert curve.iloc[0] == pytest.approx(1.01)

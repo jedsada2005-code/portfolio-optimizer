@@ -525,6 +525,17 @@ if run_btn:
     if needed:
         with st.spinner("Downloading exchange rates..."):
             rates = download_fx_rates(tuple(needed), str(start_date), str(end_date))
+        late = fx.late_rates(data_close, asset_currencies, base_currency, rates)
+        if late:
+            detail = ", ".join(
+                f"**{cur}** เริ่ม {pd.Timestamp(day).date()}" for cur, day in late.items()
+            )
+            st.warning(
+                f"⚠️ อัตราแลกเปลี่ยนยังไม่มีข้อมูลตั้งแต่ต้นช่วง: {detail} "
+                f"(ข้อมูลราคาเริ่ม {data_close.index[0].date()}) "
+                "— วันก่อนหน้านั้นแปลงค่าเงินไม่ได้ จึงไม่ถูกนำมาคำนวณ "
+                "(เดิมระบบเติมเรตย้อนหลังให้ ทำให้ผลของค่าเงินช่วงนั้นกลายเป็นศูนย์)"
+            )
         try:
             data_close = fx.convert_prices(
                 data_close, asset_currencies, base_currency, rates
@@ -1972,8 +1983,13 @@ if st.session_state.get("calculated"):
             line=dict(color="#2196F3"),
         ))
         if not bench_daily.empty:
+            # Anchored, not based at 1.0: a benchmark that listed later
+            # would otherwise restart from scratch beneath a portfolio
+            # that had already grown, and the picture would contradict
+            # the statistics beside it.
+            bench_curve = metrics.anchored_growth(bench_daily, cumulative)
             fig_cum.add_trace(go.Scatter(
-                x=bench_daily.index, y=(1 + bench_daily).cumprod().values,
+                x=bench_curve.index, y=bench_curve.values,
                 mode="lines", name=benchmark_symbol,
                 line=dict(color="#9E9E9E", width=1.5, dash="dash"),
             ))
@@ -1982,6 +1998,12 @@ if st.session_state.get("calculated"):
             height=400,
         )
         st.plotly_chart(fig_cum, use_container_width=True)
+        if not bench_daily.empty and bench_daily.index[0] > port_daily.index[0]:
+            st.caption(
+                f"เริ่มเส้น **{benchmark_symbol}** ที่ {bench_daily.index[0].date()} "
+                f"ซึ่งเป็นวันแรกที่มันมีข้อมูล และตั้งต้นให้เท่ากับมูลค่าพอร์ต ณ วันนั้น "
+                "— ถ้าเริ่มที่ 1.0 ใหม่ ระยะห่างระหว่างสองเส้นจะไม่ใช่ผลต่างจริง"
+            )
 
         # ── Rolling Performance ──
         rolling = metrics.rolling_performance(port_daily, risk_free_rate, 1.0)

@@ -576,6 +576,29 @@ def blend_performance(annual_return, annual_volatility, risk_free_rate, cash_fra
     )
 
 
+def anchored_growth(returns, reference_curve):
+    """Growth of ``returns``, starting where ``reference_curve`` stood.
+
+    Two curves each based at 1.0 on different dates cannot be compared
+    by eye. A benchmark that listed later restarted at 1.00 while the
+    portfolio was already at 4.84, so the chart showed the portfolio
+    ahead 2.6x on a window the statistics -- correctly -- had it losing
+    by 9.85% a year. Anchoring the later curve to the earlier one at
+    their shared start makes the gap between the lines the real one.
+    """
+    r = pd.Series(returns).dropna()
+    if r.empty:
+        return pd.Series(dtype=float)
+
+    anchor = 1.0
+    reference = pd.Series(reference_curve).dropna()
+    if not reference.empty:
+        prior = reference.loc[:r.index[0]]
+        if not prior.empty:
+            anchor = float(prior.iloc[-1])
+    return anchor * (1.0 + r).cumprod()
+
+
 def rolling_performance(returns, risk_free_rate, window_years=1.0):
     """Trailing-window return, volatility and Sharpe through time.
 
