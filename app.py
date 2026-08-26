@@ -96,6 +96,21 @@ def current_url():
         return f"?{query}"
 
 
+def seed(key, value):
+    """Store a widget's starting value once, then let its key own it.
+
+    Passing the default as ``value=`` instead makes Streamlit re-create
+    the widget whenever that default moves -- which Calculate does on
+    every run, by writing the settings into the URL -- so an edit the
+    reader had not yet calculated was silently discarded. st.slider
+    ignores its key entirely in that situation, which is reproducible in
+    six lines. Seeding once and passing no default is what the symbol
+    box already did.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
 def qp_choice(key, options, default_index=0):
     value = st.query_params.get(key)
     return options.index(value) if value in options else default_index
@@ -158,10 +173,35 @@ st.title("Portfolio Optimizer & Backtesting")
 with st.sidebar:
     st.header("Settings")
 
+    # Every control below carries an explicit key. Without one, Streamlit
+    # identifies a widget partly by its `value=` argument -- and these all
+    # take their default from st.query_params, which Calculate rewrites.
+    # The widget was therefore re-created on the next rerun and any edit
+    # the reader had not yet calculated was silently discarded.
+    #
     # Only the inputs a typical run actually touches stay visible. Every
     # default below is usable as-is, so grouping the rest behind
     # expanders costs nothing and stops Calculate from sitting at the
     # bottom of nineteen controls.
+    seed("w_cash", qp_number("cash", 1_000_000, int))
+    seed("w_rf", qp_number("rf", 0.02))
+    seed("w_mode", MODES[qp_choice("mode", MODES)])
+    seed("w_train", 70)
+    seed("w_refit", "รายปี")
+    seed("w_reb", list(metrics.REBALANCE_FREQUENCIES)[
+        qp_choice("reb", list(metrics.REBALANCE_FREQUENCIES), 2)])
+    seed("w_cost", qp_number("cost", 0.0))
+    seed("w_bench", qp_text("bench", "SPY"))
+    seed("w_minw", int(round(qp_number("minw", 0.0) * 100)))
+    seed("w_maxw", int(round(qp_number("maxw", 1.0) * 100)))
+    seed("w_cashpct", int(round(qp_number("cashpct", 0.0) * 100)))
+    seed("w_tvol", qp_number("tvol", 0.12))
+    seed("w_tret", qp_number("tret", 0.10))
+    seed("w_minyrs", qp_number("minyrs", metrics.DEFAULT_MIN_HISTORY_YEARS, int))
+    seed("w_retm", list(optimizer.RETURN_METHODS)[
+        qp_choice("retm", list(optimizer.RETURN_METHODS))])
+    seed("w_shrink", qp_number("shrink", optimizer.DEFAULT_SHRINKAGE))
+
     if "pending_symbols" in st.session_state:
         st.session_state["symbols_input"] = st.session_state.pop("pending_symbols")
     elif "symbols_input" not in st.session_state:
@@ -173,16 +213,18 @@ with st.sidebar:
     )
     col1, col2 = st.columns(2)
     with col1:
+        seed("w_start", qp_date("start", pd.Timestamp("2010-01-01")))
         start_date = st.date_input(
             "Start Date",
-            value=qp_date("start", pd.Timestamp("2010-01-01")),
+            key="w_start",
             min_value=pd.Timestamp("1990-01-01"),
             max_value=pd.Timestamp.today(),
         )
     with col2:
+        seed("w_end", qp_date("end", pd.Timestamp.today()))
         end_date = st.date_input(
             "End Date",
-            value=qp_date("end", pd.Timestamp.today()),
+            key="w_end",
             min_value=pd.Timestamp("1990-01-01"),
             max_value=pd.Timestamp.today(),
         )
@@ -194,8 +236,10 @@ with st.sidebar:
         st.rerun()
 
     with st.expander("💱 เงินและสกุลเงิน"):
+        seed("w_base", fx.BASE_CURRENCIES[qp_choice("base", fx.BASE_CURRENCIES)])
         base_currency = st.selectbox(
-            "สกุลเงินฐาน", fx.BASE_CURRENCIES, index=qp_choice("base", fx.BASE_CURRENCIES),
+            "สกุลเงินฐาน", fx.BASE_CURRENCIES,
+            key="w_base",
             help=(
                 "แปลงทุกสินทรัพย์เป็นสกุลนี้ก่อนคำนวณ กองทุนไทยเป็น THB หุ้น US เป็น USD "
                 "ถ้าไม่แปลง ผลของค่าเงินจะหายไปทั้งหมดและ volatility จะต่ำกว่าความจริง"
@@ -203,10 +247,12 @@ with st.sidebar:
         )
         total_cash = st.number_input(
             f"เงินลงทุนตั้งต้น ({base_currency})",
-            value=qp_number("cash", 1_000_000, int), step=100_000,
+            step=100_000,
+            key="w_cash",
         )
         risk_free_rate = st.number_input(
-            "Risk-Free Rate", value=qp_number("rf", 0.02), step=0.01, format="%.4f",
+            "Risk-Free Rate", step=0.01, format="%.4f",
+            key="w_rf",
             help="ผลตอบแทนที่ได้โดยไม่มีความเสี่ยง ใช้เป็นฐานคำนวณ Sharpe และเป็นดอกเบี้ยของสัดส่วนเงินสด",
         )
 
@@ -214,7 +260,7 @@ with st.sidebar:
         backtest_mode = st.radio(
             "โหมด Backtest",
             MODES,
-            index=qp_choice("mode", MODES),
+            key="w_mode",
             help=(
                 "In-sample หาน้ำหนักและทดสอบบนข้อมูลชุดเดียวกัน ผลลัพธ์จะสวยเกินจริงเสมอ "
                 "Train/Test หาน้ำหนักจากช่วงแรก แล้วทดสอบบนช่วงหลังที่ไม่เคยเห็น "
@@ -225,19 +271,21 @@ with st.sidebar:
         refit_label = "รายปี"
         if backtest_mode == "Train / Test Split":
             train_fraction = st.slider(
-                "สัดส่วนช่วง Train", 30, 90, 70, step=5, format="%d%%",
+                "สัดส่วนช่วง Train", 30, 90, step=5, format="%d%%",
+                key="w_train",
                 help="ที่เหลือใช้เป็นช่วง Test สำหรับวัดผลจริงแบบ out-of-sample",
             ) / 100
         elif backtest_mode == "Walk-Forward":
             refit_label = st.selectbox(
-                "ความถี่การคำนวณน้ำหนักใหม่", ["รายไตรมาส", "รายปี"], index=1,
+                "ความถี่การคำนวณน้ำหนักใหม่", ["รายไตรมาส", "รายปี"],
+                key="w_refit",
                 help="ต้องมีข้อมูลอย่างน้อย 2 ปีก่อนการคำนวณครั้งแรก",
             )
 
         rebalance_label = st.selectbox(
             "ความถี่การ Rebalance",
             list(metrics.REBALANCE_FREQUENCIES),
-            index=qp_choice("reb", list(metrics.REBALANCE_FREQUENCIES), 2),
+            key="w_reb",
             help=(
                 "การคำนวณแบบเดิมสมมติว่าปรับพอร์ตกลับสัดส่วนเดิมทุกวันทำการโดยไม่มีค่าใช้จ่าย "
                 "ซึ่งทำไม่ได้จริงและดันผลตอบแทนสูงเกินจริง"
@@ -245,7 +293,8 @@ with st.sidebar:
         )
         cost_bps = st.number_input(
             "ค่าธรรมเนียมซื้อขาย (bps ต่อมูลค่าที่เทรด)",
-            min_value=0.0, max_value=500.0, value=qp_number("cost", 0.0), step=5.0,
+            min_value=0.0, max_value=500.0, step=5.0,
+            key="w_cost",
             help=(
                 "100 bps = 1% คิดจากมูลค่าที่ซื้อขายจริงในแต่ละรอบ rebalance เท่านั้น "
                 "(ไม่คิดตอนซื้อครั้งแรก) หมายเหตุ: NAV กองทุนและราคา ETF หัก "
@@ -254,14 +303,15 @@ with st.sidebar:
             ),
         )
         benchmark_symbol = st.text_input(
-            "Benchmark (เว้นว่างได้)", value=qp_text("bench", "SPY"),
+            "Benchmark (เว้นว่างได้)",
+            key="w_bench",
             help="สัญลักษณ์ Yahoo สำหรับเทียบผลงาน ไม่ถูกนับรวมเป็นสินทรัพย์ในพอร์ต เช่น SPY หรือ ^SET.BK",
         ).strip().upper()
 
     with st.expander("⚙️ การตั้งค่าขั้นสูง"):
         min_weight = st.slider(
-            "น้ำหนักขั้นต่ำต่อสินทรัพย์", 0, 50,
-            int(round(qp_number("minw", 0.0) * 100)), step=1, format="%d%%",
+            "น้ำหนักขั้นต่ำต่อสินทรัพย์", 0, 50, step=1, format="%d%%",
+            key="w_minw",
             help=(
                 "บังคับให้ทุกตัวได้อย่างน้อยเท่านี้ กันไม่ให้ optimizer ตัดบางตัวเหลือ 0% "
                 "ตั้งได้ไม่เกิน 100% ÷ จำนวนสินทรัพย์ และคิดจากส่วนที่เป็นสินทรัพย์เสี่ยง "
@@ -269,16 +319,16 @@ with st.sidebar:
             ),
         ) / 100
         max_weight = st.slider(
-            "น้ำหนักสูงสุดต่อสินทรัพย์", 5, 100,
-            int(round(qp_number("maxw", 1.0) * 100)), step=5, format="%d%%",
+            "น้ำหนักสูงสุดต่อสินทรัพย์", 5, 100, step=5, format="%d%%",
+            key="w_maxw",
             help=(
                 "กันไม่ให้ optimizer ทุ่มน้ำหนักเกือบทั้งหมดลงสินทรัพย์ตัวเดียว "
                 "ต้องตั้งไม่ต่ำกว่า 100% หารด้วยจำนวนสินทรัพย์ เช่น 4 ตัวต้องอย่างน้อย 25%"
             ),
         ) / 100
         cash_fraction = st.slider(
-            "สัดส่วนเงินสด", 0, 90,
-            int(round(qp_number("cashpct", 0.0) * 100)), step=5, format="%d%%",
+            "สัดส่วนเงินสด", 0, 90, step=5, format="%d%%",
+            key="w_cashpct",
             help=(
                 "กันเงินไว้เป็นเงินสดที่ได้ผลตอบแทนเท่า Risk-Free Rate "
                 "สินทรัพย์เสี่ยงที่เหลือคงสัดส่วนภายในเดิม (two-fund separation)"
@@ -286,17 +336,19 @@ with st.sidebar:
         ) / 100
         target_volatility = st.number_input(
             "ความเสี่ยงเป้าหมายต่อปี", min_value=0.01, max_value=1.0,
-            value=qp_number("tvol", 0.12), step=0.01, format="%.2f",
+            step=0.01, format="%.2f",
+            key="w_tvol",
             help=f"ใช้เมื่อเลือกวิธี “{optimizer.TARGET_VOLATILITY}”",
         )
         target_return = st.number_input(
             "ผลตอบแทนเป้าหมายต่อปี", min_value=-0.5, max_value=2.0,
-            value=qp_number("tret", 0.10), step=0.01, format="%.2f",
+            step=0.01, format="%.2f",
+            key="w_tret",
             help=f"ใช้เมื่อเลือกวิธี “{optimizer.TARGET_RETURN}”",
         )
         min_history_years = st.slider(
             "ประวัติขั้นต่ำที่ยอมรับ (ปี)", 1, 6,
-            qp_number("minyrs", metrics.DEFAULT_MIN_HISTORY_YEARS, int),
+            key="w_minyrs",
             help=(
                 "สินทรัพย์ที่มีข้อมูลสั้นกว่านี้จะไม่ถูกนำมาคำนวณ "
                 "หน้าต่างผลตอบแทน 1 ปีทับซ้อนกันเกือบทั้งหมด ข้อมูล 3 ปีจึงให้ "
@@ -306,7 +358,7 @@ with st.sidebar:
         return_method = st.selectbox(
             "วิธีประมาณผลตอบแทนคาดหวัง",
             list(optimizer.RETURN_METHODS),
-            index=qp_choice("retm", list(optimizer.RETURN_METHODS)),
+            key="w_retm",
             help=(
                 "ตัวแปรที่มีผลต่อน้ำหนักมากที่สุด — เปลี่ยนวิธีอาจย้ายน้ำหนักจาก 88% "
                 "ในตัวหนึ่ง ไปเป็น 26% ในอีกตัวได้ CAPM มักให้พอร์ตที่กระจายตัวกว่า "
@@ -314,8 +366,8 @@ with st.sidebar:
             ),
         )
         shrinkage = st.slider(
-            "Covariance Shrinkage", 0.0, 1.0,
-            qp_number("shrink", optimizer.DEFAULT_SHRINKAGE), step=0.05,
+            "Covariance Shrinkage", 0.0, 1.0, step=0.05,
+            key="w_shrink",
             format="%.2f",
             help=(
                 "ดึงค่าสหสัมพันธ์เข้าหาค่าเฉลี่ย ทำให้น้ำหนักที่ได้เสถียรขึ้นและ "
@@ -638,7 +690,9 @@ if run_btn:
             test_close = data_close
 
         weekly = train_close.resample("W-FRI").last()
-        ar, ar_observations = optimizer.estimate_returns_with_counts(weekly, return_method)
+        ar, ar_observations = optimizer.estimate_returns_with_counts(
+            weekly, return_method, risk_free_rate
+        )
 
         # An expected return built from a handful of overlapping 52-week
         # windows is noise, and the optimiser will happily chase it into
@@ -1489,7 +1543,8 @@ if st.session_state.get("calculated"):
             help=(
                 f"ถือ {len(sel_weights)} ตัว แต่กระจายตัวเท่ากับถือเท่าๆ กันกี่ตัว "
                 "(inverse Herfindahl) — 40/30/20/10 นับได้ 3.3 ตัว ส่วน 25/25/25/25 "
-                "นับได้ 4.0 ตัว ยิ่งต่ำแปลว่ายิ่งกระจุก"
+                "นับได้ 4.0 ตัว ยิ่งต่ำแปลว่ายิ่งกระจุก · วัดเฉพาะสินทรัพย์เสี่ยง "
+                "ไม่นับเงินสด เพราะเงินสดไม่ได้ช่วยกระจายความเสี่ยง"
             ),
         )
 

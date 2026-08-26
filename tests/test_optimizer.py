@@ -942,3 +942,88 @@ class TestComparisonRowsShareOneWindow:
         years = {name: row["years"] for name, row in table.items()}
         assert len(years) >= 2
         assert max(years.values()) - min(years.values()) < 0.02, years
+
+
+class TestCAPMReceivesTheRiskFreeRate:
+    """CAPM is R_i = R_f + beta_i (E[R_m] - R_f), but the call omitted
+    risk_free_rate entirely, so pypfopt used its 0.0 default whatever the
+    sidebar said. Low-beta holdings came out understated and high-beta
+    ones overstated -- by 1.8 points either way on a three-asset test."""
+
+    @staticmethod
+    def _weekly():
+        index = pd.date_range("2010-01-08", periods=780, freq="W-FRI")
+        rng = np.random.default_rng(17)
+        market = rng.normal(0.0015, 0.02, len(index))
+        return pd.DataFrame({
+            "HIGHBETA": 100 * np.cumprod(1 + 1.8 * market + rng.normal(0, 0.004, len(index))),
+            "LOWBETA": 100 * np.cumprod(1 + 0.3 * market + rng.normal(0, 0.004, len(index))),
+            "MID": 100 * np.cumprod(1 + 1.0 * market + rng.normal(0, 0.004, len(index))),
+        }, index=index)
+
+    def test_the_rate_changes_the_estimate(self):
+        weekly = self._weekly()
+        at_zero = optimizer.estimate_returns(weekly, "CAPM (อิงความเสี่ยงเทียบตลาด)")
+        at_two = optimizer.estimate_returns(
+            weekly, "CAPM (อิงความเสี่ยงเทียบตลาด)", risk_free_rate=0.02
+        )
+        assert not np.allclose(at_zero.values, at_two.values)
+
+    def test_a_low_beta_holding_is_raised_by_a_higher_rate(self):
+        weekly = self._weekly()
+        low = [
+            optimizer.estimate_returns(
+                weekly, "CAPM (อิงความเสี่ยงเทียบตลาด)", risk_free_rate=r
+            )["LOWBETA"]
+            for r in (0.0, 0.05)
+        ]
+        assert low[1] > low[0]
+
+    def test_a_high_beta_holding_is_lowered_by_a_higher_rate(self):
+        weekly = self._weekly()
+        high = [
+            optimizer.estimate_returns(
+                weekly, "CAPM (อิงความเสี่ยงเทียบตลาด)", risk_free_rate=r
+            )["HIGHBETA"]
+            for r in (0.0, 0.05)
+        ]
+        assert high[1] < high[0]
+
+    def test_the_rate_is_treated_as_an_annual_one(self):
+        # pypfopt annualises the market return before applying the
+        # formula, so an asset with beta 1 lands on the market return
+        # whatever the rate, and beta 0 would land on the rate itself.
+        weekly = self._weekly()
+        rate = 0.04
+        estimate = optimizer.estimate_returns(
+            weekly, "CAPM (อิงความเสี่ยงเทียบตลาด)", risk_free_rate=rate
+        )
+        spread = (estimate["HIGHBETA"] - estimate["LOWBETA"])
+        at_zero = optimizer.estimate_returns(weekly, "CAPM (อิงความเสี่ยงเทียบตลาด)")
+        # the spread scales with (market - rate), so a 4% rate shrinks it
+        assert spread < (at_zero["HIGHBETA"] - at_zero["LOWBETA"])
+
+    @pytest.mark.parametrize("method", [
+        "ค่าเฉลี่ยผลตอบแทน 1 ปี (ทับซ้อน)",
+        "ค่าเฉลี่ยตลอดช่วง",
+        "ถ่วงน้ำหนักข้อมูลล่าสุด (EMA)",
+    ])
+    def test_the_other_estimators_ignore_the_rate(self, method):
+        weekly = self._weekly()
+        a = optimizer.estimate_returns(weekly, method)
+        b = optimizer.estimate_returns(weekly, method, risk_free_rate=0.05)
+        pd.testing.assert_series_equal(a, b)
+
+    def test_walk_forward_fits_use_the_rate_too(self):
+        index = pd.bdate_range("2010-01-01", periods=3000)
+        rng = np.random.default_rng(23)
+        market = rng.normal(0.0006, 0.012, len(index))
+        prices = pd.DataFrame({
+            "A": 100 * np.cumprod(1 + 1.7 * market),
+            "B": 100 * np.cumprod(1 + 0.2 * market),
+            "C": 100 * np.cumprod(1 + 1.0 * market),
+        }, index=index)
+        method = "CAPM (อิงความเสี่ยงเทียบตลาด)"
+        low = optimizer.fit_weights(prices, 0.0, "Max Sharpe", 1.0, 0.2, return_method=method)
+        high = optimizer.fit_weights(prices, 0.08, "Max Sharpe", 1.0, 0.2, return_method=method)
+        assert low != high
