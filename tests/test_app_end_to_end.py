@@ -882,3 +882,112 @@ class TestStatusChipsMatchTheChosenObjective:
         at = _calculate(app)
         status = " ".join(c.value or "" for c in at.caption if "Rebalance" in (c.value or ""))
         assert "สูงสุด 40%/ตัว" in status, status
+
+
+def _comparison_table(at):
+    for frame in at.dataframe:
+        table = frame.value
+        if "วิธี" in list(getattr(table, "columns", [])):
+            return table.set_index("วิธี")
+    raise LookupError("no objective comparison table rendered")
+
+
+class TestObjectivesAreComparedSideBySide:
+    """Choosing between seven objectives meant running seven backtests
+    and remembering the numbers; the weights of all seven were already
+    on screen but never their results."""
+
+    def test_every_solvable_objective_gets_a_row(self, app):
+        at = _calculate(app)
+        table = _comparison_table(at)
+        for name in at.session_state["objective_weights"]:
+            assert name in table.index, name
+
+    def test_the_selected_objective_row_matches_the_headline(self, app):
+        at = _calculate(app)
+        chosen = _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").value
+        row = _comparison_table(at).loc[chosen]
+        headline = {m.label: m.value for m in at.metric}
+
+        assert row["ผลตอบแทนต่อปี"] == headline["ผลตอบแทนต่อปี"]
+        assert row["ขาดทุนสูงสุด"] == headline["ขาดทุนสูงสุด"]
+        assert row["Sharpe"] == headline["Sharpe Ratio"]
+
+    def test_it_still_matches_after_switching_objective(self, app):
+        at = _calculate(app)
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value(
+            optimizer.HRP_OBJECTIVE
+        ).run()
+
+        row = _comparison_table(at).loc[optimizer.HRP_OBJECTIVE]
+        headline = {m.label: m.value for m in at.metric}
+        assert row["ผลตอบแทนต่อปี"] == headline["ผลตอบแทนต่อปี"]
+        assert row["Sharpe"] == headline["Sharpe Ratio"]
+
+    def test_walk_forward_refits_every_row_not_just_the_chosen_one(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        at = _calculate(app)
+        chosen = _widget(at.selectbox, "วัตถุประสงค์ที่ใช้คำนวณ").value
+
+        table = _comparison_table(at)
+        row = table.loc[chosen]
+        headline = {m.label: m.value for m in at.metric}
+        assert row["ผลตอบแทนต่อปี"] == headline["ผลตอบแทนต่อปี"]
+        assert row["Sharpe"] == headline["Sharpe Ratio"]
+        assert len(table) >= 3
+
+    def test_walk_forward_measures_the_baseline_over_the_same_window(self, app):
+        # walk_forward only starts after its minimum training history, so
+        # a baseline simulated from the first price would be handed extra
+        # years the optimisers never got to trade.
+        app.radio[0].set_value("Walk-Forward")
+        at = _calculate(app)
+
+        window = at.session_state["nav_view"]["returns"].index
+        prices = at.session_state["test_close"].loc[window[0]:]
+        assets = sorted(at.session_state["ar"].index)
+        expected = optimizer.compare_fixed_weights(
+            {"x": {a: 1 / len(assets) for a in assets}},
+            prices, at.session_state["risk_free_rate"],
+            metrics.REBALANCE_FREQUENCIES[at.session_state["rebalance_label"]],
+            at.session_state["cost_bps"],
+        )["x"]
+        row = _comparison_table(at).loc[optimizer.EQUAL_WEIGHT]
+        assert row["ผลตอบแทนต่อปี"] == f"{expected['annual_return']:.2%}"
+
+    def test_equal_weight_is_always_offered_as_the_naive_baseline(self, app):
+        at = _calculate(app)
+        assert optimizer.EQUAL_WEIGHT in _comparison_table(at).index
+
+    def test_untouched_custom_weights_do_not_masquerade_as_a_choice(self, app):
+        # read_custom_weights falls back to 1/N before the weights tab is
+        # ever edited, so an untouched "Custom" row would just be the
+        # equal-weight row again under a name implying the reader chose it.
+        at = _calculate(app)
+        assert not any("Custom" in str(n) for n in _comparison_table(at).index)
+
+    def test_edited_custom_weights_earn_their_own_row(self, app):
+        at = _calculate(app)
+        _widget(at.number_input, "SPY").set_value(70.0).run()
+        assert any("Custom" in str(n) for n in _comparison_table(at).index)
+
+    def test_the_equal_weight_row_really_is_equally_weighted(self, app):
+        at = _calculate(app)
+        assets = sorted(at.session_state["ar"].index)
+        expected = optimizer.compare_fixed_weights(
+            {"x": {a: 1 / len(assets) for a in assets}},
+            at.session_state["test_close"], at.session_state["risk_free_rate"],
+            metrics.REBALANCE_FREQUENCIES[at.session_state["rebalance_label"]],
+            at.session_state["cost_bps"],
+        )["x"]
+        row = _comparison_table(at).loc[optimizer.EQUAL_WEIGHT]
+        assert row["ผลตอบแทนต่อปี"] == f"{expected['annual_return']:.2%}"
+
+    def test_in_sample_mode_says_the_ranking_is_in_sample(self, app):
+        app.radio[0].set_value("In-sample (ทั้งช่วง)")
+        at = _calculate(app)
+        _comparison_table(at)
+        assert any(
+            "In-sample" in (c.value or "") and "เปรียบเทียบ" in (c.value or "")
+            for c in at.caption
+        ), [c.value for c in at.caption]

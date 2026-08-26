@@ -720,3 +720,110 @@ class TestTargetGap:
         assert optimizer.target_gap(
             optimizer.TARGET_VOLATILITY, None, expected_return=0.14, volatility=0.09
         ) is None
+
+
+def _three_sleeves(start="2015-01-01", periods=1600):
+    """Three assets with different drifts and volatilities."""
+    index = pd.bdate_range(start, periods=periods)
+    rng = np.random.default_rng(7)
+    return pd.DataFrame({
+        "FAST": 100 * np.cumprod(1 + rng.normal(0.0006, 0.014, periods)),
+        "SLOW": 100 * np.cumprod(1 + rng.normal(0.0002, 0.004, periods)),
+        "MID": 100 * np.cumprod(1 + rng.normal(0.0004, 0.009, periods)),
+    }, index=index)
+
+
+class TestCompareFixedWeights:
+    """Every column of a comparison table has to come out of the same
+    procedure, or the table ranks the procedures rather than the
+    objectives it claims to be comparing."""
+
+    def test_each_named_weight_set_is_measured(self):
+        prices = _three_sleeves()
+        table = optimizer.compare_fixed_weights(
+            {"all fast": {"FAST": 1.0}, "even": {"FAST": 1 / 3, "SLOW": 1 / 3, "MID": 1 / 3}},
+            prices, 0.02,
+        )
+        assert set(table) == {"all fast", "even"}
+        assert table["all fast"]["annual_volatility"] > table["even"]["annual_volatility"]
+
+    def test_the_same_weights_under_two_names_score_identically(self):
+        prices = _three_sleeves()
+        weights = {"FAST": 0.5, "SLOW": 0.5}
+        table = optimizer.compare_fixed_weights(
+            {"a": dict(weights), "b": dict(weights)}, prices, 0.02,
+            rebalance_freq="Q", cost_bps=25.0,
+        )
+        assert table["a"] == table["b"]
+
+    def test_a_weight_set_that_cannot_be_simulated_is_dropped(self):
+        prices = _three_sleeves()
+        table = optimizer.compare_fixed_weights(
+            {"real": {"FAST": 1.0}, "unheld": {"FAST": 0.0, "SLOW": 0.0}},
+            prices, 0.02,
+        )
+        assert set(table) == {"real"}
+
+    def test_a_cash_sleeve_lowers_the_volatility_of_every_row(self):
+        prices = _three_sleeves()
+        risky = {"FAST": 1.0}
+        bare = optimizer.compare_fixed_weights({"x": risky}, prices, 0.02)
+        with_cash = optimizer.compare_fixed_weights(
+            {"x": risky},
+            prices.assign(**{metrics.CASH_SYMBOL: metrics.cash_price_series(prices.index, 0.02)}),
+            0.02, cash_fraction=0.5,
+        )
+        assert with_cash["x"]["annual_volatility"] < bare["x"]["annual_volatility"]
+
+    def test_trading_costs_reduce_the_measured_return(self):
+        prices = _three_sleeves()
+        weights = {"FAST": 0.5, "SLOW": 0.5}
+        free = optimizer.compare_fixed_weights(
+            {"x": weights}, prices, 0.02, rebalance_freq="M", cost_bps=0.0)
+        charged = optimizer.compare_fixed_weights(
+            {"x": weights}, prices, 0.02, rebalance_freq="M", cost_bps=100.0)
+        assert charged["x"]["annual_return"] < free["x"]["annual_return"]
+
+
+class TestCompareWalkForward:
+    """Under walk-forward the comparison has to re-fit every objective on
+    the same schedule; borrowing a fixed-weight backtest for the others
+    would compare two different procedures."""
+
+    def test_each_objective_is_walked_forward(self):
+        prices = _three_sleeves(periods=2200)
+        table = optimizer.compare_walk_forward(
+            ["Max Sharpe", "Min Volatility", optimizer.HRP_OBJECTIVE],
+            prices, 0.02, max_weight=1.0, shrinkage=0.2, refit_freq="Y",
+        )
+        assert set(table) == {"Max Sharpe", "Min Volatility", optimizer.HRP_OBJECTIVE}
+        for stats in table.values():
+            assert stats["years"] > 0
+
+    def test_min_volatility_walks_out_less_volatile_than_max_sharpe(self):
+        prices = _three_sleeves(periods=2200)
+        table = optimizer.compare_walk_forward(
+            ["Max Sharpe", "Min Volatility"], prices, 0.02,
+            max_weight=1.0, shrinkage=0.2, refit_freq="Y",
+        )
+        assert (table["Min Volatility"]["annual_volatility"]
+                < table["Max Sharpe"]["annual_volatility"])
+
+    def test_a_target_is_routed_to_the_objective_that_takes_one(self):
+        prices = _three_sleeves(periods=2200)
+        table = optimizer.compare_walk_forward(
+            [optimizer.TARGET_VOLATILITY], prices, 0.02,
+            max_weight=1.0, shrinkage=0.2, refit_freq="Y",
+            targets={optimizer.TARGET_VOLATILITY: 0.08},
+        )
+        assert optimizer.TARGET_VOLATILITY in table
+
+    def test_an_objective_that_cannot_be_solved_is_skipped(self):
+        prices = _three_sleeves(periods=2200)
+        table = optimizer.compare_walk_forward(
+            ["Max Sharpe", optimizer.TARGET_RETURN], prices, 0.02,
+            max_weight=1.0, shrinkage=0.2, refit_freq="Y",
+            targets={optimizer.TARGET_RETURN: 5.0},   # 500% a year
+        )
+        assert "Max Sharpe" in table
+        assert optimizer.TARGET_RETURN not in table

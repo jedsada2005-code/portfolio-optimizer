@@ -57,6 +57,10 @@ HRP_OBJECTIVE = "HRP (Risk Parity)"
 MIN_CVAR = "Min CVaR"
 MIN_SEMIVARIANCE = "Min Semivariance"
 
+# Not an objective: the naive 1/N portfolio, carried in comparisons as
+# the baseline every optimiser has to beat to have earned its complexity.
+EQUAL_WEIGHT = "ลงเท่ากันทุกตัว (1/N)"
+
 MPT_OBJECTIVES = ["Max Sharpe", "Min Volatility", TARGET_VOLATILITY, TARGET_RETURN]
 ALTERNATIVE_OBJECTIVES = [HRP_OBJECTIVE, MIN_CVAR, MIN_SEMIVARIANCE]
 OBJECTIVES = MPT_OBJECTIVES + ALTERNATIVE_OBJECTIVES
@@ -403,6 +407,50 @@ def sample_weights(rng, n_assets, n_samples, max_weight=1.0, max_passes=12, min_
     totals = w.sum(axis=1, keepdims=True)
     keep = np.isclose(totals[:, 0], 1.0, atol=1e-6)
     return w[keep]
+
+
+def compare_fixed_weights(weights_by_name, prices, risk_free_rate,
+                          rebalance_freq=None, cost_bps=0.0, cash_fraction=0.0):
+    """Backtest several weight sets through one identical simulation.
+
+    Every row of a comparison has to come out of the same procedure on
+    the same window, or the table ranks the procedures rather than the
+    objectives it claims to be comparing.
+
+    ``prices`` must already carry the cash column when ``cash_fraction``
+    is non-zero, exactly as the single-portfolio backtest receives it.
+    """
+    table = {}
+    for name, weights in weights_by_name.items():
+        blended = metrics.blend_with_cash(weights, cash_fraction)
+        simulation = metrics.simulate_portfolio(
+            prices, blended, rebalance_freq, cost_bps
+        )
+        if simulation.returns.empty:
+            continue
+        table[name] = metrics.backtest_stats(simulation.returns, risk_free_rate)
+    return table
+
+
+def compare_walk_forward(objectives, prices, risk_free_rate, max_weight, shrinkage,
+                         refit_freq="Y", cost_bps=0.0, targets=None, **walk_kwargs):
+    """Walk each objective forward through the identical schedule.
+
+    Reusing a fixed-weight backtest for the objectives the user did not
+    select would put a re-fitted portfolio in one row and a static one in
+    the next, which is the comparison this table exists to avoid.
+    """
+    targets = targets or {}
+    table = {}
+    for name in objectives:
+        result = walk_forward(
+            prices, risk_free_rate, name, max_weight, shrinkage,
+            refit_freq, cost_bps, target=targets.get(name), **walk_kwargs
+        )
+        if result.returns.empty:
+            continue
+        table[name] = metrics.backtest_stats(result.returns, risk_free_rate)
+    return table
 
 
 WalkForwardResult = namedtuple("WalkForwardResult", "returns weight_history turnover")
