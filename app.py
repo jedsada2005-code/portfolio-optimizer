@@ -355,6 +355,46 @@ with st.sidebar:
                 "ตัวอย่างอิสระจริงแค่ 3 ชุด — ต่ำกว่านี้ค่าประมาณจะแกว่งมาก"
             ),
         )
+        # A shared floor forced money into holdings the optimiser had good
+        # reason to decline, and a shared cap could not be tightened on
+        # the one holding that needed it. These override either, per
+        # holding, and default to the shared value so they cost nothing
+        # until they are touched.
+        planned = [t.strip().upper() for t in
+                   st.session_state.get("symbols_input", "").split(",") if t.strip()]
+        asset_floors, asset_caps = {}, {}
+        if planned:
+            # Moving a shared slider resets the per-asset boxes to it.
+            # Seeding them once instead froze each box at whatever the
+            # shared value happened to be when the symbol first appeared,
+            # so a later change to the slider silently stopped applying.
+            shared = (min_weight, max_weight)
+            if st.session_state.get("shared_bounds") != shared:
+                st.session_state["shared_bounds"] = shared
+                for symbol in planned:
+                    st.session_state[f"lo_{symbol}"] = int(round(min_weight * 100))
+                    st.session_state[f"hi_{symbol}"] = int(round(max_weight * 100))
+            st.caption(
+                "ตั้งค่ารายตัว — ค่าเริ่มต้นตามค่าร่วมด้านบน "
+                "(ถ้าเลื่อนค่าร่วม ค่ารายตัวจะถูกตั้งใหม่ตาม)"
+            )
+            for symbol in planned:
+                seed(f"lo_{symbol}", int(round(min_weight * 100)))
+                seed(f"hi_{symbol}", int(round(max_weight * 100)))
+                low_col, high_col = st.columns(2)
+                low = low_col.number_input(
+                    f"ขั้นต่ำของ {symbol}", min_value=0, max_value=100, step=1,
+                    key=f"lo_{symbol}",
+                )
+                high = high_col.number_input(
+                    f"สูงสุดของ {symbol}", min_value=0, max_value=100, step=1,
+                    key=f"hi_{symbol}",
+                )
+                if abs(low / 100 - min_weight) > 1e-9:
+                    asset_floors[symbol] = low / 100
+                if abs(high / 100 - max_weight) > 1e-9:
+                    asset_caps[symbol] = high / 100
+
         return_method = st.selectbox(
             "วิธีประมาณผลตอบแทนคาดหวัง",
             list(optimizer.RETURN_METHODS),
@@ -447,6 +487,8 @@ input_signature = (
     int(min_history_years),
     float(target_volatility),
     float(target_return),
+    tuple(sorted(asset_floors.items())),
+    tuple(sorted(asset_caps.items())),
 )
 
 if run_btn:
@@ -737,7 +779,12 @@ if run_btn:
 
         weekly_usable = weekly[list(ar.index)]
         try:
-            optimizer.validate_bounds(len(ar), max_weight, min_weight)
+            optimizer.validate_bounds(
+                optimizer.bound_pairs(
+                    list(ar.index), min_weight, max_weight, asset_floors, asset_caps
+                ),
+                list(ar.index),
+            )
         except ValueError as exc:
             st.error(f"⚠️ {exc}")
             st.stop()
@@ -749,7 +796,10 @@ if run_btn:
         n_samples = 200_000
         rng = np.random.default_rng(42)
         w = optimizer.sample_weights(
-            rng, len(ar), n_samples, max_weight, min_weight=min_weight
+            rng, len(ar), n_samples,
+            pairs=optimizer.bound_pairs(
+                list(ar.index), min_weight, max_weight, asset_floors, asset_caps
+            ),
         )
         n_samples = len(w)
         rets = w.dot(ar)
@@ -770,7 +820,7 @@ if run_btn:
         try:
             cleaned = optimizer.optimize_weights(
                 ar, covr, "Max Sharpe", risk_free_rate, max_weight, min_weight,
-                weekly=weekly_usable,
+                weekly=weekly_usable, floors=asset_floors, caps=asset_caps,
             )
         except optimizer.SOLVER_ERRORS:
             st.error(
@@ -790,7 +840,7 @@ if run_btn:
         try:
             mv_cleaned = optimizer.optimize_weights(
                 ar, covr, "Min Volatility", risk_free_rate, max_weight, min_weight,
-                weekly=weekly_usable,
+                weekly=weekly_usable, floors=asset_floors, caps=asset_caps,
             )
         except optimizer.SOLVER_ERRORS as exc:
             st.error(
@@ -819,7 +869,7 @@ if run_btn:
             try:
                 objective_weights[name] = optimizer.optimize_weights(
                     ar, covr, name, risk_free_rate, max_weight, min_weight,
-                    weekly=weekly_usable,
+                    weekly=weekly_usable, floors=asset_floors, caps=asset_caps,
                     target=(
                         target_volatility if name == optimizer.TARGET_VOLATILITY
                         else target_return if name == optimizer.TARGET_RETURN
@@ -870,10 +920,13 @@ if run_btn:
         rolling_corr = metrics.rolling_correlation(weekly_usable.pct_change())
         return_intervals = metrics.bootstrap_return_interval(weekly_usable)
 
-        ef_x, ef_y = optimizer.frontier_curve(ar, covr, max_weight, min_weight=min_weight)
+        ef_x, ef_y = optimizer.frontier_curve(
+            ar, covr, max_weight, min_weight=min_weight,
+            floors=asset_floors, caps=asset_caps,
+        )
         # Draw the unconstrained frontier alongside it so the cost of the
         # bounds is visible rather than merely asserted.
-        if max_weight < 1.0 or min_weight > 0.0:
+        if max_weight < 1.0 or min_weight > 0.0 or asset_floors or asset_caps:
             free_x, free_y = optimizer.frontier_curve(ar, covr)
         else:
             free_x, free_y = np.array([]), np.array([])
@@ -916,6 +969,8 @@ if run_btn:
     st.session_state["ef_curve"] = (ef_x, ef_y)
     st.session_state["ef_curve_free"] = (free_x, free_y)
     st.session_state["min_weight"] = min_weight
+    st.session_state["asset_floors"] = asset_floors
+    st.session_state["asset_caps"] = asset_caps
     st.session_state["stock_list"] = list(data_close.columns)
     st.session_state["total_cash"] = total_cash
     st.session_state["risk_free_rate"] = risk_free_rate
@@ -960,6 +1015,8 @@ if st.session_state.get("calculated"):
     ef_x, ef_y = st.session_state["ef_curve"]
     free_x, free_y = st.session_state["ef_curve_free"]
     min_weight = st.session_state["min_weight"]
+    asset_floors = st.session_state["asset_floors"]
+    asset_caps = st.session_state["asset_caps"]
     stock_list = st.session_state["stock_list"]
     total_cash = st.session_state["total_cash"]
     risk_free_rate = st.session_state["risk_free_rate"]
@@ -1110,6 +1167,7 @@ if st.session_state.get("calculated"):
             cash_fraction=cash_fraction, rebalance_freq=rebalance_freq,
             min_weight=min_weight, return_method=return_method,
             min_observations=required_observations,
+            floors=asset_floors, caps=asset_caps,
         )
         walk_targets = {
             optimizer.TARGET_VOLATILITY: target_volatility,
@@ -1533,11 +1591,19 @@ if st.session_state.get("calculated"):
             )
 
         st.subheader(f"{display_strategy} Optimal Weights")
-        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
         col_m1.metric("Expected Annual Return", f"{sel_ret:.2%}")
         col_m2.metric("Annual Volatility", f"{sel_vol:.2%}")
         col_m3.metric("Sharpe Ratio", f"{sel_sharpe:.2f}")
         col_m4.metric(
+            "กระจายตัวตามความเสี่ยง",
+            f"{metrics.effective_holdings(dict(optimizer.risk_contributions(sel_weights, covr))):.1f} ตัว",
+            help=(
+                "เหมือนช่องข้างซ้าย แต่นับจากส่วนแบ่งความเสี่ยงแทนน้ำหนักเงิน "
+                "— ถ้าต่ำกว่ามาก แปลว่าความเสี่ยงกระจุกกว่าที่ตารางน้ำหนักทำให้คิด"
+            ),
+        )
+        col_m5.metric(
             "กระจายตัวเทียบเท่า",
             f"{metrics.effective_holdings(sel_weights):.1f} ตัว",
             help=(
@@ -1548,11 +1614,33 @@ if st.session_state.get("calculated"):
             ),
         )
 
-        weights_df = pd.DataFrame({
-            "Stock": list(sel_weights.keys()),
-            "Weight": [f"{v:.1%}" for v in sel_weights.values()],
-        })
+        # Where the money went, beside where the risk went. The two come
+        # apart badly: on one fit a 37.2% holding carried 8.3% of the
+        # variance while a 28.9% one carried 49.4%, so the line that
+        # would hurt in a drawdown was not the biggest in the table.
+        risk_share = optimizer.risk_contributions(sel_weights, covr)
+        weights_df = pd.DataFrame([
+            {
+                "สินทรัพย์": asset,
+                "น้ำหนักเงิน": f"{sel_weights[asset]:.1%}",
+                "ส่วนแบ่งความเสี่ยง": (
+                    f"{risk_share[asset]:.1%}" if asset in risk_share.index else "—"
+                ),
+                "ต่าง": (
+                    f"{risk_share[asset] - sel_weights[asset]:+.1%}"
+                    if asset in risk_share.index else "—"
+                ),
+            }
+            for asset in sorted(sel_weights, key=lambda a: -sel_weights[a])
+        ])
         st.dataframe(weights_df, use_container_width=True, hide_index=True)
+        if not risk_share.empty:
+            worst = risk_share.idxmax()
+            st.caption(
+                f"**{worst}** ถือไว้ {sel_weights.get(worst, 0.0):.1%} ของเงิน "
+                f"แต่รับ **{risk_share[worst]:.1%}** ของความเสี่ยงทั้งพอร์ต "
+                "— ตารางน้ำหนักบอกว่าเงินอยู่ไหน ไม่ได้บอกว่าความเสี่ยงอยู่ไหน"
+            )
 
         # Swapping the estimator moves these expected returns by tens of
         # points, and the frontier and the backtest report them on

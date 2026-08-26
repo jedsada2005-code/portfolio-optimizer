@@ -1027,3 +1027,164 @@ class TestCAPMReceivesTheRiskFreeRate:
         low = optimizer.fit_weights(prices, 0.0, "Max Sharpe", 1.0, 0.2, return_method=method)
         high = optimizer.fit_weights(prices, 0.08, "Max Sharpe", 1.0, 0.2, return_method=method)
         assert low != high
+
+
+class TestRiskContributions:
+    """A weights table says where the money went. It does not say where
+    the risk went, and the two differ sharply: a 37.2% holding carried
+    8.3% of the variance while a 28.9% one carried 49.4%."""
+
+    @staticmethod
+    def _cov():
+        names = ["CALM", "WILD", "MID"]
+        sd = np.array([0.04, 0.30, 0.15])
+        corr = np.array([[1.0, 0.1, 0.2], [0.1, 1.0, 0.3], [0.2, 0.3, 1.0]])
+        return pd.DataFrame(np.outer(sd, sd) * corr, index=names, columns=names)
+
+    def test_the_shares_add_up_to_the_whole_portfolio(self):
+        shares = optimizer.risk_contributions({"CALM": 0.5, "WILD": 0.3, "MID": 0.2}, self._cov())
+        assert shares.sum() == pytest.approx(1.0)
+
+    def test_a_volatile_holding_carries_more_risk_than_money(self):
+        weights = {"CALM": 0.5, "WILD": 0.3, "MID": 0.2}
+        shares = optimizer.risk_contributions(weights, self._cov())
+        assert shares["WILD"] > weights["WILD"]
+        assert shares["CALM"] < weights["CALM"]
+
+    def test_equal_weights_do_not_mean_equal_risk(self):
+        shares = optimizer.risk_contributions(
+            {"CALM": 1 / 3, "WILD": 1 / 3, "MID": 1 / 3}, self._cov()
+        )
+        assert shares["WILD"] > 3 * shares["CALM"]
+
+    def test_a_holding_with_no_money_carries_no_risk(self):
+        shares = optimizer.risk_contributions({"CALM": 0.5, "WILD": 0.5}, self._cov())
+        assert shares["MID"] == pytest.approx(0.0)
+
+    def test_a_single_holding_carries_all_of_it(self):
+        shares = optimizer.risk_contributions({"WILD": 1.0}, self._cov())
+        assert shares["WILD"] == pytest.approx(1.0)
+
+    def test_the_cash_sleeve_is_ignored(self):
+        cov = self._cov()
+        weights = metrics.blend_with_cash({"CALM": 0.5, "WILD": 0.3, "MID": 0.2}, 0.4)
+        shares = optimizer.risk_contributions(weights, cov)
+        assert shares.sum() == pytest.approx(1.0)
+        assert metrics.CASH_SYMBOL not in shares.index
+
+    def test_an_empty_portfolio_contributes_nothing(self):
+        assert optimizer.risk_contributions({}, self._cov()).empty
+
+    def test_risk_concentration_can_exceed_money_concentration(self):
+        weights = {"CALM": 0.5, "WILD": 0.3, "MID": 0.2}
+        shares = optimizer.risk_contributions(weights, self._cov())
+        by_money = metrics.effective_holdings(weights)
+        by_risk = metrics.effective_holdings(dict(shares))
+        assert by_risk < by_money
+
+
+class TestPerAssetBounds:
+    """pypfopt takes either one (min, max) pair for everything or one per
+    asset; only the shared pair was ever passed. So a floor meant to keep
+    a core holding funded also forced money into holdings the optimiser
+    had good reason to decline -- EWY and THD at 5% each in a real run,
+    purely because the floor could not be told apart."""
+
+    @staticmethod
+    def _inputs():
+        names = ["GOOD", "OKAY", "POOR"]
+        expected = pd.Series([0.14, 0.09, 0.01], index=names)
+        sd = np.array([0.18, 0.12, 0.25])
+        corr = np.array([[1.0, 0.3, 0.2], [0.3, 1.0, 0.25], [0.2, 0.25, 1.0]])
+        cov = pd.DataFrame(np.outer(sd, sd) * corr, index=names, columns=names)
+        return expected, cov
+
+    def test_pairs_default_to_the_shared_bounds(self):
+        pairs = optimizer.bound_pairs(["A", "B"], 0.05, 0.40)
+        assert pairs == [(0.05, 0.40), (0.05, 0.40)]
+
+    def test_a_floor_can_be_lifted_for_one_asset(self):
+        pairs = optimizer.bound_pairs(["A", "B"], 0.05, 0.40, floors={"B": 0.0})
+        assert pairs == [(0.05, 0.40), (0.0, 0.40)]
+
+    def test_a_cap_can_be_tightened_for_one_asset(self):
+        pairs = optimizer.bound_pairs(["A", "B"], 0.05, 0.40, caps={"A": 0.10})
+        assert pairs == [(0.05, 0.10), (0.05, 0.40)]
+
+    def test_an_exempt_asset_can_be_left_at_zero(self):
+        expected, cov = self._inputs()
+        forced = optimizer.optimize_weights(
+            expected, cov, "Max Sharpe", 0.02, max_weight=0.6, min_weight=0.10
+        )
+        exempt = optimizer.optimize_weights(
+            expected, cov, "Max Sharpe", 0.02, max_weight=0.6, min_weight=0.10,
+            floors={"POOR": 0.0},
+        )
+        assert forced["POOR"] == pytest.approx(0.10, abs=1e-4)
+        assert exempt["POOR"] < 1e-6
+        assert exempt["OKAY"] >= 0.10 - 1e-6
+
+    def test_a_per_asset_cap_is_honoured(self):
+        expected, cov = self._inputs()
+        weights = optimizer.optimize_weights(
+            expected, cov, "Max Sharpe", 0.02, caps={"GOOD": 0.25}
+        )
+        assert weights["GOOD"] <= 0.25 + 1e-6
+
+    def test_the_downside_objectives_take_them_too(self):
+        expected, cov = self._inputs()
+        index = pd.date_range("2015-01-02", periods=400, freq="W-FRI")
+        rng = np.random.default_rng(5)
+        weekly = pd.DataFrame(
+            {n: 100 * np.cumprod(1 + rng.normal(0.001, v, len(index)))
+             for n, v in zip(expected.index, [0.02, 0.015, 0.03])}, index=index
+        )
+        weights = optimizer.optimize_weights(
+            expected, cov, optimizer.MIN_CVAR, 0.02, weekly=weekly, caps={"OKAY": 0.20}
+        )
+        assert weights["OKAY"] <= 0.20 + 1e-6
+
+    def test_an_impossible_set_is_refused_with_the_reason(self):
+        expected, cov = self._inputs()
+        with pytest.raises(ValueError, match="ขั้นต่ำ"):
+            optimizer.optimize_weights(
+                expected, cov, "Max Sharpe", 0.02,
+                floors={"GOOD": 0.5, "OKAY": 0.5, "POOR": 0.5},
+            )
+
+    def test_caps_that_cannot_reach_a_hundred_are_refused(self):
+        expected, cov = self._inputs()
+        with pytest.raises(ValueError, match="สูงสุด"):
+            optimizer.optimize_weights(
+                expected, cov, "Max Sharpe", 0.02, caps={"GOOD": 0.2, "OKAY": 0.2, "POOR": 0.2},
+            )
+
+    def test_the_reachable_maximum_accounts_for_them(self):
+        expected, _ = self._inputs()
+        shared = optimizer.max_achievable_return(expected, 0.5, 0.1)
+        exempt = optimizer.max_achievable_return(expected, 0.5, 0.1, floors={"POOR": 0.0})
+        assert exempt > shared
+
+    def test_the_random_cloud_respects_them(self):
+        rng = np.random.default_rng(11)
+        pairs = optimizer.bound_pairs(["A", "B", "C"], 0.10, 0.50, floors={"C": 0.0})
+        cloud = optimizer.sample_weights(rng, 3, 3000, pairs=pairs)
+        assert len(cloud) > 0
+        assert cloud[:, 0].min() >= 0.10 - 1e-9
+        assert cloud[:, 2].min() >= -1e-9
+        assert cloud.max() <= 0.50 + 1e-9
+
+    def test_walk_forward_carries_them_into_every_refit(self):
+        index = pd.bdate_range("2012-01-01", periods=2600)
+        rng = np.random.default_rng(13)
+        prices = pd.DataFrame({
+            "GOOD": 100 * np.cumprod(1 + rng.normal(0.0006, 0.011, len(index))),
+            "OKAY": 100 * np.cumprod(1 + rng.normal(0.0003, 0.008, len(index))),
+            "POOR": 100 * np.cumprod(1 + rng.normal(0.00005, 0.016, len(index))),
+        }, index=index)
+        result = optimizer.walk_forward(
+            prices, 0.02, "Max Sharpe", 0.6, 0.2, "Y", 0.0,
+            min_weight=0.10, floors={"POOR": 0.0},
+        )
+        assert result.weight_history
+        assert all(w.get("POOR", 0.0) < 1e-6 for _, w in result.weight_history)
