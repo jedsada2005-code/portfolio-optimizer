@@ -1471,3 +1471,54 @@ class TestRiskContributionIsShown:
         assert shown["กระจายตัวตามความเสี่ยง"] == (
             f"{metrics.effective_holdings(dict(shares)):.1f} ตัว"
         )
+
+
+def _exact_button(at, label):
+    for button in at.button:
+        if (button.label or "") == label:
+            return button
+    raise LookupError(f"no button labelled exactly {label!r}")
+
+
+class TestQuickDateRanges:
+    """The browser's year grid pages twenty years at a time, so from a
+    1990 minimum the first page ends at 2009 -- 2552 in the Buddhist
+    calendar a Thai browser renders. Anyone wanting a recent window had
+    to page forward to find it."""
+
+    def test_ten_years_sets_both_ends(self, app):
+        _exact_button(app, "10 ปี").click().run()
+        assert not app.exception, app.exception
+
+        today = pd.Timestamp.today().normalize().date()
+        start = _widget(app.date_input, "Start Date").value
+        end = _widget(app.date_input, "End Date").value
+        assert end == today
+        assert abs((today - start).days - 3653) < 3, start
+
+    def test_five_and_fifteen_differ_by_a_decade(self, app):
+        _exact_button(app, "5 ปี").click().run()
+        five = _widget(app.date_input, "Start Date").value
+        _exact_button(app, "15 ปี").click().run()
+        fifteen = _widget(app.date_input, "Start Date").value
+        assert abs((five - fifteen).days - 3653) < 3
+
+    def test_since_2010_reaches_a_year_the_first_grid_page_cannot(self, app):
+        _exact_button(app, "ตั้งแต่ 2010").click().run()
+        start = _widget(app.date_input, "Start Date").value
+        assert start == pd.Timestamp("2010-01-01").date()
+        assert start.year > 2009, "the point is to skip past the first grid page"
+
+    def test_the_chosen_range_is_what_gets_calculated(self, app):
+        _exact_button(app, "10 ปี").click().run()
+        at = _calculate(app)
+        prices = at.session_state["data_close"]
+        assert prices.index[0].year >= pd.Timestamp.today().year - 11
+
+    def test_the_buttons_leave_other_settings_alone(self, app):
+        _widget(app.number_input, "Risk-Free Rate").set_value(0.04)
+        _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(45)
+        _exact_button(app, "10 ปี").click().run()
+
+        assert _widget(app.number_input, "Risk-Free Rate").value == 0.04
+        assert _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").value == 45
