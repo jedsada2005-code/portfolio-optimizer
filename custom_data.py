@@ -3,6 +3,8 @@ import warnings
 
 import pandas as pd
 
+import metrics
+
 
 DATE_COLUMNS = {"date", "datetime", "timestamp", "time"}
 SYMBOL_COLUMNS = {"symbol", "ticker", "asset", "name"}
@@ -193,4 +195,6 @@ def merge_uploaded_prices(data_close, uploaded_prices):
         if not data_close.empty
         else uploaded_prices.copy()
     )
-    return merged.sort_index().ffill()
+    # Only inside each column's own life: an uploaded file that stops
+    # earlier than the market data must not be stretched flat to meet it.
+    return metrics.ffill_within_life(merged.sort_index())

@@ -1205,3 +1205,37 @@ def test_walk_forward_survives_one_objective_blowing_up(app, monkeypatch):
 
     assert not at.exception, at.exception
     assert at.session_state["calculated"] is True
+
+
+class TestAHoldingThatStopsIsDeclared:
+    """common_start was announced loudly; nothing said anything when a
+    holding stopped existing partway through."""
+
+    def test_a_full_run_says_nothing_when_every_holding_is_alive(self, app):
+        at = _calculate(app)
+        assert not [
+            w.value for w in at.warning if "หยุดมีข้อมูล" in (w.value or "")
+        ]
+
+    def test_the_backtest_end_is_stated_when_a_holding_stops(self, app):
+        at = _calculate(app)
+        prices = at.session_state["test_close"]
+        assert metrics.common_end(prices) is not None
+        # every holding alive, so the end is the last row
+        assert metrics.common_end(prices) == prices.index[-1]
+
+
+class TestComparisonWindowIsDeclared:
+    def test_the_table_states_the_window_every_row_covers(self, app):
+        at = _calculate(app)
+        said = [c.value for c in at.caption if "ทุกแถววัดช่วงเดียวกัน" in (c.value or "")]
+        assert said, [c.value for c in at.caption]
+
+    def test_the_stated_window_matches_what_the_rows_used(self, app):
+        at = _calculate(app)
+        table = _comparison_table(at)
+        said = [c.value for c in at.caption if "ทุกแถววัดช่วงเดียวกัน" in (c.value or "")][0]
+        # one window, so every row must report the same length
+        years = at.session_state["comparison_years"]
+        assert f"{years:.1f}" in said, said
+        assert len(table) >= 3

@@ -765,3 +765,113 @@ class TestBootstrapReturnInterval:
         table = metrics.bootstrap_return_interval(weekly)
         assert "X" in table.index
         assert "NEW" not in table.index
+
+
+class TestFfillWithinLife:
+    """A holiday is a gap to bridge; a holding that stops reporting is
+    not. Filling past the last real price turns it into a flat,
+    zero-volatility line the optimiser reads as a safe asset -- its
+    measured volatility fell from 32.4% to 22.9% in the case that
+    prompted this."""
+
+    @staticmethod
+    def _frame():
+        index = pd.bdate_range("2020-01-01", "2020-03-31")
+        frame = pd.DataFrame({
+            "LIVE": np.arange(1.0, len(index) + 1.0),
+            "STOPS": np.arange(1.0, len(index) + 1.0),
+            "GAPPY": np.arange(1.0, len(index) + 1.0),
+        }, index=index)
+        frame.loc["2020-02-14":, "STOPS"] = np.nan      # stops reporting
+        frame.loc["2020-02-03":"2020-02-05", "GAPPY"] = np.nan  # a holiday run
+        return frame
+
+    def test_an_interior_gap_is_still_bridged(self):
+        filled = metrics.ffill_within_life(self._frame())
+        assert filled.loc["2020-02-04", "GAPPY"] == filled.loc["2020-01-31", "GAPPY"]
+
+    def test_nothing_is_invented_past_the_last_real_price(self):
+        filled = metrics.ffill_within_life(self._frame())
+        assert filled.loc["2020-02-14":, "STOPS"].isna().all()
+
+    def test_a_live_column_is_untouched(self):
+        frame = self._frame()
+        filled = metrics.ffill_within_life(frame)
+        pd.testing.assert_series_equal(filled["LIVE"], frame["LIVE"])
+
+    def test_a_column_that_never_reported_stays_empty(self):
+        frame = self._frame()
+        frame["NEVER"] = np.nan
+        assert metrics.ffill_within_life(frame)["NEVER"].isna().all()
+
+
+class TestCommonEnd:
+    """common_start guards the day a portfolio can first be held. Nothing
+    guarded the day one of its holdings stopped existing."""
+
+    @staticmethod
+    def _frame():
+        index = pd.bdate_range("2020-01-01", "2020-03-31")
+        frame = pd.DataFrame(
+            {"A": 1.0, "B": 1.0, "C": 1.0}, index=index
+        )
+        frame.loc[:"2020-01-15", "B"] = np.nan     # starts late
+        frame.loc["2020-03-02":, "C"] = np.nan     # stops early
+        return frame
+
+    def test_it_is_the_day_the_first_holding_stops(self):
+        frame = self._frame()
+        assert metrics.common_end(frame) == pd.Timestamp("2020-02-28")
+
+    def test_it_pairs_with_common_start(self):
+        frame = self._frame()
+        start, end = metrics.common_start(frame), metrics.common_end(frame)
+        assert start == pd.Timestamp("2020-01-16")
+        assert start < end
+        assert frame.loc[start:end].notna().all().all()
+
+    def test_a_frame_that_never_overlaps_has_no_end(self):
+        index = pd.bdate_range("2020-01-01", "2020-03-31")
+        frame = pd.DataFrame({"A": 1.0, "B": np.nan}, index=index)
+        assert metrics.common_end(frame) is None
+
+    def test_an_empty_frame_has_no_end(self):
+        assert metrics.common_end(pd.DataFrame()) is None
+
+    def test_all_columns_live_means_the_last_row(self):
+        index = pd.bdate_range("2020-01-01", "2020-03-31")
+        frame = pd.DataFrame({"A": 1.0, "B": 1.0}, index=index)
+        assert metrics.common_end(frame) == index[-1]
+
+
+class TestSimulationStopsWhenAHoldingDoes:
+    def test_the_backtest_ends_where_the_holdings_do(self):
+        index = pd.bdate_range("2020-01-01", "2020-12-31")
+        prices = pd.DataFrame(
+            {"A": 100.0 * 1.0004 ** np.arange(len(index)),
+             "B": 100.0 * 1.0002 ** np.arange(len(index))}, index=index
+        )
+        prices.loc["2020-07-01":, "B"] = np.nan
+
+        result = metrics.simulate_portfolio(prices, {"A": 0.5, "B": 0.5}, "M", 0.0)
+        assert result.returns.index[-1] == metrics.common_end(prices)
+        assert result.returns.index[-1] < index[-1]
+
+    def test_a_dead_holding_cannot_flat_line_the_volatility(self):
+        index = pd.bdate_range("2015-01-01", "2025-01-01")
+        rng = np.random.default_rng(4)
+        prices = pd.DataFrame(
+            {"A": 100 * np.cumprod(1 + rng.normal(0.0004, 0.011, len(index))),
+             "B": 100 * np.cumprod(1 + rng.normal(0.0006, 0.020, len(index)))},
+            index=index,
+        )
+        prices.loc["2020-01-01":, "B"] = np.nan
+
+        truncated = metrics.simulate_portfolio(prices, {"A": 0.5, "B": 0.5}, "Q", 0.0)
+        stretched = metrics.simulate_portfolio(
+            prices.ffill(), {"A": 0.5, "B": 0.5}, "Q", 0.0
+        )
+        honest = metrics.backtest_stats(truncated.returns, 0.02)
+        invented = metrics.backtest_stats(stretched.returns, 0.02)
+        assert honest["annual_volatility"] > invented["annual_volatility"]
+        assert honest["years"] < invented["years"]

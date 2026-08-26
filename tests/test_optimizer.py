@@ -885,3 +885,60 @@ class TestHRPSurvivesNewerScipy:
             "single", "complete", "average", "weighted",
             "centroid", "median", "ward",
         }
+
+
+class TestComparisonRowsShareOneWindow:
+    """The table exists so seven objectives can be judged against each
+    other. simulate_portfolio starts at the common_start of whatever a
+    row happens to hold, so rows that avoided a late-listing holding were
+    handed eight years the others never traded."""
+
+    @staticmethod
+    def _prices():
+        index = pd.bdate_range("2010-01-01", "2025-01-01")
+        rng = np.random.default_rng(9)
+        frame = pd.DataFrame({
+            "OLD1": 100 * np.cumprod(1 + rng.normal(0.0004, 0.010, len(index))),
+            "OLD2": 100 * np.cumprod(1 + rng.normal(0.0003, 0.008, len(index))),
+            "LATE": 100 * np.cumprod(1 + rng.normal(0.0009, 0.022, len(index))),
+        }, index=index)
+        frame.loc[:"2018-01-01", "LATE"] = np.nan
+        return frame
+
+    def test_rows_holding_different_vintages_still_cover_one_window(self):
+        table = optimizer.compare_fixed_weights(
+            {
+                "avoids the late one": {"OLD1": 0.5, "OLD2": 0.5},
+                "holds the late one": {"OLD1": 0.4, "OLD2": 0.3, "LATE": 0.3},
+            },
+            self._prices(), 0.02, "Q", 0.0,
+        )
+        years = {name: row["years"] for name, row in table.items()}
+        assert max(years.values()) - min(years.values()) < 0.02, years
+
+    def test_the_shared_window_is_the_shortest_row_not_the_longest(self):
+        table = optimizer.compare_fixed_weights(
+            {
+                "avoids the late one": {"OLD1": 0.5, "OLD2": 0.5},
+                "holds the late one": {"OLD1": 0.4, "OLD2": 0.3, "LATE": 0.3},
+            },
+            self._prices(), 0.02, "Q", 0.0,
+        )
+        # LATE lists in 2018, so roughly seven years, not fifteen.
+        assert all(6.0 < row["years"] < 8.0 for row in table.values())
+
+    def test_rows_of_the_same_vintage_keep_the_whole_window(self):
+        table = optimizer.compare_fixed_weights(
+            {"a": {"OLD1": 1.0}, "b": {"OLD2": 1.0}},
+            self._prices(), 0.02, "Q", 0.0,
+        )
+        assert all(row["years"] > 14.0 for row in table.values())
+
+    def test_walk_forward_rows_share_one_window_too(self):
+        table = optimizer.compare_walk_forward(
+            ["Max Sharpe", "Min Volatility", optimizer.HRP_OBJECTIVE],
+            self._prices(), 0.02, max_weight=1.0, shrinkage=0.2, refit_freq="Y",
+        )
+        years = {name: row["years"] for name, row in table.items()}
+        assert len(years) >= 2
+        assert max(years.values()) - min(years.values()) < 0.02, years

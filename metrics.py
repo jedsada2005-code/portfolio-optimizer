@@ -119,6 +119,44 @@ def first_valid_dates(prices):
     return prices.apply(lambda col: col.first_valid_index())
 
 
+def last_valid_dates(prices):
+    """Last date each column still has a real price."""
+    return prices.apply(lambda col: col.last_valid_index())
+
+
+def ffill_within_life(prices):
+    """Forward-fill inside each column's own trading life, not past its end.
+
+    A holiday is a gap to bridge; a holding that stops reporting is not.
+    Carrying the last price forward turns it into a flat,
+    zero-volatility line that the optimiser reads as a safe asset -- in
+    the case that prompted this, a holding's measured volatility fell
+    from 32.4% to 22.9% and it was handed weight on the strength of it.
+    """
+    filled = prices.ffill()
+    for column in prices.columns:
+        last = prices[column].last_valid_index()
+        if last is None:
+            continue
+        filled.loc[filled.index > last, column] = np.nan
+    return filled
+
+
+def common_end(prices):
+    """Last date on which every column still has a price, or None.
+
+    The mirror of ``common_start``: a portfolio cannot be backtested
+    past the point where one of its holdings stops existing any more
+    than it can be backtested before they all do.
+    """
+    if prices.empty or prices.shape[1] == 0:
+        return None
+    complete = prices.notna().all(axis=1)
+    if not complete.any():
+        return None
+    return complete[::-1].idxmax()
+
+
 def common_start(prices):
     """First date on which every column has a price, or None.
 
@@ -150,7 +188,7 @@ def portfolio_daily_returns(prices, weights):
     if start is None:
         return PortfolioReturns(empty, pd.DataFrame(), held, None)
 
-    sub = sub.loc[start:].ffill()
+    sub = sub.loc[start:common_end(sub)].ffill()
     w = np.array([float(weights[c]) for c in held], dtype=float)
     total = w.sum()
     if total > 0:
@@ -452,7 +490,7 @@ def simulate_portfolio(prices, weights, freq="Q", cost_bps=0.0):
     if start is None:
         return Simulation(empty, pd.DataFrame(), empty, {}, held, None, [])
 
-    sub = sub.loc[start:].ffill()
+    sub = sub.loc[start:common_end(sub)].ffill()
     target = np.array([float(weights[c]) for c in held], dtype=float)
     total_weight = target.sum()
     if total_weight > 0:

@@ -435,6 +435,35 @@ def sample_weights(rng, n_assets, n_samples, max_weight=1.0, max_passes=12, min_
     return w[keep]
 
 
+def stats_over_one_window(returns_by_name, risk_free_rate):
+    """Statistics for several return series over the window they share.
+
+    simulate_portfolio starts at the common_start of whatever a row
+    happens to hold, so a row that avoided a late-listing holding was
+    handed years the others never traded -- fifteen against seven in the
+    case that prompted this. Trimming every row to the overlap makes the
+    table rank objectives rather than calendars.
+    """
+    live = {n: s for n, s in returns_by_name.items() if not s.empty}
+    if not live:
+        return {}
+    start = max(s.index[0] for s in live.values())
+    end = min(s.index[-1] for s in live.values())
+    if start > end:
+        return {}
+
+    table = {}
+    for name, series in live.items():
+        window = series.loc[start:end].copy()
+        if len(window) < 2:
+            continue
+        # Every row measures growth from the shared start, so the first
+        # row is a base day on each rather than a real return on some.
+        window.iloc[0] = 0.0
+        table[name] = metrics.backtest_stats(window, risk_free_rate)
+    return table
+
+
 def compare_fixed_weights(weights_by_name, prices, risk_free_rate,
                           rebalance_freq=None, cost_bps=0.0, cash_fraction=0.0):
     """Backtest several weight sets through one identical simulation.
@@ -446,16 +475,15 @@ def compare_fixed_weights(weights_by_name, prices, risk_free_rate,
     ``prices`` must already carry the cash column when ``cash_fraction``
     is non-zero, exactly as the single-portfolio backtest receives it.
     """
-    table = {}
+    returns = {}
     for name, weights in weights_by_name.items():
         blended = metrics.blend_with_cash(weights, cash_fraction)
         simulation = metrics.simulate_portfolio(
             prices, blended, rebalance_freq, cost_bps
         )
-        if simulation.returns.empty:
-            continue
-        table[name] = metrics.backtest_stats(simulation.returns, risk_free_rate)
-    return table
+        if not simulation.returns.empty:
+            returns[name] = simulation.returns
+    return stats_over_one_window(returns, risk_free_rate)
 
 
 def compare_walk_forward(objectives, prices, risk_free_rate, max_weight, shrinkage,
@@ -467,7 +495,7 @@ def compare_walk_forward(objectives, prices, risk_free_rate, max_weight, shrinka
     the next, which is the comparison this table exists to avoid.
     """
     targets = targets or {}
-    table = {}
+    returns = {}
     for name in objectives:
         try:
             result = walk_forward(
@@ -476,10 +504,9 @@ def compare_walk_forward(objectives, prices, risk_free_rate, max_weight, shrinka
             )
         except Exception:  # noqa: BLE001 - one row must not cost the table
             continue
-        if result.returns.empty:
-            continue
-        table[name] = metrics.backtest_stats(result.returns, risk_free_rate)
-    return table
+        if not result.returns.empty:
+            returns[name] = result.returns
+    return stats_over_one_window(returns, risk_free_rate)
 
 
 WalkForwardResult = namedtuple("WalkForwardResult", "returns weight_history turnover")
