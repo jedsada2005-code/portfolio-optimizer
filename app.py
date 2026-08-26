@@ -145,9 +145,11 @@ def download_yf_close(symbols, start, end):
     if df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
-        close = df["Close"].ffill()
+        close = metrics.ffill_within_life(df["Close"])
     else:
-        close = df[["Close"]].rename(columns={"Close": symbols[0]}).ffill()
+        close = metrics.ffill_within_life(
+            df[["Close"]].rename(columns={"Close": symbols[0]})
+        )
     close = close.dropna(how="all")
     return close.dropna(axis=1, how="all")
 st.title("Portfolio Optimizer & Backtesting")
@@ -1094,6 +1096,21 @@ if st.session_state.get("calculated"):
         )
         st.stop()
     
+    # ...and it can only run while every holding still exists. Nothing
+    # used to guard this end, so a holding that stopped reporting was
+    # carried forward as a flat line for the rest of the window.
+    requested_end = pd.Timestamp(test_prices.index[-1])
+    if result.returns.index[-1] < requested_end:
+        lasts = metrics.last_valid_dates(test_prices[result.held])
+        stopper = lasts.idxmin()
+        st.warning(
+            f"⚠️ Backtest จบจริงที่ **{result.returns.index[-1].date()}** ไม่ใช่ "
+            f"{requested_end.date()} เพราะ **{stopper}** หยุดมีข้อมูลตั้งแต่ "
+            f"{pd.Timestamp(lasts[stopper]).date()} "
+            "— ราคาหลังจากนั้นไม่มีอยู่จริง จึงไม่ถูกนำมาคำนวณ "
+            "(เดิมระบบลากราคาสุดท้ายไปเป็นเส้นตรง ซึ่งทำให้ความผันผวนต่ำกว่าความจริง)"
+        )
+
     # The backtest can only begin once every holding actually exists.
     requested_start = pd.Timestamp(test_prices.index[0])
     if result.start is not None and result.start > requested_start:
@@ -1250,6 +1267,10 @@ if st.session_state.get("calculated"):
     }
     st.session_state["walk_weight_history"] = (
         walk_result.weight_history if walk_result is not None else []
+    )
+
+    st.session_state["comparison_years"] = (
+        next(iter(objective_table.values()))["years"] if objective_table else 0.0
     )
 
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -1847,6 +1868,16 @@ if st.session_state.get("calculated"):
                 )
             ])
             st.dataframe(ranking, use_container_width=True, hide_index=True)
+            any_row = next(iter(objective_table.values()))
+            st.caption(
+                f"ทุกแถววัดช่วงเดียวกัน **{any_row['years']:.1f} ปี** "
+                + (
+                    "— ตรงกับช่วงของพอร์ตด้านบน"
+                    if abs(any_row["years"] - n_years) < 0.05 else
+                    f"ซึ่งสั้นกว่าช่วงของพอร์ตด้านบน ({n_years:.1f} ปี) เพราะบางวิธี "
+                    "ถือสินทรัพย์ที่เริ่มมีข้อมูลช้ากว่า จึงต้องตัดให้ทุกแถวเทียบกันได้"
+                )
+            )
 
             best_sharpe = max(objective_table, key=lambda n: objective_table[n]["sharpe"])
             gentlest = max(

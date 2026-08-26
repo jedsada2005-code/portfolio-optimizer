@@ -96,7 +96,27 @@ def test_parse_csv_rejects_missing_date_column():
         pass
 
 
-def test_merge_uploaded_prices_outer_joins_and_forward_fills():
+def test_merge_uploaded_prices_bridges_gaps_inside_a_column():
+    market = pd.DataFrame(
+        {"AAPL": [100.0, 101.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-03"]),
+    )
+    uploaded = pd.DataFrame(
+        {"PRIVATE_FUND": [50.0, 51.0, 52.0]},
+        index=pd.to_datetime(["2024-01-01", "2024-01-02", "2024-01-03"]),
+    )
+
+    merged = custom_data.merge_uploaded_prices(market, uploaded)
+
+    assert list(merged.columns) == ["AAPL", "PRIVATE_FUND"]
+    # AAPL did not trade on the 2nd; carrying the 1st forward is right.
+    assert merged.loc[pd.Timestamp("2024-01-02"), "AAPL"] == 100.0
+
+
+def test_merge_uploaded_prices_does_not_stretch_a_file_that_ends_early():
+    """A file ending before the market data must not be filled out to
+    meet it: that turns the last uploaded price into a flat line the
+    optimiser reads as a zero-volatility holding."""
     market = pd.DataFrame(
         {"AAPL": [100.0, 101.0]},
         index=pd.to_datetime(["2024-01-01", "2024-01-03"]),
@@ -108,9 +128,7 @@ def test_merge_uploaded_prices_outer_joins_and_forward_fills():
 
     merged = custom_data.merge_uploaded_prices(market, uploaded)
 
-    assert list(merged.columns) == ["AAPL", "PRIVATE_FUND"]
-    assert merged.loc[pd.Timestamp("2024-01-02"), "AAPL"] == 100.0
-    assert merged.loc[pd.Timestamp("2024-01-03"), "PRIVATE_FUND"] == 51.0
+    assert pd.isna(merged.loc[pd.Timestamp("2024-01-03"), "PRIVATE_FUND"])
 
 
 def test_merge_uploaded_prices_rejects_duplicate_market_symbol():
