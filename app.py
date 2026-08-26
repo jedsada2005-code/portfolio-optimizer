@@ -211,6 +211,29 @@ with st.sidebar:
         key="symbols_input",
         help="หุ้น/ETF เช่น `SPY` · หุ้นไทยเติม `.BK` เช่น `PTT.BK` · กองทุนไทยเติม `MF:` เช่น `MF:K-GOLD-A(A)`",
     )
+    # The browser's year grid pages twenty years at a time, so from a
+    # 1990 minimum its first page ends at 2009 -- 2552 in the Buddhist
+    # calendar a Thai browser renders, which reads as the limit. Nobody
+    # picking "the last ten years" should have to page through a calendar
+    # to find it.
+    #
+    # Rendered above the two date fields deliberately: a widget's key can
+    # only be written before that widget renders. Staging the choice and
+    # calling st.rerun() from below them aborts the run before the rest
+    # of the sidebar has rendered, and Streamlit discards the state of
+    # every widget the run never reached -- which silently reset them.
+    today = pd.Timestamp.today().normalize().date()
+    quick = st.columns(4)
+    for column, (label, start) in zip(quick, {
+        "5 ปี": today - pd.DateOffset(years=5),
+        "10 ปี": today - pd.DateOffset(years=10),
+        "15 ปี": today - pd.DateOffset(years=15),
+        "ตั้งแต่ 2010": pd.Timestamp("2010-01-01"),
+    }.items()):
+        if column.button(label, use_container_width=True, help="ตั้งช่วงวันที่ให้อัตโนมัติ"):
+            st.session_state["w_start"] = pd.Timestamp(start).date()
+            st.session_state["w_end"] = today
+
     col1, col2 = st.columns(2)
     with col1:
         seed("w_start", qp_date("start", pd.Timestamp("2010-01-01")))
