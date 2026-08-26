@@ -920,6 +920,7 @@ if st.session_state.get("calculated"):
     # tab can show backtest diagnostics, and the NAV tab cannot drift
     # from the backtest by recomputing its own version.
     custom_w_available = read_custom_weights(sorted(ar.index))
+    custom_edited = any(f"cw_{sym}" in st.session_state for sym in ar.index)
     if backtest_mode == "Walk-Forward":
         walk_objective = st.selectbox(
             "วัตถุประสงค์ที่ใช้คำนวณน้ำหนักใหม่ทุกงวด",
@@ -1012,20 +1013,22 @@ if st.session_state.get("calculated"):
     # whole in-sample/out-of-sample gap to trading fees.
     gross_daily = None
     if backtest_mode == "Walk-Forward":
+        # Shared settings only: the target belongs to whichever objective
+        # is being solved, so the comparison below can vary it per row.
         walk_kwargs = dict(
             cash_fraction=cash_fraction, rebalance_freq=rebalance_freq,
             min_weight=min_weight, return_method=return_method,
             min_observations=required_observations,
-            target=(
-                target_volatility if walk_objective == optimizer.TARGET_VOLATILITY
-                else target_return if walk_objective == optimizer.TARGET_RETURN
-                else None
-            ),
         )
+        walk_targets = {
+            optimizer.TARGET_VOLATILITY: target_volatility,
+            optimizer.TARGET_RETURN: target_return,
+        }
         with st.spinner("Running walk-forward..."):
             walk_result = optimizer.walk_forward(
                 test_close, risk_free_rate, walk_objective, max_weight,
-                shrinkage, refit_freq, cost_bps, **walk_kwargs,
+                shrinkage, refit_freq, cost_bps,
+                target=walk_targets.get(walk_objective), **walk_kwargs,
             )
         if walk_result.returns.empty:
             st.error(
@@ -1043,7 +1046,8 @@ if st.session_state.get("calculated"):
             with st.spinner("Measuring what the trading cost..."):
                 gross_daily = optimizer.walk_forward(
                     test_close, risk_free_rate, walk_objective, max_weight,
-                    shrinkage, refit_freq, 0.0, **walk_kwargs,
+                    shrinkage, refit_freq, 0.0,
+                    target=walk_targets.get(walk_objective), **walk_kwargs,
                 ).returns
     else:
         weights_in_force = backtest_w
@@ -1108,6 +1112,44 @@ if st.session_state.get("calculated"):
             "ผลลัพธ์จึงสวยเกินจริงเสมอ เปลี่ยนเป็นโหมด Train/Test Split เพื่อดูผลจริง"
         )
     
+    # Every objective put through the identical backtest. The weights of
+    # all seven were already on screen but never their results, so
+    # choosing between them meant running the app seven times and
+    # remembering the numbers.
+    with st.spinner("เปรียบเทียบทุกวิธีจัดพอร์ต..."):
+        if backtest_mode == "Walk-Forward":
+            objective_table = optimizer.compare_walk_forward(
+                [n for n in OBJECTIVES if n in objective_weights],
+                test_close, risk_free_rate, max_weight, shrinkage,
+                refit_freq, cost_bps, targets=walk_targets, **walk_kwargs,
+            )
+            # 1/N has nothing to re-fit, but it must still be measured
+            # over the window walk-forward actually traded -- simulating
+            # it from the first price would hand it the training years
+            # the objectives never got to use.
+            assets = sorted(ar.index)
+            objective_table.update(optimizer.compare_fixed_weights(
+                {optimizer.EQUAL_WEIGHT: {a: 1 / len(assets) for a in assets}},
+                test_prices.loc[port_daily.index[0]:], risk_free_rate,
+                rebalance_freq, cost_bps, cash_fraction,
+            ))
+        else:
+            candidates = {
+                name: objective_weights[name]
+                for name in OBJECTIVES if name in objective_weights
+            }
+            assets = sorted(ar.index)
+            candidates[optimizer.EQUAL_WEIGHT] = {a: 1 / len(assets) for a in assets}
+            # read_custom_weights falls back to 1/N until the weights tab
+            # is edited, so an untouched Custom row would be the
+            # equal-weight row again under a name implying a choice.
+            if custom_edited:
+                candidates[CUSTOM_SOURCE] = custom_w_available
+            objective_table = optimizer.compare_fixed_weights(
+                candidates, test_prices, risk_free_rate,
+                rebalance_freq, cost_bps, cash_fraction,
+            )
+
     # ── Benchmark ──
     # Computed before the summary so the headline metrics can carry
     # a delta against it.
@@ -1619,6 +1661,58 @@ if st.session_state.get("calculated"):
                     f"Sharpe ของ {benchmark_symbol}", f"{bench_stats['sharpe']:.2f}",
                     help="ไว้เทียบกับ Sharpe ของพอร์ต",
                 )
+
+        # ── Every objective, side by side ──
+        if objective_table:
+            st.subheader("เปรียบเทียบทุกวิธีจัดพอร์ต")
+            if backtest_mode == "Walk-Forward":
+                st.caption(
+                    f"ทุกแถวคำนวณน้ำหนักใหม่{refit_label}ด้วยตารางเดียวกัน "
+                    "และวัดบนช่วงเดียวกัน จึงเทียบกันได้ตรงๆ"
+                )
+            elif split_date is not None:
+                st.caption(
+                    f"ทุกแถวหาน้ำหนักจากข้อมูลถึง {split_date.date()} "
+                    "แล้ววัดบนช่วง test เดียวกัน — เป็น out-of-sample ทั้งหมด"
+                )
+            else:
+                st.caption(
+                    "⚠️ โหมด In-sample — การเปรียบเทียบนี้วัดบนข้อมูลชุดเดียวกับที่ใช้หา "
+                    "น้ำหนัก ทุกวิธีจึงดูดีเกินจริง และวิธีที่ยืดหยุ่นที่สุดจะได้เปรียบ "
+                    "เปลี่ยนเป็น Train/Test หรือ Walk-Forward เพื่อจัดอันดับที่เชื่อได้"
+                )
+
+            ranking = pd.DataFrame([
+                {
+                    "": "◀" if name == weight_source else "",
+                    "วิธี": name,
+                    "ผลตอบแทนต่อปี": f"{row['annual_return']:.2%}",
+                    "ความผันผวน": f"{row['annual_volatility']:.2%}",
+                    "Sharpe": f"{row['sharpe']:.2f}",
+                    "ขาดทุนสูงสุด": f"{row['max_drawdown']:.2%}",
+                    "Calmar": f"{row['calmar']:.2f}",
+                }
+                for name, row in (
+                    (n, objective_table[n])
+                    for n in list(OBJECTIVES) + [optimizer.EQUAL_WEIGHT, CUSTOM_SOURCE]
+                    if n in objective_table
+                )
+            ])
+            st.dataframe(ranking, use_container_width=True, hide_index=True)
+
+            best_sharpe = max(objective_table, key=lambda n: objective_table[n]["sharpe"])
+            gentlest = max(
+                objective_table, key=lambda n: objective_table[n]["max_drawdown"]
+            )
+            st.caption(
+                f"◀ คือวิธีที่เลือกอยู่ · Sharpe สูงสุดในช่วงนี้คือ **{best_sharpe}** "
+                f"({objective_table[best_sharpe]['sharpe']:.2f}) · ขาดทุนน้อยที่สุดคือ "
+                f"**{gentlest}** ({objective_table[gentlest]['max_drawdown']:.2%})"
+            )
+            st.caption(
+                "อันดับนี้เป็นผลของช่วงเวลาที่ทดสอบช่วงเดียว ไม่ใช่หลักฐานว่าวิธีไหนดีกว่า "
+                "โดยทั่วไป — เลือกจากความเสี่ยงที่รับได้จริง แล้วใช้ Walk-Forward ยืนยัน"
+            )
 
         if bench_stats is not None:
             st.subheader(f"เทียบกับ Benchmark: {benchmark_symbol}")
