@@ -23,6 +23,12 @@ PLOT_SAMPLE = 6_000
 MODES = ["Train / Test Split", "Walk-Forward", "In-sample (ทั้งช่วง)"]
 OBJECTIVES = optimizer.OBJECTIVES
 CUSTOM_SOURCE = "Custom (จากแท็บน้ำหนักพอร์ต)"
+
+# An expected return this far from what the holding actually delivered
+# over the very window the estimate was built on is worth a second look.
+# On a 2010- window the default estimator's worst asset is 0.7% out and
+# EMA's is 20.4%, so the line separates them comfortably.
+ESTIMATE_GAP_LIMIT = 0.10
 DEFAULT_SYMBOLS = "AMZN, META, LLY, SPY, NVDA, GOOGL"
 
 # Starting points for people who have no idea what to type into an
@@ -806,7 +812,6 @@ if run_btn:
     st.session_state["cash_fraction"] = cash_fraction
     st.session_state["max_weight"] = max_weight
     st.session_state["shrinkage"] = shrinkage
-    st.session_state["cost_bps_used"] = cost_bps
     st.session_state["ar"] = ar
     st.session_state["covr"] = covr
     st.session_state["cleaned"] = cleaned
@@ -1172,7 +1177,7 @@ if st.session_state.get("calculated"):
             bench_stats = metrics.backtest_stats(bench_daily, risk_free_rate)
             port_cmp = metrics.backtest_stats(aligned.portfolio, risk_free_rate)
             beta, alpha = metrics.beta_alpha(
-                aligned.portfolio, bench_daily, risk_free_rate, periods_per_year
+                aligned.portfolio, bench_daily, risk_free_rate
             )
             if aligned.start > port_daily.index[0]:
                 st.warning(
@@ -1376,16 +1381,62 @@ if st.session_state.get("calculated"):
             )
 
         st.subheader(f"{display_strategy} Optimal Weights")
-        col_m1, col_m2, col_m3 = st.columns(3)
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         col_m1.metric("Expected Annual Return", f"{sel_ret:.2%}")
         col_m2.metric("Annual Volatility", f"{sel_vol:.2%}")
         col_m3.metric("Sharpe Ratio", f"{sel_sharpe:.2f}")
+        col_m4.metric(
+            "กระจายตัวเทียบเท่า",
+            f"{metrics.effective_holdings(sel_weights):.1f} ตัว",
+            help=(
+                f"ถือ {len(sel_weights)} ตัว แต่กระจายตัวเท่ากับถือเท่าๆ กันกี่ตัว "
+                "(inverse Herfindahl) — 40/30/20/10 นับได้ 3.3 ตัว ส่วน 25/25/25/25 "
+                "นับได้ 4.0 ตัว ยิ่งต่ำแปลว่ายิ่งกระจุก"
+            ),
+        )
 
         weights_df = pd.DataFrame({
             "Stock": list(sel_weights.keys()),
             "Weight": [f"{v:.1%}" for v in sel_weights.values()],
         })
         st.dataframe(weights_df, use_container_width=True, hide_index=True)
+
+        # Swapping the estimator moves these expected returns by tens of
+        # points, and the frontier and the backtest report them on
+        # different tabs. Showing the estimate beside what the holding
+        # actually did over the very same window makes an estimator that
+        # is far out visible instead of merely present.
+        realised = metrics.realised_returns(train_close)
+        shared = [a for a in ar.index if a in realised.index]
+        if shared:
+            gaps = {a: float(ar[a] - realised[a]) for a in shared}
+            widest = max(gaps, key=lambda a: abs(gaps[a]))
+            if abs(gaps[widest]) > ESTIMATE_GAP_LIMIT:
+                st.warning(
+                    f"⚠️ วิธีประมาณผลตอบแทน **{return_method}** ให้ค่าที่ห่างจากที่เกิดขึ้นจริง "
+                    f"มาก — **{widest}** ถูกประมาณไว้ {ar[widest]:.1%} ต่อปี แต่ในช่วงเดียวกัน "
+                    f"ทำได้จริง {realised[widest]:.1%} (ต่างกัน {gaps[widest]:+.1%}) "
+                    "น้ำหนักที่ได้จึงวิ่งตามค่าประมาณนี้ ลองเปลี่ยนวิธีประมาณแล้วดูว่า "
+                    "น้ำหนักเปลี่ยนไปแค่ไหน"
+                )
+            with st.expander("ค่าคาดหวังเทียบกับที่เกิดขึ้นจริง (ช่วงที่ใช้หาน้ำหนัก)"):
+                st.dataframe(
+                    pd.DataFrame([
+                        {
+                            "สินทรัพย์": a,
+                            "คาดหวัง": f"{ar[a]:.2%}",
+                            "เกิดขึ้นจริง": f"{realised[a]:.2%}",
+                            "ต่าง": f"{gaps[a]:+.2%}",
+                        }
+                        for a in sorted(shared, key=lambda x: -abs(gaps[x]))
+                    ]),
+                    use_container_width=True, hide_index=True,
+                )
+                st.caption(
+                    "ค่าคาดหวังไม่จำเป็นต้องเท่ากับอดีต นั่นคือหน้าที่ของตัวประมาณ "
+                    "แต่ถ้าห่างกันมากบนข้อมูลชุดเดียวกับที่มันเห็น ก็ควรตั้งคำถาม "
+                    f"— เกณฑ์ที่ใช้เตือนคือห่างเกิน {ESTIMATE_GAP_LIMIT:.0%}"
+                )
 
 
         # ── Walk-forward weight history ──
@@ -1764,7 +1815,11 @@ if st.session_state.get("calculated"):
         )
         r3.metric(
             "Turnover รวม", f"{turnover_series.sum():.0%}",
-            help="มูลค่าที่ซื้อขายรวมทั้งช่วง คิดเป็นสัดส่วนของมูลค่าพอร์ต",
+            help=(
+                "มูลค่าที่เทรดรวมทั้งช่วง คิดเป็นสัดส่วนของมูลค่าพอร์ต — นับสองทาง "
+                "คือรวมทั้งขาซื้อและขาขาย ซึ่งตรงกับฐานที่ใช้คิดค่าธรรมเนียม "
+                "ตัวเลขแบบทางเดียวที่ตำรามักใช้จะเป็นครึ่งหนึ่งของนี้"
+            ),
         )
         if cost_bps > 0 and gross_daily is not None and not gross_daily.empty:
             gross_stats = metrics.backtest_stats(gross_daily, risk_free_rate)
@@ -1775,7 +1830,7 @@ if st.session_state.get("calculated"):
             )
         if rebalance_freq is None and result.final_weights:
             drift = ", ".join(
-                f"{sym} {active_w.get(sym, 0):.0%}→{final:.0%}"
+                f"{sym} {weights_in_force.get(sym, 0):.0%}→{final:.0%}"
                 for sym, final in sorted(result.final_weights.items())
             )
             st.caption(f"สัดส่วนเมื่อจบช่วง (ปล่อยให้ drift): {drift}")

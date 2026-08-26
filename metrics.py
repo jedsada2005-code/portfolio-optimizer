@@ -271,7 +271,7 @@ def align_benchmark(portfolio_returns, benchmark_prices):
     return AlignedBenchmark(port, aligned.pct_change().fillna(0.0), start)
 
 
-def beta_alpha(portfolio_returns, benchmark_returns, risk_free_rate, periods_per_year_value):
+def beta_alpha(portfolio_returns, benchmark_returns, risk_free_rate):
     """Beta against a benchmark and the resulting Jensen's alpha."""
     joined = pd.concat(
         [pd.Series(portfolio_returns), pd.Series(benchmark_returns)],
@@ -290,6 +290,43 @@ def beta_alpha(portfolio_returns, benchmark_returns, risk_free_rate, periods_per
     bench_annual = cagr(float((1 + bench).prod() - 1), years_elapsed(joined.index))
     alpha = port_annual - (risk_free_rate + beta * (bench_annual - risk_free_rate))
     return beta, float(alpha)
+
+
+def realised_returns(prices):
+    """Annualised return each column actually delivered over its history.
+
+    The frontier reports an *estimate* and the backtest reports what
+    happened, on two different tabs, with nothing on screen tying them
+    together -- so an estimator that put gold at 30% a year when it
+    delivered 7% looked no different from one that got it right.
+
+    Each column is measured over its own history, since a holding that
+    listed late did not exist for the earlier part of the window.
+    """
+    out = {}
+    for column in prices.columns:
+        series = prices[column].dropna()
+        if len(series) < 2 or series.iloc[0] <= 0:
+            continue
+        out[column] = cagr(
+            float(series.iloc[-1] / series.iloc[0] - 1.0), years_elapsed(series.index)
+        )
+    return pd.Series(out, dtype=float)
+
+
+def effective_holdings(weights):
+    """How many equally-weighted positions a portfolio is really worth.
+
+    The inverse Herfindahl index. A weights table shows what is held but
+    not how concentrated it is: 40/30/20/10 and 25/25/25/25 both list
+    four holdings, and are worth 3.3 and 4.0 of them respectively.
+    """
+    values = [float(w) for w in weights.values() if float(w) > 0]
+    total = sum(values)
+    if not values or total <= 0:
+        return 0.0
+    shares = [w / total for w in values]
+    return 1.0 / sum(share * share for share in shares)
 
 
 REBALANCE_FREQUENCIES = {
