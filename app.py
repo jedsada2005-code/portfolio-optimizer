@@ -756,13 +756,28 @@ if run_btn:
             except optimizer.SOLVER_ERRORS as exc:
                 objective_errors[name] = str(exc)
 
-        objective_perf = {
-            name: metrics.blend_performance(
-                *optimizer.portfolio_performance(ar, covr, weights, risk_free_rate)[:2],
-                risk_free_rate, cash_fraction,
-            )
+        # The target constrains the risky sleeve, before any cash is held
+        # alongside it, so keep the unblended figures to check it against.
+        objective_raw = {
+            name: optimizer.portfolio_performance(ar, covr, weights, risk_free_rate)
             for name, weights in objective_weights.items()
         }
+        objective_perf = {
+            name: metrics.blend_performance(
+                raw[0], raw[1], risk_free_rate, cash_fraction,
+            )
+            for name, raw in objective_raw.items()
+        }
+        target_gaps = {}
+        for name, wanted in (
+            (optimizer.TARGET_VOLATILITY, target_volatility),
+            (optimizer.TARGET_RETURN, target_return),
+        ):
+            if name not in objective_raw:
+                continue
+            gap = optimizer.target_gap(name, wanted, *objective_raw[name][:2])
+            if gap is not None:
+                target_gaps[name] = gap
         hrp_cleaned = objective_weights.get(optimizer.HRP_OBJECTIVE, {})
 
         # Efficient frontier curve, solved directly instead of read back
@@ -802,6 +817,7 @@ if run_btn:
     st.session_state["objective_weights"] = objective_weights
     st.session_state["objective_errors"] = objective_errors
     st.session_state["objective_perf"] = objective_perf
+    st.session_state["target_gaps"] = target_gaps
     st.session_state["required_observations"] = required_observations
     st.session_state["target_volatility"] = target_volatility
     st.session_state["target_return"] = target_return
@@ -843,6 +859,7 @@ if st.session_state.get("calculated"):
     objective_weights = st.session_state["objective_weights"]
     objective_errors = st.session_state["objective_errors"]
     objective_perf = st.session_state["objective_perf"]
+    target_gaps = st.session_state["target_gaps"]
     required_observations = st.session_state["required_observations"]
     target_volatility = st.session_state["target_volatility"]
     target_return = st.session_state["target_return"]
@@ -877,30 +894,27 @@ if st.session_state.get("calculated"):
             "ผลลัพธ์ด้านล่างยังเป็นของค่าเดิม กด **Calculate** เพื่อคำนวณใหม่"
         )
 
-    # A run's mode and settings change what every number below means,
-    # so state them once, above the tabs, instead of only inside one.
-    mode_icon = {"Walk-Forward": "🔒", "Train / Test Split": "🔒"}.get(backtest_mode, "⚠️")
-    status = [
-        f"{mode_icon} **{backtest_mode}**",
-        f"💱 {base_currency}",
-        f"🔄 Rebalance {rebalance_label}",
-    ]
-    if cost_bps:
-        status.append(f"💸 {cost_bps:.0f} bps")
-    if cash_fraction:
-        status.append(f"💵 เงินสด {cash_fraction:.0%}")
-    if max_weight < 1.0:
-        status.append(f"⚖️ สูงสุด {max_weight:.0%}/ตัว")
-    if min_weight > 0:
-        status.append(f"⚖️ ขั้นต่ำ {min_weight:.0%}/ตัว")
-    if benchmark_symbol:
-        status.append(f"📊 เทียบ {benchmark_symbol}")
-    status.append(f"📐 {return_method}")
-    st.caption(" · ".join(status))
-
     with st.expander("🔗 บันทึกหรือแชร์พอร์ตนี้"):
         st.caption("ลิงก์นี้เก็บการตั้งค่าทั้งหมดไว้ เปิดแล้วได้ค่าเดิม ส่งต่อให้คนอื่นได้")
         st.code(current_url(), language=None)
+
+    def target_note(objective):
+        """Why a target objective did not land on the number asked for."""
+        gap = target_gaps.get(objective)
+        if gap is None:
+            return None
+        wanted, achieved = gap
+        if objective == optimizer.TARGET_VOLATILITY:
+            return (
+                f"⚠️ ความเสี่ยงเป้าหมาย **{wanted:.0%}** อยู่เลยปลายเส้น frontier "
+                f"— พอร์ตที่ได้จึงเป็นจุดที่ผลตอบแทนสูงสุดเท่าที่ทำได้ ซึ่งมีความเสี่ยง "
+                f"**{achieved:.2%}** ลดเป้าหมายลงเพื่อเลือกจุดอื่นบนเส้น"
+            )
+        return (
+            f"⚠️ ผลตอบแทนเป้าหมาย **{wanted:.0%}** ต่ำกว่าจุดเริ่มต้นของเส้น frontier "
+            f"— พอร์ตที่ได้จึงเป็นจุดที่ความเสี่ยงต่ำสุด ซึ่งให้ผลตอบแทนคาดหวัง "
+            f"**{achieved:.2%}** เพิ่มเป้าหมายขึ้นเพื่อเลือกจุดอื่นบนเส้น"
+        )
 
     # Computed before the tabs so every tab is a renderer: the weights
     # tab can show backtest diagnostics, and the NAV tab cannot drift
@@ -928,6 +942,36 @@ if st.session_state.get("calculated"):
         )
         active_w = objective_weights.get(weight_source, custom_w_available)
     
+    # A run's mode and settings change what every number below means, so
+    # state them once here. It sits below the weight picker because the
+    # chosen objective decides which of them are true: HRP allocates from
+    # the covariance tree alone and takes no bounds, and hand-typed
+    # weights are not passed through the optimiser at all, so listing the
+    # bounds beside either would describe a portfolio nobody is holding.
+    mode_icon = {"Walk-Forward": "🔒", "Train / Test Split": "🔒"}.get(backtest_mode, "⚠️")
+    status = [
+        f"{mode_icon} **{backtest_mode}**",
+        f"💱 {base_currency}",
+        f"🔄 Rebalance {rebalance_label}",
+    ]
+    if cost_bps:
+        status.append(f"💸 {cost_bps:.0f} bps")
+    if cash_fraction:
+        status.append(f"💵 เงินสด {cash_fraction:.0%}")
+    honours_bounds = weight_source not in (optimizer.HRP_OBJECTIVE, CUSTOM_SOURCE)
+    if honours_bounds:
+        if max_weight < 1.0:
+            status.append(f"⚖️ สูงสุด {max_weight:.0%}/ตัว")
+        if min_weight > 0:
+            status.append(f"⚖️ ขั้นต่ำ {min_weight:.0%}/ตัว")
+    elif max_weight < 1.0 or min_weight > 0:
+        which = "HRP" if weight_source == optimizer.HRP_OBJECTIVE else "น้ำหนักที่กำหนดเอง"
+        status.append(f"⚠️ {which} ไม่ใช้เพดาน/ขั้นต่ำที่ตั้งไว้")
+    if benchmark_symbol:
+        status.append(f"📊 เทียบ {benchmark_symbol}")
+    status.append(f"📐 {return_method}")
+    st.caption(" · ".join(status))
+
     if backtest_mode == "Walk-Forward":
         st.info(
             f"โหมด Walk-Forward คำนวณน้ำหนักใหม่ทุกงวดด้วยวัตถุประสงค์ **{walk_objective}** "
@@ -940,6 +984,10 @@ if st.session_state.get("calculated"):
                 f"{k}={v:.1%}" for k, v in sorted(active_w.items()) if v > 0
             )
         )
+
+    unreached = target_note(weight_source)
+    if unreached:
+        st.warning(unreached)
     
     # C2: a cash sleeve is modelled as a synthetic holding accruing
     # the risk-free rate, so it flows through the ordinary simulator.
@@ -1065,16 +1113,34 @@ if st.session_state.get("calculated"):
     # a delta against it.
     bench_daily = pd.Series(dtype=float)
     bench_stats = None
+    # The portfolio measured over the benchmark's own window. Every
+    # "vs benchmark" figure below is drawn from this rather than from the
+    # full-window numbers, so both sides always cover the same days.
+    port_cmp = None
     beta = alpha = 0.0
     if not benchmark.empty:
-        bench_window = benchmark.reindex(
-            benchmark.index.union(port_daily.index)
-        ).ffill().reindex(port_daily.index)
-        bench_daily = bench_window.pct_change().fillna(0.0)
-        bench_stats = metrics.backtest_stats(bench_daily, risk_free_rate)
-        beta, alpha = metrics.beta_alpha(
-            port_daily, bench_daily, risk_free_rate, periods_per_year
-        )
+        aligned = metrics.align_benchmark(port_daily, benchmark)
+        bench_daily = aligned.benchmark
+        if bench_daily.empty:
+            st.warning(
+                f"⚠️ **{benchmark_symbol}** ไม่มีข้อมูลทับซ้อนกับช่วงที่ทดสอบเลย "
+                "— ข้ามการเปรียบเทียบ"
+            )
+        else:
+            bench_stats = metrics.backtest_stats(bench_daily, risk_free_rate)
+            port_cmp = metrics.backtest_stats(aligned.portfolio, risk_free_rate)
+            beta, alpha = metrics.beta_alpha(
+                aligned.portfolio, bench_daily, risk_free_rate, periods_per_year
+            )
+            if aligned.start > port_daily.index[0]:
+                st.warning(
+                    f"⚠️ **{benchmark_symbol}** มีข้อมูลตั้งแต่ "
+                    f"**{aligned.start.date()}** ซึ่งช้ากว่าพอร์ต "
+                    f"({port_daily.index[0].date()}) — ตัวเลขที่เทียบกับ benchmark "
+                    f"ทุกช่องจึงวัดเฉพาะช่วง {aligned.start.date()} เป็นต้นมา "
+                    f"({port_cmp['years']:.1f} ปี จาก {n_years:.1f} ปีของพอร์ต) "
+                    "ไม่ใช่ทั้งช่วงที่ทดสอบ"
+                )
     
     def build_workbook():
         buffer = io.BytesIO()
@@ -1248,6 +1314,10 @@ if st.session_state.get("calculated"):
                 "⚠️ วิธีที่แก้ไม่ได้ในรอบนี้: "
                 + " · ".join(f"**{k}** — {v}" for k, v in objective_errors.items())
             )
+
+        shown_unreached = target_note(display_strategy)
+        if shown_unreached:
+            st.warning(shown_unreached)
 
         sel_weights = objective_weights[display_strategy]
         sel_ret, sel_vol = objective_perf[display_strategy]
@@ -1475,20 +1545,20 @@ if st.session_state.get("calculated"):
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(
             "ผลตอบแทนต่อปี", f"{ann_ret:.2%}",
-            delta=(f"{ann_ret - bench_stats['annual_return']:+.2%} vs {benchmark_symbol}"
+            delta=(f"{port_cmp['annual_return'] - bench_stats['annual_return']:+.2%} vs {benchmark_symbol}"
                    if bench_stats else None),
             help="ผลตอบแทนทบต้นเฉลี่ยต่อปี (CAGR) คำนวณจากช่วงเวลาปฏิทินจริง",
         )
         m2.metric(
             "ขาดทุนสูงสุด", f"{max_dd:.2%}",
-            delta=(f"{max_dd - bench_stats['max_drawdown']:+.2%} vs {benchmark_symbol}"
+            delta=(f"{port_cmp['max_drawdown'] - bench_stats['max_drawdown']:+.2%} vs {benchmark_symbol}"
                    if bench_stats else None),
             delta_color="normal",
             help="Max Drawdown — ระยะที่พอร์ตตกจากจุดสูงสุดลงมาต่ำสุด ยิ่งใกล้ 0 ยิ่งดี",
         )
         m3.metric(
             "Sharpe Ratio", f"{sharpe:.2f}",
-            delta=(f"{sharpe - bench_stats['sharpe']:+.2f} vs {benchmark_symbol}"
+            delta=(f"{port_cmp['sharpe'] - bench_stats['sharpe']:+.2f} vs {benchmark_symbol}"
                    if bench_stats else None),
             help=(
                 "ผลตอบแทนส่วนเกินต่อ 1 หน่วยความผันผวน ยิ่งสูงยิ่งดี "
@@ -1497,7 +1567,8 @@ if st.session_state.get("calculated"):
         )
         if bench_stats:
             m4.metric(
-                f"ชนะ {benchmark_symbol}", f"{ann_ret - bench_stats['annual_return']:+.2%}",
+                f"ชนะ {benchmark_symbol}",
+                f"{port_cmp['annual_return'] - bench_stats['annual_return']:+.2%}",
                 help=f"ส่วนต่างผลตอบแทนต่อปีเทียบกับการถือ {benchmark_symbol} เฉยๆ",
             )
         else:
@@ -1554,7 +1625,10 @@ if st.session_state.get("calculated"):
             versus = pd.DataFrame({
                 "": ["Annual Return", "Annual Volatility", "Sharpe Ratio", "Max Drawdown"],
                 "Portfolio": [
-                    f"{ann_ret:.2%}", f"{ann_vol:.2%}", f"{sharpe:.2f}", f"{max_dd:.2%}",
+                    f"{port_cmp['annual_return']:.2%}",
+                    f"{port_cmp['annual_volatility']:.2%}",
+                    f"{port_cmp['sharpe']:.2f}",
+                    f"{port_cmp['max_drawdown']:.2%}",
                 ],
                 benchmark_symbol: [
                     f"{bench_stats['annual_return']:.2%}",
@@ -1564,13 +1638,23 @@ if st.session_state.get("calculated"):
                 ],
             })
             st.dataframe(versus, use_container_width=True, hide_index=True)
+            st.caption(
+                f"ทั้งสองคอลัมน์วัดช่วงเดียวกัน: {bench_daily.index[0].date()} ถึง "
+                f"{bench_daily.index[-1].date()} ({port_cmp['years']:.1f} ปี)"
+                + ("" if port_cmp["years"] >= n_years - 0.01 else
+                   f" — สั้นกว่าช่วงที่ทดสอบพอร์ต ({n_years:.1f} ปี) เพราะ "
+                   f"{benchmark_symbol} ยังไม่มีข้อมูลในช่วงแรก")
+            )
 
             b1, b2, b3 = st.columns(3)
             b1.metric("Beta", f"{beta:.2f}", help="ความอ่อนไหวต่อ benchmark — 1.0 คือเคลื่อนไหวตามกัน")
             b2.metric("Alpha (ต่อปี)", f"{alpha:.2%}", help="ผลตอบแทนส่วนเกินหลังปรับความเสี่ยงตาม beta")
-            b3.metric("ชนะ Benchmark", f"{ann_ret - bench_stats['annual_return']:+.2%}")
+            b3.metric(
+                "ชนะ Benchmark",
+                f"{port_cmp['annual_return'] - bench_stats['annual_return']:+.2%}",
+            )
 
-            if ann_ret <= bench_stats["annual_return"]:
+            if port_cmp["annual_return"] <= bench_stats["annual_return"]:
                 st.info(
                     f"ℹ️ พอร์ตนี้ให้ผลตอบแทนไม่ชนะการถือ **{benchmark_symbol}** เฉยๆ "
                     "ในช่วงที่ทดสอบ — ลองพิจารณาว่าความซับซ้อนที่เพิ่มขึ้นคุ้มหรือไม่"

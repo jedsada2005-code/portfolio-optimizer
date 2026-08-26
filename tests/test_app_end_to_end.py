@@ -786,3 +786,99 @@ def test_the_benchmark_comparison_is_rendered_once(app):
         s.value for s in at.subheader if "เทียบกับ Benchmark" in (s.value or "")
     ]
     assert len(headings) == 1, headings
+
+
+class TestBenchmarkCoversTheSameDays:
+    """A benchmark that listed after the portfolio began was forward-
+    filled into NaNs, then those NaNs became 0% returns -- so it read as
+    flat through years it did not exist for."""
+
+    def test_a_later_listing_is_not_flat_lined(self, app):
+        # In-sample so the tested window really does start in 2010; under
+        # the default split it would start after ARKK already existed and
+        # there would be no gap to mishandle. ARKK listed Oct 2014.
+        _widget(app.text_input, "Benchmark").set_value("ARKK")
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2010-01-01"))
+        app.radio[0].set_value("In-sample (ทั้งช่วง)")
+        at = _calculate(app)
+
+        prices = at.session_state["benchmark"].dropna()
+        truth = metrics.backtest_stats(
+            prices.pct_change().dropna(), at.session_state["risk_free_rate"]
+        )["annual_return"]
+
+        for frame in at.dataframe:
+            table = frame.value
+            if "ARKK" in getattr(table, "columns", []):
+                reported = float(table["ARKK"].iloc[0].rstrip("%")) / 100.0
+                assert reported == pytest.approx(truth, abs=5e-3)
+                break
+        else:
+            raise AssertionError("no benchmark comparison table rendered")
+
+    def test_the_shorter_comparison_window_is_declared(self, app):
+        _widget(app.text_input, "Benchmark").set_value("ARKK")
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2010-01-01"))
+        app.radio[0].set_value("In-sample (ทั้งช่วง)")
+        at = _calculate(app)
+
+        said = [w.value for w in at.warning if "ARKK" in (w.value or "")]
+        assert said, "nothing told the reader the comparison starts later"
+
+    def test_a_benchmark_covering_the_whole_window_says_nothing_extra(self, app):
+        # ^GSPC rather than SPY: SPY is in the portfolio, which raises an
+        # unrelated warning of its own.
+        _widget(app.text_input, "Benchmark").set_value("^GSPC")
+        at = _calculate(app)
+        assert not [
+            w.value for w in at.warning if "^GSPC" in (w.value or "")
+        ]
+
+
+class TestUnreachableTargetsAreDeclared:
+    """efficient_risk maximises return under a volatility ceiling, so a
+    ceiling above the end of the frontier is non-binding: the solver
+    returns the highest-return portfolio and says nothing."""
+
+    def test_a_volatility_ceiling_beyond_the_frontier_is_reported(self, app):
+        _widget(app.number_input, "ความเสี่ยงเป้าหมาย").set_value(0.90)
+        at = _calculate(app)
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value(
+            optimizer.TARGET_VOLATILITY
+        ).run()
+
+        assert not at.exception, at.exception
+        said = " ".join(w.value or "" for w in at.warning)
+        assert "90" in said and "ทำได้" in said, said
+
+    def test_a_reachable_target_is_not_reported(self, app):
+        _widget(app.number_input, "ความเสี่ยงเป้าหมาย").set_value(0.12)
+        at = _calculate(app)
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value(
+            optimizer.TARGET_VOLATILITY
+        ).run()
+
+        assert not [w for w in at.warning if "ทำได้สูงสุด" in (w.value or "")]
+
+
+class TestStatusChipsMatchTheChosenObjective:
+    """HRP allocates from the covariance tree alone and takes no weight
+    bounds, but the status line was built before the objective was
+    chosen, so it advertised bounds HRP had ignored."""
+
+    def test_hrp_does_not_advertise_bounds_it_ignores(self, app):
+        _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(40)
+        at = _calculate(app)
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value(
+            optimizer.HRP_OBJECTIVE
+        ).run()
+
+        status = " ".join(c.value or "" for c in at.caption if "Rebalance" in (c.value or ""))
+        assert status, "no status line rendered"
+        assert "สูงสุด 40%/ตัว" not in status, status
+
+    def test_a_bounded_objective_still_advertises_its_bounds(self, app):
+        _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(40)
+        at = _calculate(app)
+        status = " ".join(c.value or "" for c in at.caption if "Rebalance" in (c.value or ""))
+        assert "สูงสุด 40%/ตัว" in status, status

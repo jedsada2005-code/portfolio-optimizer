@@ -674,3 +674,49 @@ class TestDownsideSolverBackend:
         )
         assert min(w.values()) >= 0.1 - 1e-6
         assert max(w.values()) <= 0.4 + 1e-6
+
+
+class TestTargetGap:
+    """efficient_risk maximises return under a volatility ceiling and
+    efficient_return minimises volatility under a return floor, so a
+    target on the slack side of either is ignored rather than refused --
+    the solver returns the nearest reachable portfolio in silence."""
+
+    def test_a_volatility_ceiling_above_the_frontier_is_reported(self):
+        gap = optimizer.target_gap(
+            optimizer.TARGET_VOLATILITY, 0.35, expected_return=0.20, volatility=0.1927
+        )
+        assert gap == (0.35, 0.1927)
+
+    def test_a_volatility_target_that_was_met_reports_nothing(self):
+        assert optimizer.target_gap(
+            optimizer.TARGET_VOLATILITY, 0.12, expected_return=0.14, volatility=0.12
+        ) is None
+
+    def test_a_return_floor_below_the_frontier_is_reported(self):
+        gap = optimizer.target_gap(
+            optimizer.TARGET_RETURN, -0.20, expected_return=0.0417, volatility=0.0564
+        )
+        assert gap == (-0.20, 0.0417)
+
+    def test_a_return_target_that_was_met_reports_nothing(self):
+        assert optimizer.target_gap(
+            optimizer.TARGET_RETURN, 0.10, expected_return=0.10, volatility=0.0857
+        ) is None
+
+    def test_rounding_noise_is_not_reported_as_a_miss(self):
+        assert optimizer.target_gap(
+            optimizer.TARGET_VOLATILITY, 0.12, expected_return=0.14, volatility=0.120_4
+        ) is None
+
+    @pytest.mark.parametrize("objective", ["Max Sharpe", "Min Volatility",
+                                           optimizer.HRP_OBJECTIVE])
+    def test_objectives_without_a_target_report_nothing(self, objective):
+        assert optimizer.target_gap(
+            objective, 0.12, expected_return=0.14, volatility=0.09
+        ) is None
+
+    def test_a_missing_target_reports_nothing(self):
+        assert optimizer.target_gap(
+            optimizer.TARGET_VOLATILITY, None, expected_return=0.14, volatility=0.09
+        ) is None

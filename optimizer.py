@@ -307,6 +307,27 @@ def optimize_weights(expected_returns, cov, objective, risk_free_rate,
     return cleaned
 
 
+def target_gap(objective, target, expected_return, volatility, tolerance=1e-3):
+    """``(requested, achieved)`` when a target objective missed its target.
+
+    ``efficient_risk`` maximises return subject to a volatility ceiling
+    and ``efficient_return`` minimises volatility subject to a return
+    floor, so a target on the slack side of either constraint is simply
+    non-binding: the solver succeeds and hands back the nearest
+    reachable portfolio without a word. Asking for 35% volatility on a
+    frontier that ends at 19% is answered with the 19% portfolio.
+
+    Returns None when the objective takes no target, none was given, or
+    the target was reached.
+    """
+    if objective not in NEEDS_TARGET or target is None:
+        return None
+    achieved = volatility if objective == TARGET_VOLATILITY else expected_return
+    if abs(achieved - target) <= tolerance:
+        return None
+    return float(target), float(achieved)
+
+
 def portfolio_performance(expected_returns, cov, weights, risk_free_rate):
     """Expected return, volatility and Sharpe for an explicit weight set."""
     w = np.array([float(weights.get(a, 0.0)) for a in expected_returns.index])
