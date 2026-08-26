@@ -1152,3 +1152,56 @@ class TestEstimatesCarryTheirUncertainty:
         _widget(app.slider, "ประวัติขั้นต่ำที่ยอมรับ").set_value(1)
         at = _calculate(app)
         assert not at.exception, at.exception
+
+
+class TestOneBrokenObjectiveDoesNotTakeThePageDown:
+    """Every objective is solved on every run, so anything unexpected out
+    of one of them reached the page as a traceback. That is how a private
+    scipy name pypfopt validates against, removed in a newer scipy, put
+    up "Oh no. Error running app." for every visitor."""
+
+    def test_the_page_survives_a_scipy_without_the_private_name(
+        self, app, monkeypatch
+    ):
+        import scipy.cluster.hierarchy as sch
+        monkeypatch.delattr(sch, "_LINKAGE_METHODS", raising=False)
+
+        at = _calculate(app)
+        assert not at.exception, at.exception
+        assert optimizer.HRP_OBJECTIVE in at.session_state["objective_weights"]
+
+    def test_an_objective_that_blows_up_is_reported_not_fatal(
+        self, app, monkeypatch
+    ):
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("upstream library changed under us")
+
+        monkeypatch.setattr(optimizer, "hrp_weights", explode)
+        at = _calculate(app)
+
+        assert not at.exception, at.exception
+        assert at.session_state["calculated"] is True
+        assert optimizer.HRP_OBJECTIVE not in at.session_state["objective_weights"]
+        assert optimizer.HRP_OBJECTIVE in at.session_state["objective_errors"]
+
+    def test_the_remaining_objectives_still_work(self, app, monkeypatch):
+        def explode(*_args, **_kwargs):
+            raise RuntimeError("upstream library changed under us")
+
+        monkeypatch.setattr(optimizer, "hrp_weights", explode)
+        at = _calculate(app)
+
+        for name in ("Max Sharpe", "Min Volatility", optimizer.MIN_CVAR):
+            assert name in at.session_state["objective_weights"], name
+
+
+def test_walk_forward_survives_one_objective_blowing_up(app, monkeypatch):
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("upstream library changed under us")
+
+    monkeypatch.setattr(optimizer, "hrp_weights", explode)
+    app.radio[0].set_value("Walk-Forward")
+    at = _calculate(app)
+
+    assert not at.exception, at.exception
+    assert at.session_state["calculated"] is True
