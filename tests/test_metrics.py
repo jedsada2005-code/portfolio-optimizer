@@ -468,3 +468,76 @@ class TestHistoryRequirement:
     def test_a_two_year_floor_still_admits_shorter_history(self):
         counts = pd.Series({"NEW": 60})
         assert metrics.unreliable_assets(counts, metrics.observations_for_years(2)) == {}
+
+
+class TestAlignBenchmark:
+    """A benchmark that listed after the portfolio began leaves NaNs at
+    the front of the reindexed price series. Turning those into 0%
+    returns made it look flat through years it did not exist for, which
+    flattered every comparison drawn against it."""
+
+    @staticmethod
+    def _portfolio(index):
+        return pd.Series(0.0004, index=index)
+
+    def test_a_later_listing_is_measured_from_its_own_inception(self):
+        index = pd.bdate_range("2020-01-01", "2024-12-31")
+        prices = pd.Series(
+            100.0 * 1.0005 ** np.arange(len(index)), index=index
+        )
+        prices.loc[:"2022-01-01"] = np.nan
+
+        aligned = metrics.align_benchmark(self._portfolio(index), prices)
+
+        assert aligned.start == prices.first_valid_index()
+        # 0.05% a business day, compounded, is what the benchmark really did.
+        stats = metrics.backtest_stats(aligned.benchmark, 0.0)
+        assert stats["annual_return"] == pytest.approx(1.0005 ** 261 - 1, rel=0.02)
+
+    def test_both_sides_cover_the_same_days(self):
+        index = pd.bdate_range("2020-01-01", "2024-12-31")
+        prices = pd.Series(100.0 * 1.0005 ** np.arange(len(index)), index=index)
+        prices.loc[:"2022-01-01"] = np.nan
+
+        aligned = metrics.align_benchmark(self._portfolio(index), prices)
+
+        assert aligned.portfolio.index.equals(aligned.benchmark.index)
+        assert aligned.portfolio.index[0] == aligned.start
+
+    def test_both_sides_start_from_the_same_base(self):
+        index = pd.bdate_range("2020-01-01", "2024-12-31")
+        prices = pd.Series(100.0 * 1.0005 ** np.arange(len(index)), index=index)
+        prices.loc[:"2022-01-01"] = np.nan
+
+        aligned = metrics.align_benchmark(self._portfolio(index), prices)
+
+        assert aligned.portfolio.iloc[0] == 0.0
+        assert aligned.benchmark.iloc[0] == 0.0
+
+    def test_a_fully_overlapping_benchmark_keeps_the_whole_window(self):
+        index = pd.bdate_range("2020-01-01", "2024-12-31")
+        prices = pd.Series(100.0 * 1.0005 ** np.arange(len(index)), index=index)
+
+        aligned = metrics.align_benchmark(self._portfolio(index), prices)
+
+        assert aligned.start == index[0]
+        assert len(aligned.portfolio) == len(index)
+
+    def test_a_benchmark_that_never_overlaps_returns_nothing(self):
+        index = pd.bdate_range("2020-01-01", "2020-12-31")
+        prices = pd.Series(
+            100.0, index=pd.bdate_range("2022-01-01", "2022-12-31")
+        )
+
+        aligned = metrics.align_benchmark(self._portfolio(index), prices)
+
+        assert aligned.benchmark.empty
+        assert aligned.start is None
+
+    def test_an_empty_benchmark_returns_nothing(self):
+        index = pd.bdate_range("2020-01-01", "2020-12-31")
+        aligned = metrics.align_benchmark(
+            self._portfolio(index), pd.Series(dtype=float)
+        )
+        assert aligned.benchmark.empty
+        assert aligned.portfolio.empty

@@ -234,6 +234,43 @@ def backtest_stats(returns, risk_free_rate):
     }
 
 
+AlignedBenchmark = namedtuple("AlignedBenchmark", "portfolio benchmark start")
+
+
+def align_benchmark(portfolio_returns, benchmark_prices):
+    """Portfolio and benchmark returns over the window both really cover.
+
+    A benchmark that listed after the portfolio began leaves NaNs at the
+    front of the reindexed price series, and ``pct_change`` turns those
+    into NaN in turn. Filling them with 0% makes the benchmark look flat
+    through years it did not exist for, which understates its own return
+    and flatters every comparison drawn against it. Trimming to the
+    overlap instead keeps both sides measuring the same days, from the
+    same base date.
+    """
+    empty = pd.Series(dtype=float)
+    port = pd.Series(portfolio_returns).dropna()
+    prices = pd.Series(benchmark_prices).dropna()
+    if port.empty or prices.empty:
+        return AlignedBenchmark(empty, empty, None)
+
+    start = max(port.index[0], prices.index[0])
+    port = port.loc[start:]
+    if port.empty:
+        return AlignedBenchmark(empty, empty, None)
+
+    aligned = prices.reindex(prices.index.union(port.index)).ffill().reindex(port.index)
+    if aligned.isna().all():
+        return AlignedBenchmark(empty, empty, None)
+
+    # Both series are rebased to `start`, so the first row is a 0% base
+    # day on each side rather than a real return on one and a gap on the
+    # other.
+    port = port.copy()
+    port.iloc[0] = 0.0
+    return AlignedBenchmark(port, aligned.pct_change().fillna(0.0), start)
+
+
 def beta_alpha(portfolio_returns, benchmark_returns, risk_free_rate, periods_per_year_value):
     """Beta against a benchmark and the resulting Jensen's alpha."""
     joined = pd.concat(
