@@ -18,6 +18,7 @@ from pypfopt import (
 from pypfopt.exceptions import OptimizationError
 
 import cvxpy
+import scipy.cluster.hierarchy as _sch
 
 try:  # cvxpy raises this straight through pypfopt on a degenerate problem
     from cvxpy.error import SolverError
@@ -99,12 +100,37 @@ def estimate_returns_with_counts(weekly_prices, method):
     return estimate_returns(weekly_prices, method), counts
 
 
+# The seven methods scipy.cluster.hierarchy.linkage documents. pypfopt
+# 1.6.0 -- still its latest release -- validates its linkage argument
+# against scipy's private _LINKAGE_METHODS mapping, which newer scipy no
+# longer defines. The name is used for that check and nothing else;
+# every line after it in HRPOpt.optimize is public API. Since app.py
+# solves every objective on every run, the AttributeError took the whole
+# page down rather than merely disabling HRP.
+LINKAGE_METHODS = (
+    "single", "complete", "average", "weighted", "centroid", "median", "ward",
+)
+
+
+def _restore_linkage_methods():
+    """Put back the private name pypfopt validates against, if it is gone.
+
+    Deliberately done per call rather than once at import, so it holds
+    however scipy is loaded or reloaded around us.
+    """
+    if not hasattr(_sch, "_LINKAGE_METHODS"):
+        _sch._LINKAGE_METHODS = {
+            name: index for index, name in enumerate(LINKAGE_METHODS)
+        }
+
+
 def hrp_weights(weekly_prices):
     """Hierarchical risk parity: allocation from the covariance alone.
 
     Needs no expected returns at all, which sidesteps the noisiest input
     in the whole exercise and never leaves an asset at zero.
     """
+    _restore_linkage_methods()
     returns = weekly_prices.pct_change().dropna(how="all")
     optimiser = HRPOpt(returns)
     optimiser.optimize()
@@ -443,10 +469,13 @@ def compare_walk_forward(objectives, prices, risk_free_rate, max_weight, shrinka
     targets = targets or {}
     table = {}
     for name in objectives:
-        result = walk_forward(
-            prices, risk_free_rate, name, max_weight, shrinkage,
-            refit_freq, cost_bps, target=targets.get(name), **walk_kwargs
-        )
+        try:
+            result = walk_forward(
+                prices, risk_free_rate, name, max_weight, shrinkage,
+                refit_freq, cost_bps, target=targets.get(name), **walk_kwargs
+            )
+        except Exception:  # noqa: BLE001 - one row must not cost the table
+            continue
         if result.returns.empty:
             continue
         table[name] = metrics.backtest_stats(result.returns, risk_free_rate)

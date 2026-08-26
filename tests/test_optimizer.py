@@ -827,3 +827,61 @@ class TestCompareWalkForward:
         )
         assert "Max Sharpe" in table
         assert optimizer.TARGET_RETURN not in table
+
+
+class TestHRPSurvivesNewerScipy:
+    """pypfopt 1.6.0 -- still the latest release -- validates its linkage
+    argument against scipy.cluster.hierarchy._LINKAGE_METHODS, a private
+    mapping newer scipy no longer defines. The name is used for nothing
+    else; every line after it is public API. Because app.py solves every
+    objective on every run, the AttributeError took the whole page down
+    rather than merely disabling HRP.
+    """
+
+    @staticmethod
+    def _weekly():
+        index = pd.date_range("2015-01-02", periods=300, freq="W-FRI")
+        rng = np.random.default_rng(12)
+        return pd.DataFrame({
+            "A": 100 * np.cumprod(1 + rng.normal(0.001, 0.02, len(index))),
+            "B": 100 * np.cumprod(1 + rng.normal(0.0005, 0.01, len(index))),
+            "C": 100 * np.cumprod(1 + rng.normal(0.0008, 0.03, len(index))),
+        }, index=index)
+
+    @pytest.fixture
+    def without_private_scipy_name(self, monkeypatch):
+        import scipy.cluster.hierarchy as sch
+        monkeypatch.delattr(sch, "_LINKAGE_METHODS", raising=False)
+        return sch
+
+    def test_hrp_still_allocates(self, without_private_scipy_name):
+        weights = optimizer.hrp_weights(self._weekly())
+        assert set(weights) == {"A", "B", "C"}
+        assert sum(weights.values()) == pytest.approx(1.0)
+
+    def test_the_objective_still_solves_through_the_normal_entry_point(
+        self, without_private_scipy_name
+    ):
+        weekly = self._weekly()
+        expected = optimizer.estimate_returns(weekly, optimizer.DEFAULT_RETURN_METHOD)
+        cov = optimizer.shrink_covariance(weekly.pct_change().cov() * 52, 0.2)
+        weights = optimizer.optimize_weights(
+            expected, cov, optimizer.HRP_OBJECTIVE, 0.02, weekly=weekly
+        )
+        assert sum(weights.values()) == pytest.approx(1.0)
+
+    def test_the_answer_is_the_same_either_way(self, monkeypatch):
+        weekly = self._weekly()
+        native = optimizer.hrp_weights(weekly)
+
+        import scipy.cluster.hierarchy as sch
+        monkeypatch.delattr(sch, "_LINKAGE_METHODS", raising=False)
+        shimmed = optimizer.hrp_weights(weekly)
+
+        assert native == pytest.approx(shimmed)
+
+    def test_the_shim_offers_the_methods_scipy_documents(self):
+        assert set(optimizer.LINKAGE_METHODS) == {
+            "single", "complete", "average", "weighted",
+            "centroid", "median", "ward",
+        }

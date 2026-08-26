@@ -761,6 +761,15 @@ if run_btn:
                 )
             except optimizer.SOLVER_ERRORS as exc:
                 objective_errors[name] = str(exc)
+            except Exception as exc:  # noqa: BLE001 - deliberately broad
+                # Seven objectives are solved on every run, so anything
+                # unforeseen out of one of them -- a dependency changing
+                # under us, say -- reached the reader as a traceback and
+                # took the whole page with it. Cost the objective, not
+                # the page; the message is shown, not swallowed.
+                objective_errors[name] = (
+                    f"เกิดข้อผิดพลาดที่ไม่คาดคิด ({type(exc).__name__}: {exc})"
+                )
 
         # The target constrains the risky sleeve, before any cash is held
         # alongside it, so keep the unblended figures to check it against.
