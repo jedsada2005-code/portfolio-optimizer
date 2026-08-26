@@ -11,6 +11,11 @@ import pandas as pd
 
 
 DAYS_PER_YEAR = 365.25
+
+# pandas returns ~8e-18 rather than 0.0 for the standard deviation of a
+# constant series, so `if vol > 0` let a Sharpe of 1.1e17 through as a
+# headline figure. Anything below this is no dispersion at all.
+NEGLIGIBLE = 1e-12
 FALLBACK_PERIODS_PER_YEAR = 252.0
 
 _MONTH_ABBR = {
@@ -65,7 +70,7 @@ def downside_deviation(returns, periods_per_year_value, target=0.0):
 
 
 def sortino_ratio(annual_return, downside_dev, risk_free_rate):
-    if downside_dev <= 0:
+    if downside_dev <= NEGLIGIBLE:
         return 0.0
     return (annual_return - risk_free_rate) / downside_dev
 
@@ -342,9 +347,9 @@ def backtest_stats(returns, risk_free_rate):
         "years": years,
         "annual_return": annual,
         "annual_volatility": vol,
-        "sharpe": (annual - risk_free_rate) / vol if vol > 0 else 0.0,
+        "sharpe": (annual - risk_free_rate) / vol if vol > NEGLIGIBLE else 0.0,
         "max_drawdown": drawdown,
-        "calmar": annual / abs(drawdown) if drawdown < 0 else 0.0,
+        "calmar": annual / abs(drawdown) if drawdown < -NEGLIGIBLE else 0.0,
         "sortino": sortino_ratio(annual, dd_dev, risk_free_rate),
         "periods_per_year": ppy,
     }
@@ -437,7 +442,12 @@ def effective_holdings(weights):
     not how concentrated it is: 40/30/20/10 and 25/25/25/25 both list
     four holdings, and are worth 3.3 and 4.0 of them respectively.
     """
-    values = [float(w) for w in weights.values() if float(w) > 0]
+    # Cash is not a diversifying holding: counting it made a portfolio
+    # look more spread out the more of it sat idle.
+    values = [
+        float(w) for asset, w in weights.items()
+        if asset != CASH_SYMBOL and float(w) > 0
+    ]
     total = sum(values)
     if not values or total <= 0:
         return 0.0

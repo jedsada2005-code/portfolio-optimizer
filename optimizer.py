@@ -72,8 +72,16 @@ NEEDS_TARGET = {TARGET_VOLATILITY, TARGET_RETURN}
 NEEDS_HISTORY = {HRP_OBJECTIVE, MIN_CVAR, MIN_SEMIVARIANCE}
 
 
-def estimate_returns(weekly_prices, method):
-    """Annualised expected returns from weekly prices."""
+def estimate_returns(weekly_prices, method, risk_free_rate=0.0):
+    """Annualised expected returns from weekly prices.
+
+    ``risk_free_rate`` reaches CAPM only, which is defined in terms of
+    it: R_i = R_f + beta_i (E[R_m] - R_f). It was omitted from the call,
+    so pypfopt used its 0.0 default however the sidebar was set, which
+    understated low-beta holdings and overstated high-beta ones. The
+    rate is annual, matching the annualised market return pypfopt
+    computes from ``frequency``.
+    """
     key = RETURN_METHODS.get(method)
     if key is None:
         raise ValueError(f"ไม่รู้จักวิธีประมาณผลตอบแทน: {method}")
@@ -87,17 +95,19 @@ def estimate_returns(weekly_prices, method):
         return pypfopt_returns.ema_historical_return(
             weekly_prices, frequency=WEEKS_PER_YEAR, span=2 * WEEKS_PER_YEAR
         )
-    return pypfopt_returns.capm_return(weekly_prices, frequency=WEEKS_PER_YEAR)
+    return pypfopt_returns.capm_return(
+        weekly_prices, frequency=WEEKS_PER_YEAR, risk_free_rate=risk_free_rate
+    )
 
 
-def estimate_returns_with_counts(weekly_prices, method):
+def estimate_returns_with_counts(weekly_prices, method, risk_free_rate=0.0):
     """Expected returns plus how many observations back each one.
 
     The count always comes from the trailing-year windows, whatever the
     estimator, because that is what the history floor is expressed in.
     """
     _, counts = metrics.annual_return_estimates(weekly_prices)
-    return estimate_returns(weekly_prices, method), counts
+    return estimate_returns(weekly_prices, method, risk_free_rate), counts
 
 
 # The seven methods scipy.cluster.hierarchy.linkage documents. pypfopt
@@ -517,7 +527,9 @@ def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage,
                 min_observations=None, target=None):
     """Expected returns and covariance from a price window, then solve."""
     weekly = prices.resample("W-FRI").last()
-    expected, observations = estimate_returns_with_counts(weekly, return_method)
+    expected, observations = estimate_returns_with_counts(
+        weekly, return_method, risk_free_rate
+    )
     floor = (
         metrics.MIN_ANNUAL_OBSERVATIONS if min_observations is None else min_observations
     )

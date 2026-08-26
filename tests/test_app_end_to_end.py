@@ -1283,3 +1283,88 @@ class TestMissingExchangeRatesAreDeclared:
         at = _calculate(app)
         assert not [w for w in at.warning if "อัตราแลกเปลี่ยนยังไม่มีข้อมูล" in (w.value or "")]
         assert at.session_state["calculated"] is True
+
+
+class TestCAPMFollowsTheRiskFreeRate:
+    """The sidebar's rate reached the Sharpe calculation and the cash
+    sleeve, but never the estimator that is defined in terms of it."""
+
+    def _capm_weights(self, at, rate):
+        _widget(at.number_input, "Risk-Free Rate").set_value(rate)
+        _widget(at.selectbox, "วิธีประมาณผลตอบแทน").set_value(
+            "CAPM (อิงความเสี่ยงเทียบตลาด)"
+        )
+        at = _calculate(at)
+        return dict(at.session_state["ar"]), at
+
+    def test_the_rate_moves_the_expected_returns(self, app):
+        low, at = self._capm_weights(app, 0.0)
+        high, _ = self._capm_weights(at, 0.06)
+        assert set(low) == set(high)
+        assert any(abs(low[a] - high[a]) > 1e-4 for a in low), (low, high)
+
+    def test_the_other_estimators_stay_put(self, app):
+        _widget(app.number_input, "Risk-Free Rate").set_value(0.0)
+        at = _calculate(app)
+        first = dict(at.session_state["ar"])
+
+        _widget(at.number_input, "Risk-Free Rate").set_value(0.06)
+        at = _calculate(at)
+        second = dict(at.session_state["ar"])
+        assert all(abs(first[a] - second[a]) < 1e-9 for a in first)
+
+
+def test_the_concentration_metric_measures_the_risky_sleeve(app):
+    _widget(app.slider, "เงินสด").set_value(40)
+    at = _calculate(app)
+    weights = at.session_state["objective_weights"]["Max Sharpe"]
+    shown = {m.label: m.value for m in at.metric}
+    assert shown["กระจายตัวเทียบเท่า"] == f"{metrics.effective_holdings(weights):.1f} ตัว"
+    blended = metrics.blend_with_cash(weights, 0.40)
+    assert metrics.effective_holdings(blended) == pytest.approx(
+        metrics.effective_holdings(weights)
+    )
+
+
+class TestSidebarEditsSurviveARerun:
+    """Every sidebar control except the symbol box took its default from
+    st.query_params and carried no key. An unkeyed widget is identified
+    partly by its `value=` argument, so once Calculate wrote the settings
+    into the URL the widget was re-created on the next rerun and the
+    reader's un-Calculated edit was silently discarded."""
+
+    def _rerun_without_calculating(self, at):
+        _widget(at.selectbox, "น้ำหนักที่ใช้ backtest").set_value("Min Volatility").run()
+        return at
+
+    def test_a_typed_rate_is_not_reverted(self, app):
+        _widget(app.number_input, "Risk-Free Rate").set_value(0.05)
+        at = _calculate(app)
+
+        _widget(at.number_input, "Risk-Free Rate").set_value(0.07)
+        at = self._rerun_without_calculating(at)
+        assert _widget(at.number_input, "Risk-Free Rate").value == 0.07
+
+    def test_a_moved_slider_is_not_reverted(self, app):
+        _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(60)
+        at = _calculate(app)
+
+        _widget(at.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(35)
+        at = self._rerun_without_calculating(at)
+        assert _widget(at.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").value == 35
+
+    def test_a_changed_benchmark_is_not_reverted(self, app):
+        _widget(app.text_input, "Benchmark").set_value("^GSPC")
+        at = _calculate(app)
+
+        _widget(at.text_input, "Benchmark").set_value("QQQ")
+        at = self._rerun_without_calculating(at)
+        assert _widget(at.text_input, "Benchmark").value == "QQQ"
+
+    def test_the_stale_warning_appears_for_the_edit_that_survived(self, app):
+        _widget(app.number_input, "Risk-Free Rate").set_value(0.05)
+        at = _calculate(app)
+
+        _widget(at.number_input, "Risk-Free Rate").set_value(0.07)
+        at = self._rerun_without_calculating(at)
+        assert any("ถูกแก้ไขหลังจากคำนวณ" in (w.value or "") for w in at.warning)

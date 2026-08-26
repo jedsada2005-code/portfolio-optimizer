@@ -937,3 +937,57 @@ class TestAnchoredGrowth:
         returns = pd.Series(0.01, index=index)
         curve = metrics.anchored_growth(returns, pd.Series(dtype=float))
         assert curve.iloc[0] == pytest.approx(1.01)
+
+
+class TestRatiosSurviveANearZeroDenominator:
+    """`if vol > 0` passes on 8e-18, which is what pandas returns for the
+    standard deviation of a constant series. The result was a Sharpe of
+    1.1e17 rendered as a headline figure."""
+
+    def test_a_constant_return_series_reports_no_sharpe(self):
+        index = pd.bdate_range("2024-01-01", periods=400)
+        stats = metrics.backtest_stats(pd.Series(0.002, index=index), 0.02)
+        assert stats["annual_volatility"] < 1e-12
+        assert stats["sharpe"] == 0.0
+
+    def test_a_vanishing_drawdown_reports_no_calmar(self):
+        index = pd.bdate_range("2024-01-01", periods=400)
+        stats = metrics.backtest_stats(pd.Series(0.002, index=index), 0.02)
+        assert stats["calmar"] == 0.0
+
+    def test_a_constant_series_reports_no_sortino(self):
+        index = pd.bdate_range("2024-01-01", periods=400)
+        assert metrics.backtest_stats(pd.Series(0.002, index=index), 0.02)["sortino"] == 0.0
+
+    def test_a_real_portfolio_still_gets_its_ratios(self):
+        index = pd.bdate_range("2015-01-01", periods=2000)
+        rng = np.random.default_rng(31)
+        stats = metrics.backtest_stats(
+            pd.Series(rng.normal(0.0005, 0.010, len(index)), index=index), 0.02
+        )
+        assert 0.0 < abs(stats["sharpe"]) < 10.0
+        assert 0.0 < abs(stats["calmar"]) < 100.0
+        assert stats["sortino"] != 0.0
+
+
+class TestEffectiveHoldingsIgnoresCash:
+    """The metric measures how concentrated the risky sleeve is. Cash is
+    not a diversifying holding, and counting it made a portfolio look
+    more spread out the more of it sat idle."""
+
+    def test_cash_does_not_count_as_a_holding(self):
+        risky = {"A": 0.5, "B": 0.3, "C": 0.2}
+        bare = metrics.effective_holdings(risky)
+        blended = metrics.effective_holdings(metrics.blend_with_cash(risky, 0.4))
+        assert blended == pytest.approx(bare)
+
+    def test_more_cash_does_not_raise_the_count(self):
+        risky = {"A": 0.6, "B": 0.4}
+        counts = [
+            metrics.effective_holdings(metrics.blend_with_cash(risky, c))
+            for c in (0.0, 0.3, 0.6)
+        ]
+        assert counts[0] == pytest.approx(counts[1]) == pytest.approx(counts[2])
+
+    def test_a_cash_only_portfolio_holds_nothing_risky(self):
+        assert metrics.effective_holdings({metrics.CASH_SYMBOL: 1.0}) == 0.0
