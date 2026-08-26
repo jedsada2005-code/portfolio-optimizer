@@ -56,7 +56,12 @@ def convert_prices(prices, currencies, base, rates):
     if prices.empty:
         return prices
 
-    aligned = rates.reindex(rates.index.union(prices.index)).ffill().bfill()
+    # ffill only. Back-filling priced the earliest part of the window at
+    # a rate that did not exist yet, so the currency move over that
+    # stretch came out as exactly zero -- silently, and for 40% of the
+    # window in the case that prompted this. A date with no rate has no
+    # price in the base currency, and says so by staying NaN.
+    aligned = rates.reindex(rates.index.union(prices.index)).ffill()
     aligned = aligned.reindex(prices.index)
 
     def rate_for(currency):
@@ -75,6 +80,27 @@ def convert_prices(prices, currencies, base, rates):
         else:
             out[column] = prices[column] / rate_for(native) * base_rate
     return pd.DataFrame(out, index=prices.index)[list(prices.columns)]
+
+
+def late_rates(prices, currencies, base, rates):
+    """Currencies whose rate history begins after the prices do.
+
+    Those dates cannot be converted at all, so the backtest has to start
+    later -- worth saying out loud rather than letting it look like the
+    holdings themselves were unavailable.
+    """
+    if prices.empty or rates is None or rates.empty:
+        return {}
+    late = {}
+    for currency in required_currencies(currencies, base):
+        if currency not in rates.columns:
+            continue
+        series = rates[currency].dropna()
+        if series.empty:
+            continue
+        if series.index[0] > prices.index[0]:
+            late[currency] = series.index[0]
+    return late
 
 
 def resolve_currencies(symbols, lookup=None, defaults=None):

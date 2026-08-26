@@ -142,3 +142,54 @@ class TestResolveCurrencies:
             {"IBTA.L": "USD", "VOD.L": "GBP", "SPY": "USD"}
         )
         assert corrected == {"IBTA.L": ("GBP", "USD")}
+
+
+class TestRatesAreNotInvented:
+    """convert_prices back-filled the rate series, so the earliest part
+    of a window was priced at a rate that did not exist yet and the
+    currency move over that stretch came out as exactly zero -- 40% of
+    the window in the case that prompted this, with no warning."""
+
+    @staticmethod
+    def _setup():
+        index = pd.bdate_range("2020-01-01", "2024-12-31")
+        rate = pd.Series(np.nan, index=index, dtype=float)
+        live = index[index >= "2022-01-01"]
+        rate.loc[live] = np.linspace(30.0, 36.0, len(live))
+        prices = pd.DataFrame({"THAI": pd.Series(100.0, index=index)})
+        return prices, pd.DataFrame({"THB": rate})
+
+    def test_dates_before_the_first_rate_are_left_unpriced(self):
+        prices, rates = self._setup()
+        out = fx.convert_prices(prices, {"THAI": "THB"}, "USD", rates)
+        assert out.loc[:"2021-12-31", "THAI"].isna().all()
+
+    def test_dates_the_rate_covers_are_still_converted(self):
+        prices, rates = self._setup()
+        out = fx.convert_prices(prices, {"THAI": "THB"}, "USD", rates)
+        assert out.loc["2022-01-03":, "THAI"].notna().all()
+        assert out["THAI"].dropna().iloc[0] == pytest.approx(100.0 / 30.0)
+
+    def test_an_interior_gap_is_still_carried_forward(self):
+        idx = pd.bdate_range("2020-01-01", periods=4)
+        rates = pd.DataFrame({"THB": [35.0, np.nan, np.nan, 35.0]}, index=idx)
+        prices = pd.DataFrame({"MF:X": [35.0] * 4}, index=idx)
+        out = fx.convert_prices(prices, {"MF:X": "THB"}, "USD", rates)
+        assert out["MF:X"].notna().all()
+
+    def test_a_late_starting_rate_is_reported(self):
+        prices, rates = self._setup()
+        late = fx.late_rates(prices, {"THAI": "THB"}, "USD", rates)
+        assert set(late) == {"THB"}
+        assert late["THB"] == pd.Timestamp("2022-01-03")
+
+    def test_full_coverage_reports_nothing(self):
+        idx = pd.bdate_range("2020-01-01", periods=10)
+        rates = pd.DataFrame({"THB": 35.0}, index=idx)
+        prices = pd.DataFrame({"MF:X": [35.0] * 10}, index=idx)
+        assert fx.late_rates(prices, {"MF:X": "THB"}, "USD", rates) == {}
+
+    def test_a_currency_needed_only_as_the_base_is_checked_too(self):
+        prices, rates = self._setup()
+        late = fx.late_rates(prices, {"US": "USD"}, "THB", rates)
+        assert set(late) == {"THB"}

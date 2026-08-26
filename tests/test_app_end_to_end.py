@@ -1239,3 +1239,47 @@ class TestComparisonWindowIsDeclared:
         years = at.session_state["comparison_years"]
         assert f"{years:.1f}" in said, said
         assert len(table) >= 3
+
+
+class TestTheChartAgreesWithTheTable:
+    """The growth chart drew two curves based at 1.0 on different dates,
+    so a benchmark that listed later restarted from scratch and the
+    picture contradicted the statistics beside it."""
+
+    def test_the_benchmark_line_starts_where_the_portfolio_stood(self, app):
+        _widget(app.text_input, "Benchmark").set_value("ARKK")
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2010-01-01"))
+        app.radio[0].set_value("In-sample (ทั้งช่วง)")
+        at = _calculate(app)
+
+        port = at.session_state["nav_view"]["returns"]
+        aligned = metrics.align_benchmark(port, at.session_state["benchmark"])
+        port_curve = (1.0 + port).cumprod()
+        curve = metrics.anchored_growth(aligned.benchmark, port_curve)
+
+        assert aligned.start > port.index[0], "need a benchmark that lists later"
+        assert curve.iloc[0] == pytest.approx(port_curve.loc[aligned.start])
+        assert curve.iloc[0] > 1.5, "portfolio had already grown by then"
+
+    def test_the_reader_is_told_the_benchmark_line_was_anchored(self, app):
+        _widget(app.text_input, "Benchmark").set_value("ARKK")
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2010-01-01"))
+        app.radio[0].set_value("In-sample (ทั้งช่วง)")
+        at = _calculate(app)
+        assert any(
+            "เริ่มเส้น" in (c.value or "") and "ARKK" in (c.value or "")
+            for c in at.caption
+        ), [c.value for c in at.caption]
+
+    def test_a_benchmark_covering_the_window_says_nothing_extra(self, app):
+        _widget(app.text_input, "Benchmark").set_value("^GSPC")
+        at = _calculate(app)
+        assert not [c for c in at.caption if "เริ่มเส้น" in (c.value or "")]
+
+
+class TestMissingExchangeRatesAreDeclared:
+    def test_a_run_with_full_rate_coverage_says_nothing(self, app):
+        _widget(app.selectbox, "สกุลเงินฐาน").set_value("THB")
+        at = _calculate(app)
+        assert not [w for w in at.warning if "อัตราแลกเปลี่ยนยังไม่มีข้อมูล" in (w.value or "")]
+        assert at.session_state["calculated"] is True
