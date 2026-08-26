@@ -991,3 +991,80 @@ class TestObjectivesAreComparedSideBySide:
             "In-sample" in (c.value or "") and "เปรียบเทียบ" in (c.value or "")
             for c in at.caption
         ), [c.value for c in at.caption]
+
+
+class TestEstimatesAreShownAgainstOutcomes:
+    """Swapping the return estimator moves the frontier's expected return
+    by tens of points -- EMA put gold at 30.8% a year over a window it
+    delivered 6.7% in -- but the estimate and the outcome lived on
+    different tabs with nothing tying them together."""
+
+    def _table(self, at):
+        for frame in at.dataframe:
+            table = frame.value
+            if "เกิดขึ้นจริง" in list(getattr(table, "columns", [])):
+                return table.set_index("สินทรัพย์")
+        raise LookupError("no estimate-versus-outcome table rendered")
+
+    def test_each_holding_shows_its_estimate_beside_its_outcome(self, app):
+        at = _calculate(app)
+        table = self._table(at)
+        truth = metrics.realised_returns(at.session_state["train_close"])
+        for asset in at.session_state["ar"].index:
+            assert table.loc[asset, "เกิดขึ้นจริง"] == f"{truth[asset]:.2%}"
+
+    def test_an_estimator_far_from_the_outcome_is_flagged(self, app):
+        _widget(app.selectbox, "วิธีประมาณผลตอบแทน").set_value(
+            "ถ่วงน้ำหนักข้อมูลล่าสุด (EMA)"
+        )
+        _widget(app.date_input, "Start Date").set_value(pd.Timestamp("2010-01-01"))
+        at = _calculate(app)
+        assert any(
+            "ห่างจากที่เกิดขึ้นจริง" in (w.value or "") for w in at.warning
+        ), [w.value for w in at.warning]
+
+
+class TestConcentrationIsMeasured:
+    """A weights table shows what is held, not how much of the portfolio
+    one position really is."""
+
+    def test_the_effective_holding_count_is_reported(self, app):
+        at = _calculate(app)
+        weights = at.session_state["objective_weights"]["Max Sharpe"]
+        expected = metrics.effective_holdings(weights)
+        shown = {m.label: m.value for m in at.metric}
+        assert "กระจายตัวเทียบเท่า" in shown
+        assert shown["กระจายตัวเทียบเท่า"] == f"{expected:.1f} ตัว"
+
+    def test_a_minimum_weight_raises_the_effective_count(self, app):
+        bare = metrics.effective_holdings(
+            _calculate(app).session_state["objective_weights"]["Max Sharpe"]
+        )
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(15)
+        spread = metrics.effective_holdings(
+            _calculate(app).session_state["objective_weights"]["Max Sharpe"]
+        )
+        assert spread > bare
+
+
+class TestRebalancingReportsAreExact:
+    def test_turnover_says_it_counts_both_sides_of_each_trade(self, app):
+        at = _calculate(app)
+        turnover = [m for m in at.metric if "Turnover" in m.label]
+        assert turnover, "no turnover metric"
+        # "ซื้อขาย" alone would pass on the old wording; the point is that
+        # the figure is the two-way sum, twice the conventional one-way one.
+        assert "สองทาง" in turnover[0].help, turnover[0].help
+        assert "ครึ่ง" in turnover[0].help, turnover[0].help
+
+    def test_walk_forward_drift_starts_from_the_weights_it_held(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        _widget(app.selectbox, "Rebalance").set_value("ซื้อแล้วถือ (ไม่ปรับ)")
+        at = _calculate(app)
+
+        held = at.session_state["walk_weight_history"][-1][1]
+        drift = [c.value for c in at.caption if "สัดส่วนเมื่อจบช่วง" in (c.value or "")]
+        assert drift, "no drift caption"
+        for symbol, weight in held.items():
+            if weight > 0:
+                assert f"{symbol} {weight:.0%}→" in drift[0], (symbol, drift[0])

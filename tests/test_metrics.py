@@ -274,32 +274,32 @@ class TestBetaAlpha:
     def test_tracking_the_benchmark_exactly_gives_beta_one_alpha_zero(self):
         rng = np.random.default_rng(4)
         b = pd.Series(rng.normal(0.0004, 0.01, 1000), index=pd.bdate_range("2020-01-01", periods=1000))
-        beta, alpha = metrics.beta_alpha(b, b, 0.02, 252)
+        beta, alpha = metrics.beta_alpha(b, b, 0.02)
         assert beta == pytest.approx(1.0)
         assert alpha == pytest.approx(0.0, abs=1e-9)
 
     def test_double_exposure_gives_beta_two(self):
         rng = np.random.default_rng(4)
         b = pd.Series(rng.normal(0.0004, 0.01, 1000), index=pd.bdate_range("2020-01-01", periods=1000))
-        beta, _ = metrics.beta_alpha(2 * b, b, 0.02, 252)
+        beta, _ = metrics.beta_alpha(2 * b, b, 0.02)
         assert beta == pytest.approx(2.0)
 
     def test_constant_outperformance_shows_positive_alpha(self):
         rng = np.random.default_rng(4)
         b = pd.Series(rng.normal(0.0004, 0.01, 1000), index=pd.bdate_range("2020-01-01", periods=1000))
-        _, alpha = metrics.beta_alpha(b + 0.0002, b, 0.02, 252)
+        _, alpha = metrics.beta_alpha(b + 0.0002, b, 0.02)
         assert alpha > 0
 
     def test_a_flat_benchmark_gives_no_beta(self):
         idx = pd.bdate_range("2020-01-01", periods=50)
-        beta, alpha = metrics.beta_alpha(pd.Series(0.001, index=idx), pd.Series(0.0, index=idx), 0.02, 252)
+        beta, alpha = metrics.beta_alpha(pd.Series(0.001, index=idx), pd.Series(0.0, index=idx), 0.02)
         assert beta == 0.0
 
     def test_only_overlapping_dates_are_compared(self):
         rng = np.random.default_rng(4)
         idx = pd.bdate_range("2020-01-01", periods=300)
         b = pd.Series(rng.normal(0.0004, 0.01, 300), index=idx)
-        beta, _ = metrics.beta_alpha(b.iloc[100:], b, 0.02, 252)
+        beta, _ = metrics.beta_alpha(b.iloc[100:], b, 0.02)
         assert beta == pytest.approx(1.0)
 
 
@@ -541,3 +541,72 @@ class TestAlignBenchmark:
         )
         assert aligned.benchmark.empty
         assert aligned.portfolio.empty
+
+
+class TestRealisedReturns:
+    """The frontier's expected returns and the backtest's realised ones
+    are two different numbers on two different tabs, and nothing on
+    screen let a reader see how far apart an estimator had put them."""
+
+    def test_a_steady_riser_reports_its_own_growth_rate(self):
+        index = pd.bdate_range("2015-01-01", "2024-12-31")
+        prices = pd.DataFrame(
+            {"UP": 100.0 * 1.10 ** (np.arange(len(index)) / 261.0)}, index=index
+        )
+        realised = metrics.realised_returns(prices)
+        assert realised["UP"] == pytest.approx(0.10, abs=2e-3)
+
+    def test_a_faller_reports_a_negative_rate(self):
+        index = pd.bdate_range("2015-01-01", "2024-12-31")
+        prices = pd.DataFrame(
+            {"DOWN": 100.0 * 0.95 ** (np.arange(len(index)) / 261.0)}, index=index
+        )
+        assert metrics.realised_returns(prices)["DOWN"] < 0
+
+    def test_each_column_is_measured_over_its_own_history(self):
+        index = pd.bdate_range("2015-01-01", "2024-12-31")
+        late = 100.0 * 1.20 ** (np.arange(len(index)) / 261.0)
+        prices = pd.DataFrame({
+            "OLD": 100.0 * 1.10 ** (np.arange(len(index)) / 261.0),
+            "NEW": late,
+        }, index=index)
+        prices.loc[:"2022-01-01", "NEW"] = np.nan
+
+        realised = metrics.realised_returns(prices)
+        assert realised["OLD"] == pytest.approx(0.10, abs=2e-3)
+        assert realised["NEW"] == pytest.approx(0.20, abs=2e-3)
+
+    def test_a_column_with_no_prices_is_left_out(self):
+        index = pd.bdate_range("2015-01-01", "2015-12-31")
+        prices = pd.DataFrame({
+            "REAL": 100.0 * 1.10 ** (np.arange(len(index)) / 261.0),
+            "EMPTY": np.nan,
+        }, index=index)
+        assert "EMPTY" not in metrics.realised_returns(prices).index
+
+
+class TestEffectiveHoldings:
+    """A weights table shows what is held; it does not show how much of
+    the portfolio one position really is."""
+
+    def test_equal_weights_are_worth_their_own_count(self):
+        assert metrics.effective_holdings(
+            {"A": 0.25, "B": 0.25, "C": 0.25, "D": 0.25}
+        ) == pytest.approx(4.0)
+
+    def test_one_dominant_holding_counts_for_little_more_than_one(self):
+        assert metrics.effective_holdings(
+            {"A": 0.9, "B": 0.05, "C": 0.05}
+        ) == pytest.approx(1.0 / (0.81 + 0.0025 + 0.0025))
+
+    def test_zero_weights_do_not_count(self):
+        assert metrics.effective_holdings(
+            {"A": 0.5, "B": 0.5, "C": 0.0}
+        ) == pytest.approx(2.0)
+
+    def test_unnormalised_weights_are_normalised_first(self):
+        assert metrics.effective_holdings({"A": 50.0, "B": 50.0}) == pytest.approx(2.0)
+
+    def test_an_empty_portfolio_is_worth_nothing(self):
+        assert metrics.effective_holdings({}) == 0.0
+        assert metrics.effective_holdings({"A": 0.0}) == 0.0
