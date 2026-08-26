@@ -1368,3 +1368,106 @@ class TestSidebarEditsSurviveARerun:
         _widget(at.number_input, "Risk-Free Rate").set_value(0.07)
         at = self._rerun_without_calculating(at)
         assert any("ถูกแก้ไขหลังจากคำนวณ" in (w.value or "") for w in at.warning)
+
+
+class TestPerAssetBoundsInTheApp:
+    """A single floor forced money into holdings the optimiser had good
+    reason to decline: with six ETFs at a 5% floor, two of them sat at
+    exactly 5% for no reason but the rule.
+
+    The per-asset boxes only exist once a run has been made with those
+    symbols, so each case calculates first and then overrides.
+    """
+
+    def test_an_asset_can_be_exempted_from_the_floor(self, app):
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(15)
+        at = _calculate(app)
+        forced = at.session_state["objective_weights"]["Max Sharpe"]
+        assert all(w >= 0.15 - 1e-6 for w in forced.values()), forced
+
+        pinned = min(forced, key=forced.get)
+        assert forced[pinned] == pytest.approx(0.15, abs=1e-4), forced
+        _widget(at.number_input, f"ขั้นต่ำของ {pinned}").set_value(0)
+        at = _calculate(at)
+
+        exempt = at.session_state["objective_weights"]["Max Sharpe"]
+        assert exempt[pinned] < forced[pinned] - 1e-4, (forced, exempt)
+
+    def test_an_asset_can_be_capped_on_its_own(self, app):
+        at = _calculate(app)
+        weights = at.session_state["objective_weights"]["Max Sharpe"]
+        biggest = max(weights, key=weights.get)
+        assert weights[biggest] > 0.25
+
+        _widget(at.number_input, f"สูงสุดของ {biggest}").set_value(20)
+        at = _calculate(at)
+        assert at.session_state["objective_weights"]["Max Sharpe"][biggest] <= 0.20 + 1e-6
+
+    def test_the_defaults_leave_the_shared_bounds_alone(self, app):
+        _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").set_value(40)
+        at = _calculate(app)
+        for name, weights in at.session_state["objective_weights"].items():
+            if name == optimizer.HRP_OBJECTIVE:
+                continue
+            assert max(weights.values()) <= 0.40 + 1e-6, name
+
+    def test_moving_the_shared_slider_resets_the_per_asset_boxes(self, app):
+        at = _calculate(app)
+        first = _widget(at.number_input, "ขั้นต่ำของ SPY")
+        assert first.value == 0
+
+        _widget(at.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(10)
+        at = _calculate(at)
+        assert _widget(at.number_input, "ขั้นต่ำของ SPY").value == 10
+
+    def test_an_impossible_set_is_refused_rather_than_solved(self, app):
+        at = _calculate(app)
+        for symbol in ("SPY", "QQQ", "GLD", "TLT"):
+            _widget(at.number_input, f"ขั้นต่ำของ {symbol}").set_value(40)
+        _widget(at.button, "Calculate").click().run()
+
+        assert not at.exception, at.exception
+        assert at.error
+
+    def test_walk_forward_carries_the_exemption(self, app):
+        app.radio[0].set_value("Walk-Forward")
+        _widget(app.slider, "น้ำหนักขั้นต่ำต่อสินทรัพย์").set_value(15)
+        at = _calculate(app)
+        # clean_weights rounds to five places and the result is then
+        # renormalised, so a bound can land a rounding step under it.
+        assert all(
+            w.get(a, 0.0) >= 0.15 - 1e-3
+            for _, w in at.session_state["walk_weight_history"] for a in w
+            if a != metrics.CASH_SYMBOL
+        )
+
+        _widget(at.number_input, "ขั้นต่ำของ TLT").set_value(0)
+        at = _calculate(at)
+        history = at.session_state["walk_weight_history"]
+        assert history
+        assert any(w.get("TLT", 0.0) < 0.15 - 1e-6 for _, w in history)
+
+
+class TestRiskContributionIsShown:
+    def test_each_holding_shows_its_share_of_the_risk(self, app):
+        at = _calculate(app)
+        weights = at.session_state["objective_weights"]["Max Sharpe"]
+        truth = optimizer.risk_contributions(weights, at.session_state["covr"])
+        for frame in at.dataframe:
+            table = frame.value
+            if "ส่วนแบ่งความเสี่ยง" in list(getattr(table, "columns", [])):
+                row = table.set_index("สินทรัพย์")
+                held = max(weights, key=weights.get)
+                assert row.loc[held, "ส่วนแบ่งความเสี่ยง"] == f"{truth[held]:.1%}"
+                return
+        raise AssertionError("no risk table rendered")
+
+    def test_the_effective_count_by_risk_is_reported(self, app):
+        at = _calculate(app)
+        weights = at.session_state["objective_weights"]["Max Sharpe"]
+        shares = optimizer.risk_contributions(weights, at.session_state["covr"])
+        shown = {m.label: m.value for m in at.metric}
+        assert "กระจายตัวตามความเสี่ยง" in shown
+        assert shown["กระจายตัวตามความเสี่ยง"] == (
+            f"{metrics.effective_holdings(dict(shares)):.1f} ตัว"
+        )

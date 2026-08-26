@@ -205,73 +205,108 @@ def shrink_covariance(cov, intensity=DEFAULT_SHRINKAGE):
     return nearest_psd(pd.DataFrame(blended, index=cov.index, columns=cov.columns))
 
 
-def validate_bounds(n_assets, max_weight, min_weight=0.0):
+def bound_pairs(assets, min_weight, max_weight, floors=None, caps=None):
+    """Per-asset ``(lower, upper)`` pairs, defaulting to the shared pair.
+
+    pypfopt takes either one pair for everything or one per asset, and
+    only the shared pair was ever passed. A floor meant to keep a core
+    holding funded therefore also forced money into holdings the
+    optimiser had good reason to decline -- two of them at exactly the
+    floor in a real run, purely because the rule could not tell them
+    apart.
+    """
+    floors = floors or {}
+    caps = caps or {}
+    return [
+        (float(floors.get(a, min_weight)), float(caps.get(a, max_weight)))
+        for a in assets
+    ]
+
+
+def validate_bounds(pairs, assets=None):
     """Reject weight bounds no allocation can satisfy.
 
     The solver's own message for an infeasible problem is "Please check
     your objectives/constraints", which does not say which bound is
     wrong or what would work.
     """
-    if min_weight > max_weight:
+    names = list(assets) if assets is not None else list(range(len(pairs)))
+    n = len(pairs)
+    for name, (low, high) in zip(names, pairs):
+        if low > high:
+            raise ValueError(
+                f"น้ำหนักขั้นต่ำของ {name} ({low:.0%}) มากกว่าน้ำหนักสูงสุด ({high:.0%})"
+            )
+    floor_total = sum(low for low, _ in pairs)
+    cap_total = sum(high for _, high in pairs)
+    if floor_total > 1.0 + 1e-9:
         raise ValueError(
-            f"น้ำหนักขั้นต่ำ {min_weight:.0%} มากกว่าน้ำหนักสูงสุด {max_weight:.0%}"
+            f"น้ำหนักขั้นต่ำรวมกัน {floor_total:.0%} เกิน 100% "
+            f"— ลดขั้นต่ำลง หรือยกเว้นบางตัว (เฉลี่ยตั้งได้ไม่เกิน {1 / n:.1%} ต่อตัว)"
         )
-    if min_weight * n_assets > 1.0 + 1e-9:
+    if cap_total < 1.0 - 1e-9:
         raise ValueError(
-            f"น้ำหนักขั้นต่ำ {min_weight:.0%} × {n_assets} ตัว = "
-            f"{min_weight * n_assets:.0%} เกิน 100% — ตั้งได้สูงสุด {1 / n_assets:.1%}"
-        )
-    if max_weight * n_assets < 1.0 - 1e-9:
-        raise ValueError(
-            f"น้ำหนักสูงสุดต่อสินทรัพย์ {max_weight:.0%} × {n_assets} ตัว ไม่ถึง 100% "
-            f"— ต้องตั้งอย่างน้อย {1 / n_assets:.1%} หรือเพิ่มจำนวนสินทรัพย์"
+            f"น้ำหนักสูงสุดรวมกันได้แค่ {cap_total:.0%} ไม่ถึง 100% "
+            f"— เพิ่มเพดาน หรือเพิ่มจำนวนสินทรัพย์ (เฉลี่ยต้องอย่างน้อย {1 / n:.1%} ต่อตัว)"
         )
 
 
-def max_achievable_return(expected_returns, max_weight, min_weight=0.0):
+def max_achievable_return(expected_returns, max_weight, min_weight=0.0,
+                          floors=None, caps=None):
     """Highest expected return reachable under the weight bounds.
 
-    Every asset is funded to the floor first; only what remains can be
-    steered towards the best performers, and no asset may take more
-    than ``max_weight - min_weight`` of it.
+    Every asset is funded to its own floor first; only what remains can
+    be steered towards the best performers, and no asset may take more
+    than its own remaining headroom.
     """
-    n = len(expected_returns)
-    validate_bounds(n, max_weight, min_weight)
-    remaining = 1.0 - min_weight * n
-    total = min_weight * float(expected_returns.sum())
-    headroom = max_weight - min_weight
-    for value in expected_returns.sort_values(ascending=False):
-        take = min(headroom, remaining)
-        total += take * value
+    assets = list(expected_returns.index)
+    pairs = bound_pairs(assets, min_weight, max_weight, floors, caps)
+    validate_bounds(pairs, assets)
+
+    low = dict(zip(assets, (p[0] for p in pairs)))
+    high = dict(zip(assets, (p[1] for p in pairs)))
+    remaining = 1.0 - sum(low.values())
+    total = sum(low[a] * float(expected_returns[a]) for a in assets)
+    for asset in expected_returns.sort_values(ascending=False).index:
+        take = min(high[asset] - low[asset], remaining)
+        total += take * float(expected_returns[asset])
         remaining -= take
         if remaining <= 1e-12:
             break
     return float(total)
 
 
-def _frontier(expected_returns, cov, max_weight, min_weight=0.0):
+def _frontier(expected_returns, cov, max_weight, min_weight=0.0,
+              floors=None, caps=None):
     return EfficientFrontier(
-        expected_returns, cov, weight_bounds=(min_weight, max_weight)
+        expected_returns, cov,
+        weight_bounds=bound_pairs(
+            list(expected_returns.index), min_weight, max_weight, floors, caps
+        ),
     )
 
 
-def achievable_range(expected_returns, cov, max_weight=1.0, min_weight=0.0):
+def achievable_range(expected_returns, cov, max_weight=1.0, min_weight=0.0,
+                     floors=None, caps=None):
     """(lowest volatility, its return, highest return) under the bounds.
 
     Used to tell someone asking for an impossible target what they could
     have asked for instead.
     """
-    ef = _frontier(expected_returns, cov, max_weight, min_weight)
+    ef = _frontier(expected_returns, cov, max_weight, min_weight, floors, caps)
     ef.min_volatility()
     min_return, min_volatility, _ = ef.portfolio_performance()
     return min_volatility, min_return, max_achievable_return(
-        expected_returns, max_weight, min_weight
+        expected_returns, max_weight, min_weight, floors, caps
     )
 
 
-def _downside_optimizer(objective, expected_returns, weekly, max_weight, min_weight):
+def _downside_optimizer(objective, expected_returns, weekly, max_weight, min_weight,
+                        floors=None, caps=None):
     returns = weekly.pct_change().dropna(how="all")
-    bounds = (min_weight, max_weight)
+    bounds = bound_pairs(
+        list(expected_returns.index), min_weight, max_weight, floors, caps
+    )
     # These build one variable per observation, which the default OSQP
     # backend abandons at its iteration limit once weight bounds tighten.
     # CLARABEL solves the same problems in hundredths of a second.
@@ -292,23 +327,27 @@ def _downside_optimizer(objective, expected_returns, weekly, max_weight, min_wei
 
 
 def optimize_weights(expected_returns, cov, objective, risk_free_rate,
-                     max_weight=1.0, min_weight=0.0, weekly=None, target=None):
+                     max_weight=1.0, min_weight=0.0, weekly=None, target=None,
+                     floors=None, caps=None):
     """Solve for one objective, raising ValueError with a readable message."""
     if objective in NEEDS_HISTORY and weekly is None:
         raise ValueError(f"{objective} ต้องใช้ประวัติผลตอบแทน ไม่ใช่แค่ค่าคาดหวัง")
     if objective == HRP_OBJECTIVE:
         return hrp_weights(weekly)
 
-    validate_bounds(len(expected_returns), max_weight, min_weight)
+    validate_bounds(
+        bound_pairs(list(expected_returns.index), min_weight, max_weight, floors, caps),
+        list(expected_returns.index),
+    )
     if objective in (MIN_CVAR, MIN_SEMIVARIANCE):
         return _downside_optimizer(
-            objective, expected_returns, weekly, max_weight, min_weight
+            objective, expected_returns, weekly, max_weight, min_weight, floors, caps
         )
 
     if objective in NEEDS_TARGET and target is None:
         raise ValueError(f"{objective} ต้องระบุค่าเป้าหมาย")
 
-    ef = _frontier(expected_returns, cov, max_weight, min_weight)
+    ef = _frontier(expected_returns, cov, max_weight, min_weight, floors, caps)
     try:
         if objective == "Min Volatility":
             ef.min_volatility()
@@ -321,7 +360,7 @@ def optimize_weights(expected_returns, cov, objective, risk_free_rate,
     except SOLVER_ERRORS as exc:
         if objective in NEEDS_TARGET:
             low_vol, low_ret, high_ret = achievable_range(
-                expected_returns, cov, max_weight, min_weight
+                expected_returns, cov, max_weight, min_weight, floors, caps
             )
             # pypfopt's OptimizationError prepends its own generic
             # sentence, which would bury the useful half in a tuple.
@@ -377,19 +416,51 @@ def portfolio_performance(expected_returns, cov, weights, risk_free_rate):
     return ret, vol, sharpe
 
 
-def frontier_curve(expected_returns, cov, max_weight=1.0, n_points=60, min_weight=0.0):
+def risk_contributions(weights, cov):
+    """Each holding's share of the portfolio's variance.
+
+    A weights table says where the money went; it does not say where the
+    risk went, and the two come apart badly. On one eight-ETF fit a
+    37.2% holding carried 8.3% of the variance while a 28.9% one carried
+    49.4% -- so the position that would hurt in a drawdown was not the
+    biggest line in the table.
+
+    The cash sleeve is dropped first: it has no variance and belongs to
+    no row of the covariance matrix.
+    """
+    risky = [a for a in cov.index if float(weights.get(a, 0.0)) != 0.0]
+    if not risky:
+        return pd.Series(dtype=float)
+
+    w = np.array([float(weights[a]) for a in risky])
+    total = w.sum()
+    if total > 0:
+        w = w / total
+    matrix = cov.loc[risky, risky].values
+    variance = float(w @ matrix @ w)
+    if variance <= 0:
+        return pd.Series(dtype=float)
+
+    # Euler decomposition: each holding's weight times its marginal
+    # contribution, over the total. These sum to one by construction.
+    shares = w * (matrix @ w) / variance
+    return pd.Series(shares, index=risky).reindex(cov.index).fillna(0.0)
+
+
+def frontier_curve(expected_returns, cov, max_weight=1.0, n_points=60, min_weight=0.0,
+                   floors=None, caps=None):
     """Trace the efficient frontier by solving for target returns.
 
     Replaces reading the line data back out of a throwaway matplotlib
     figure, which depended on pypfopt's internal plot ordering.
     """
-    ef = _frontier(expected_returns, cov, max_weight, min_weight)
+    ef = _frontier(expected_returns, cov, max_weight, min_weight, floors, caps)
     try:
         ef.min_volatility()
     except SOLVER_ERRORS:
         return np.array([]), np.array([])
     low = ef.portfolio_performance()[0]
-    high = max_achievable_return(expected_returns, max_weight, min_weight)
+    high = max_achievable_return(expected_returns, max_weight, min_weight, floors, caps)
     if high - low <= 1e-9:
         vol = ef.portfolio_performance()[1]
         return np.array([vol]), np.array([low])
@@ -397,7 +468,7 @@ def frontier_curve(expected_returns, cov, max_weight=1.0, n_points=60, min_weigh
     vols, rets = [], []
     for target in np.linspace(low, high, n_points):
         try:
-            point = _frontier(expected_returns, cov, max_weight, min_weight)
+            point = _frontier(expected_returns, cov, max_weight, min_weight, floors, caps)
             point.efficient_return(target)
             ret, vol, _ = point.portfolio_performance()
         except SOLVER_ERRORS:
@@ -407,39 +478,43 @@ def frontier_curve(expected_returns, cov, max_weight=1.0, n_points=60, min_weigh
     return np.array(vols), np.array(rets)
 
 
-def sample_weights(rng, n_assets, n_samples, max_weight=1.0, max_passes=12, min_weight=0.0):
+def sample_weights(rng, n_assets, n_samples, max_weight=1.0, max_passes=12,
+                   min_weight=0.0, pairs=None):
     """Random long-only weight vectors, optionally capped per asset.
 
     Plain rejection sampling empties out fast once the cap approaches
     equal weight, so capped draws are clipped and renormalised until
     they fit, which keeps the scatter cloud populated.
     """
+    if pairs is None:
+        pairs = [(min_weight, max_weight)] * n_assets
     try:
-        validate_bounds(n_assets, max_weight, min_weight)
+        validate_bounds(pairs)
     except ValueError:
         return np.empty((0, n_assets))
 
-    # Fund the floor first, then spread what is left. Rejecting draws
-    # that breach the floor would discard nearly all of them.
+    low = np.array([p[0] for p in pairs], dtype=float)
+    high = np.array([p[1] for p in pairs], dtype=float)
+
+    # Fund each floor first, then spread what is left. Rejecting draws
+    # that breach a floor would discard nearly all of them.
     w = rng.dirichlet([0.5] * n_assets, n_samples)
-    if min_weight > 0:
-        w = min_weight + (1.0 - min_weight * n_assets) * w
-    if max_weight >= 1.0:
+    w = low + (1.0 - low.sum()) * w
+    if (high >= 1.0).all():
         return w
 
     for _ in range(max_passes):
-        over = w > max_weight
-        if not over.any():
+        if not (w > high).any():
             break
-        w = np.minimum(w, max_weight)
+        w = np.minimum(w, high)
         deficit = 1.0 - w.sum(axis=1, keepdims=True)
-        headroom = max_weight - w
+        headroom = high - w
         total_headroom = headroom.sum(axis=1, keepdims=True)
         with np.errstate(invalid="ignore", divide="ignore"):
             share = np.where(total_headroom > 0, headroom / total_headroom, 0.0)
         w = w + share * deficit
 
-    w = np.clip(w, min_weight, max_weight)
+    w = np.clip(w, low, high)
     totals = w.sum(axis=1, keepdims=True)
     keep = np.isclose(totals[:, 0], 1.0, atol=1e-6)
     return w[keep]
@@ -524,7 +599,7 @@ WalkForwardResult = namedtuple("WalkForwardResult", "returns weight_history turn
 
 def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage,
                 min_weight=0.0, return_method=DEFAULT_RETURN_METHOD,
-                min_observations=None, target=None):
+                min_observations=None, target=None, floors=None, caps=None):
     """Expected returns and covariance from a price window, then solve."""
     weekly = prices.resample("W-FRI").last()
     expected, observations = estimate_returns_with_counts(
@@ -541,7 +616,7 @@ def fit_weights(prices, risk_free_rate, objective, max_weight, shrinkage,
     try:
         return optimize_weights(
             expected, cov, objective, risk_free_rate, max_weight, min_weight,
-            weekly=weekly[usable], target=target,
+            weekly=weekly[usable], target=target, floors=floors, caps=caps,
         )
     except SOLVER_ERRORS:
         return None
@@ -552,6 +627,7 @@ def walk_forward(
     refit_freq="Y", cost_bps=0.0, min_train_years=2.0,
     cash_fraction=0.0, rebalance_freq=None, min_weight=0.0,
     return_method=DEFAULT_RETURN_METHOD, min_observations=None, target=None,
+    floors=None, caps=None,
 ):
     """Re-fit on a schedule using only data available at that moment.
 
@@ -585,6 +661,7 @@ def walk_forward(
         weights = fit_weights(
             prices.loc[:refit_date], risk_free_rate, objective, max_weight,
             shrinkage, min_weight, return_method, min_observations, target,
+            floors, caps,
         )
         if weights is None:
             continue
