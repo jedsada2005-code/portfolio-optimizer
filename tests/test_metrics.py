@@ -991,3 +991,83 @@ class TestEffectiveHoldingsIgnoresCash:
 
     def test_a_cash_only_portfolio_holds_nothing_risky(self):
         assert metrics.effective_holdings({metrics.CASH_SYMBOL: 1.0}) == 0.0
+
+
+class TestParseBenchmarkSpec:
+    """A portfolio holding bonds, gold and cash was being judged against
+    SPY, which is stocks alone. The comparison said the portfolio lost
+    whenever equities ran, whatever the portfolio did. Letting the field
+    name a blend -- the policy portfolio the investor would otherwise
+    hold -- makes the comparison one between like and like."""
+
+    def test_a_bare_symbol_is_the_whole_benchmark(self):
+        assert metrics.parse_benchmark_spec("SPY") == {"SPY": 1.0}
+
+    def test_an_empty_field_asks_for_no_benchmark(self):
+        assert metrics.parse_benchmark_spec("   ") == {}
+
+    def test_weights_after_each_symbol_are_shares_of_the_benchmark(self):
+        assert metrics.parse_benchmark_spec("SPY 60, AGG 40") == {
+            "SPY": 0.6, "AGG": 0.4,
+        }
+
+    def test_weights_that_do_not_total_a_hundred_are_normalised(self):
+        # Typing 60/20 means three parts to one, not a benchmark that
+        # holds 20% in nothing at all.
+        assert metrics.parse_benchmark_spec("SPY 60, AGG 20") == {
+            "SPY": 0.75, "AGG": 0.25,
+        }
+
+    def test_several_bare_symbols_split_evenly(self):
+        assert metrics.parse_benchmark_spec("SPY, AGG, GLD") == pytest.approx(
+            {"SPY": 1 / 3, "AGG": 1 / 3, "GLD": 1 / 3}
+        )
+
+    def test_mixing_weighted_and_bare_symbols_is_refused(self):
+        # Guessing here would silently invent an allocation the reader
+        # never asked for, and every figure below would inherit it.
+        with pytest.raises(ValueError, match="AGG"):
+            metrics.parse_benchmark_spec("SPY 60, AGG")
+
+    def test_a_weight_of_zero_leaves_the_symbol_out(self):
+        assert metrics.parse_benchmark_spec("SPY 100, AGG 0") == {"SPY": 1.0}
+
+
+class TestBlendBenchmark:
+    """The blend has to flow through align_benchmark, beta_alpha and the
+    charts unchanged, so it is expressed as a price series -- exactly
+    what a single ticker already hands them."""
+
+    @staticmethod
+    def _pair(index):
+        return pd.DataFrame({
+            "UP": 100.0 * 1.0008 ** np.arange(len(index)),
+            "FLAT": np.full(len(index), 50.0),
+        }, index=index)
+
+    def test_a_half_and_half_blend_grows_at_half_the_pace(self):
+        index = pd.bdate_range("2015-01-01", "2024-12-31")
+        curve = metrics.blend_benchmark(
+            self._pair(index), {"UP": 0.5, "FLAT": 0.5}, "M"
+        )
+
+        grown = metrics.backtest_stats(curve.pct_change().dropna(), 0.0)
+        alone = metrics.backtest_stats(
+            self._pair(index)["UP"].pct_change().dropna(), 0.0
+        )
+        assert grown["annual_return"] == pytest.approx(
+            alone["annual_return"] / 2, rel=0.06
+        )
+
+    def test_the_blend_waits_for_every_part_to_exist(self):
+        index = pd.bdate_range("2015-01-01", "2024-12-31")
+        prices = self._pair(index)
+        prices.loc[:"2018-01-01", "FLAT"] = np.nan
+
+        curve = metrics.blend_benchmark(prices, {"UP": 0.5, "FLAT": 0.5}, "M")
+
+        assert curve.index[0] >= pd.Timestamp("2018-01-01")
+
+    def test_a_blend_of_nothing_is_empty(self):
+        index = pd.bdate_range("2015-01-01", "2015-06-30")
+        assert metrics.blend_benchmark(self._pair(index), {}, "M").empty

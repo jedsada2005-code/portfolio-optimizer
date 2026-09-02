@@ -87,6 +87,18 @@ def read_custom_weights(assets):
     return {sym: value / total for sym, value in raw.items()}
 
 
+def benchmark_label(parts):
+    """How a benchmark names itself on screen.
+
+    A single ticker is its own name. A blend has to show its shares, or
+    two runs against different policy mixes are indistinguishable in a
+    screenshot.
+    """
+    if len(parts) == 1:
+        return next(iter(parts))
+    return " / ".join(f"{sym} {share:.0%}" for sym, share in parts.items())
+
+
 def current_url():
     """Full page URL including the saved settings, for copying."""
     try:
@@ -328,7 +340,12 @@ with st.sidebar:
         benchmark_symbol = st.text_input(
             "Benchmark (เว้นว่างได้)",
             key="w_bench",
-            help="สัญลักษณ์ Yahoo สำหรับเทียบผลงาน ไม่ถูกนับรวมเป็นสินทรัพย์ในพอร์ต เช่น SPY หรือ ^SET.BK",
+            help=(
+                "สัญลักษณ์ Yahoo สำหรับเทียบผลงาน ไม่ถูกนับรวมเป็นสินทรัพย์ในพอร์ต "
+                "เช่น `SPY` หรือ `^SET.BK` · ใส่หลายตัวพร้อมสัดส่วนเพื่อสร้าง "
+                "benchmark ผสมได้ เช่น `SPY 60, AGG 40` — พอร์ตที่ถือทั้งหุ้นและ "
+                "พันธบัตรควรเทียบกับส่วนผสมแบบเดียวกัน ไม่ใช่ดัชนีหุ้นล้วน"
+            ),
         ).strip().upper()
 
     with st.expander("⚙️ การตั้งค่าขั้นสูง"):
@@ -556,9 +573,20 @@ if run_btn:
 
     yf_symbols, mf_symbols = thai_mf.split_symbols(stock_list)
 
-    if benchmark_symbol and benchmark_symbol in stock_list:
+    # One ticker or a whole policy portfolio -- "SPY 60, AGG 40" -- read
+    # from the same field. A malformed spec stops the benchmark alone,
+    # not the run: everything else on the page is still worth seeing.
+    try:
+        benchmark_parts = metrics.parse_benchmark_spec(benchmark_symbol)
+    except ValueError as exc:
+        st.error(f"⚠️ Benchmark: {exc}")
+        benchmark_parts = {}
+    benchmark_name = benchmark_label(benchmark_parts)
+
+    overlap = [sym for sym in benchmark_parts if sym in stock_list]
+    if overlap:
         st.warning(
-            f"⚠️ **{benchmark_symbol}** ถูกใช้เป็นทั้งสินทรัพย์ในพอร์ตและ benchmark "
+            f"⚠️ **{', '.join(overlap)}** ถูกใช้เป็นทั้งสินทรัพย์ในพอร์ตและ benchmark "
             "— การเปรียบเทียบจะเป็นการเทียบพอร์ตกับส่วนหนึ่งของตัวเอง "
             "Beta จะเข้าใกล้ 1 โดยไม่มีความหมาย เลือก benchmark ตัวอื่นจะได้ผลที่ตีความได้"
         )
@@ -671,38 +699,62 @@ if run_btn:
             )
 
     benchmark_close = pd.Series(dtype=float)
-    if benchmark_symbol:
-        with st.spinner(f"Downloading benchmark {benchmark_symbol}..."):
-            bench_df = download_yf_close((benchmark_symbol,), str(start_date), str(end_date))
-        if bench_df.empty:
+    if benchmark_parts:
+        bench_symbols = list(benchmark_parts)
+        with st.spinner(f"Downloading benchmark {benchmark_name}..."):
+            bench_df = download_yf_close(
+                tuple(bench_symbols), str(start_date), str(end_date)
+            )
+        absent = [sym for sym in bench_symbols if sym not in bench_df.columns]
+        if absent:
             st.warning(
-                f"⚠️ โหลด benchmark **{benchmark_symbol}** ไม่สำเร็จ — ข้ามการเปรียบเทียบ"
+                f"⚠️ โหลด benchmark **{', '.join(absent)}** ไม่สำเร็จ "
+                "— ข้ามการเปรียบเทียบ"
             )
         else:
-            benchmark_close = bench_df.iloc[:, 0].rename(benchmark_symbol)
-            bench_currency = fx.resolve_currencies(
-                [benchmark_symbol], lookup=lookup_currency
-            )[benchmark_symbol]
-            if bench_currency != base_currency:
+            bench_df = bench_df[bench_symbols]
+            bench_currencies = fx.resolve_currencies(
+                bench_symbols, lookup=lookup_currency
+            )
+            if set(bench_currencies.values()) != {base_currency}:
                 bench_needed = fx.required_currencies(
-                    {benchmark_symbol: bench_currency}, base_currency
+                    bench_currencies, base_currency
                 )
                 bench_rates = download_fx_rates(
                     tuple(bench_needed), str(start_date), str(end_date)
                 )
                 try:
-                    benchmark_close = fx.convert_prices(
-                        benchmark_close.to_frame(),
-                        {benchmark_symbol: bench_currency},
-                        base_currency,
-                        bench_rates,
-                    ).iloc[:, 0]
+                    bench_df = fx.convert_prices(
+                        bench_df, bench_currencies, base_currency, bench_rates,
+                    )
                 except fx.FXError:
                     st.warning(
-                        f"⚠️ แปลงสกุลเงินของ benchmark **{benchmark_symbol}** ไม่ได้ "
+                        f"⚠️ แปลงสกุลเงินของ benchmark **{benchmark_name}** ไม่ได้ "
                         "— ข้ามการเปรียบเทียบ"
                     )
-                    benchmark_close = pd.Series(dtype=float)
+                    bench_df = pd.DataFrame()
+            if bench_df.empty:
+                pass
+            elif len(bench_symbols) == 1:
+                # One ticker keeps the path it always had: raw closes,
+                # whose leading NaNs align_benchmark reads as "not listed
+                # yet" rather than as a flat stretch.
+                benchmark_close = bench_df.iloc[:, 0].rename(bench_symbols[0])
+            else:
+                # A blend is handed on as a price series too, so every
+                # figure and chart downstream takes it unchanged. It
+                # rebalances on the portfolio's own schedule, or the
+                # comparison would also be measuring that difference.
+                benchmark_close = metrics.blend_benchmark(
+                    bench_df,
+                    benchmark_parts,
+                    metrics.REBALANCE_FREQUENCIES[rebalance_label],
+                )
+                if benchmark_close.empty:
+                    st.warning(
+                        f"⚠️ ส่วนประกอบของ benchmark **{benchmark_name}** "
+                        "ไม่มีช่วงเวลาที่ทับซ้อนกัน — ข้ามการเปรียบเทียบ"
+                    )
 
     # แจ้งหุ้นที่โหลดสำเร็จ / ไม่สำเร็จ
     loaded = list(data_close.columns)
@@ -961,7 +1013,9 @@ if run_btn:
     st.session_state["split_date"] = split_date
     st.session_state["backtest_mode"] = backtest_mode
     st.session_state["benchmark"] = benchmark_close
-    st.session_state["benchmark_symbol"] = benchmark_symbol
+    # The label, not the raw field: the query params below keep the
+    # text so a shared URL still reopens with "SPY 60, AGG 40" typed in.
+    st.session_state["benchmark_symbol"] = benchmark_name
     st.session_state["rebalance_label"] = rebalance_label
     st.session_state["cost_bps"] = cost_bps
     st.session_state["base_currency"] = base_currency

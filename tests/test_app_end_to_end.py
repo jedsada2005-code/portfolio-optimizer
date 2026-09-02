@@ -1522,3 +1522,55 @@ class TestQuickDateRanges:
 
         assert _widget(app.number_input, "Risk-Free Rate").value == 0.04
         assert _widget(app.slider, "น้ำหนักสูงสุดต่อสินทรัพย์").value == 45
+
+
+class TestBlendedBenchmark:
+    """A portfolio holding bonds, gold and cash was judged against SPY
+    alone, so it was called a failure in every year equities ran however
+    well the rest of it had done its job. Naming a blend in the same
+    field makes the comparison one between like and like."""
+
+    @staticmethod
+    def _annual(at, spec):
+        _widget(at.text_input, "Benchmark").set_value(spec)
+        _calculate(at)
+        prices = at.session_state["benchmark"].dropna()
+        return metrics.backtest_stats(
+            prices.pct_change().dropna(), 0.0
+        )["annual_return"]
+
+    def test_a_blend_lands_between_the_parts_it_is_made_of(self, app):
+        equities = self._annual(app, "IWM")
+        bonds = self._annual(app, "AGG")
+        blend = self._annual(app, "IWM 50, AGG 50")
+
+        assert min(bonds, equities) < blend < max(bonds, equities), (
+            f"IWM {equities:.2%}, AGG {bonds:.2%}, blend {blend:.2%}"
+        )
+
+    def test_a_single_symbol_is_still_read_as_raw_prices(self, app):
+        _widget(app.text_input, "Benchmark").set_value("IWM")
+        at = _calculate(app)
+
+        # Yahoo closes, not a curve rebased to 1.0: the single-ticker
+        # path has to stay exactly what it was.
+        assert at.session_state["benchmark"].dropna().iloc[0] > 10
+
+    def test_the_blend_is_named_by_its_parts(self, app):
+        _widget(app.text_input, "Benchmark").set_value("IWM 60, AGG 40")
+        at = _calculate(app)
+
+        heading = next(
+            s.value for s in at.subheader
+            if "เทียบกับ Benchmark" in (s.value or "")
+        )
+        assert "IWM" in heading and "AGG" in heading and "60" in heading
+
+    def test_a_half_written_blend_is_reported_not_crashed(self, app):
+        _widget(app.text_input, "Benchmark").set_value("IWM 60, AGG")
+        at = _calculate(app)
+
+        assert not at.exception
+        assert any("AGG" in (e.value or "") for e in at.error), (
+            "the unweighted symbol should be named back to the reader"
+        )
