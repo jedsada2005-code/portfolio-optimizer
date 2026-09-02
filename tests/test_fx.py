@@ -53,6 +53,20 @@ class TestConvertPrices:
         out = fx.convert_prices(prices, {"SPY": "USD"}, "THB", self._rates(idx))
         assert out["SPY"].iloc[0] == pytest.approx(35.0)
 
+    def test_a_blend_converts_only_the_columns_that_need_it(self):
+        # A benchmark named as "SPY 60, 2801.HK 40" reaches this function
+        # as one frame mixing base-currency and foreign columns, where a
+        # single ticker only ever presented one or the other.
+        idx = pd.bdate_range("2020-01-01", periods=5)
+        prices = pd.DataFrame(
+            {"SPY": [100.0] * 5, "MF:X": [35.0] * 5}, index=idx
+        )
+        out = fx.convert_prices(
+            prices, {"SPY": "USD", "MF:X": "THB"}, "USD", self._rates(idx)
+        )
+        pd.testing.assert_series_equal(out["SPY"], prices["SPY"])
+        assert out["MF:X"].iloc[0] == pytest.approx(1.0)
+
     def test_cross_rate_between_two_foreign_currencies(self):
         idx = pd.bdate_range("2020-01-01", periods=5)
         prices = pd.DataFrame({"7203.T": [150.0] * 5}, index=idx)

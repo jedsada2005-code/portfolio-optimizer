@@ -358,6 +358,61 @@ def backtest_stats(returns, risk_free_rate):
 AlignedBenchmark = namedtuple("AlignedBenchmark", "portfolio benchmark start")
 
 
+def parse_benchmark_spec(text):
+    """Symbols and their shares, read from the benchmark field.
+
+    "SPY" names one holding. "SPY 60, AGG 40" names the policy portfolio
+    a multi-asset strategy should actually be judged against: a single
+    equity index called every portfolio holding bonds a failure whenever
+    equities ran, however well the bonds had done their job.
+    """
+    entries = [part.strip() for part in text.split(",") if part.strip()]
+    if not entries:
+        return {}
+
+    symbols, shares = [], []
+    for entry in entries:
+        pieces = entry.split()
+        symbols.append(pieces[0].upper())
+        shares.append(float(pieces[1]) if len(pieces) > 1 else None)
+
+    bare = [sym for sym, share in zip(symbols, shares) if share is None]
+    if bare and len(bare) != len(symbols):
+        # Filling the gap with a guess would invent an allocation the
+        # reader never asked for, and every figure below inherits it.
+        raise ValueError(
+            "ใส่สัดส่วนให้ครบทุกตัว หรือไม่ใส่เลยก็ได้ (จะแบ่งเท่ากัน) — "
+            f"ตัวที่ยังไม่มีสัดส่วน: {', '.join(bare)}"
+        )
+    if bare:
+        return {sym: 1.0 / len(symbols) for sym in symbols}
+
+    total = sum(shares)
+    if total <= 0:
+        return {}
+    return {
+        sym: share / total
+        for sym, share in zip(symbols, shares)
+        if share > 0
+    }
+
+
+def blend_benchmark(prices, weights, rebalance_freq):
+    """One price series for a benchmark made of several holdings.
+
+    Handed back as prices rather than returns so align_benchmark,
+    beta_alpha and every chart take it exactly as they already take a
+    single ticker -- the blend needs no separate path through any of
+    them.
+    """
+    if not weights:
+        return pd.Series(dtype=float)
+    result = simulate_portfolio(prices, weights, rebalance_freq)
+    if result.returns.empty:
+        return pd.Series(dtype=float)
+    return (1.0 + result.returns).cumprod()
+
+
 def align_benchmark(portfolio_returns, benchmark_prices):
     """Portfolio and benchmark returns over the window both really cover.
 
